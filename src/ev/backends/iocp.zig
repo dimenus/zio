@@ -606,6 +606,11 @@ pub fn submit(self: *Self, state: *LoopState, c: *Completion) void {
 
         .net_recv => {
             const data = c.cast(NetRecv);
+            if (data.flags.dont_wait) {
+                common.handleNetRecvTry(c);
+                state.markCompletedFromBackend(c);
+                return;
+            }
             self.submitRecv(state, data) catch |err| {
                 c.setError(err);
                 state.markCompletedFromBackend(c);

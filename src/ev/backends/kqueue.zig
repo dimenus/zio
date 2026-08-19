@@ -605,8 +605,8 @@ pub fn submit(self: *Self, state: *LoopState, c: *Completion) void {
         // Sockets take the single-owner, persistent edge-triggered path: try the
         // syscall optimistically, register with the owning loop only on WouldBlock.
         .net_connect => sockreg.submitConnect(self, state, c),
+        .net_recv => sockreg.submitRecv(self, state, c),
         .net_accept,
-        .net_recv,
         .net_send,
         .net_recvfrom,
         .net_sendto,

@@ -271,6 +271,15 @@ fn handleNetShutdown(c: *Completion) void {
 fn handleNetRecv(c: *Completion) void {
     const data = c.cast(NetRecv);
 
+    if (data.flags.dont_wait) {
+        if (os.net.recv(data.handle, data.buffers.iovecs, data.flags)) |bytes_read| {
+            c.setResult(.net_recv, bytes_read);
+        } else |err| {
+            c.setError(err);
+        }
+        return;
+    }
+
     // Poll+recv loop: the socket may be nonblocking (NetAccept hands out
     // nonblocking sockets by default), and multiple threads may race on the
     // same socket; poll readiness and retry on WouldBlock either way.

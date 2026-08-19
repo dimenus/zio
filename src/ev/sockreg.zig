@@ -357,6 +357,71 @@ pub fn unregister(self: anytype, fd: net.fd_t) void {
     self.unregisterCleanup(fd);
 }
 
+fn consumeReady(self: anytype, fd: net.fd_t, dir: Dir) bool {
+    const table = &self.shared.sock_table;
+    const shard = table.shardForFd(fd);
+    shard.mutex.lock();
+    defer shard.mutex.unlock();
+    const entry = shard.map.getPtr(@as(u32, @bitCast(fd))) orelse return false;
+    const ready = entry.readyPtr(dir);
+    if (!ready.*) return false;
+    ready.* = false;
+    return true;
+}
+
+fn hasWaiters(self: anytype, fd: net.fd_t, dir: Dir) bool {
+    const table = &self.shared.sock_table;
+    const shard = table.shardForFd(fd);
+    shard.mutex.lock();
+    defer shard.mutex.unlock();
+    const entry = shard.map.getPtr(@as(u32, @bitCast(fd))) orelse return false;
+    return entry.waiters(dir).head != null;
+}
+
+/// Non-parking `submitIo`: same optimistic recv and readiness-latch retry, but
+/// complete with `error.WouldBlock` instead of registering a waiter.
+///
+/// kqueue/epoll keep persistent EV_CLEAR (or EPOLLET) interest. A recv done
+/// *beside* this table consumes the edge the waiter would have drained, and a
+/// later `waitPeek` parks past data that already arrived (starh2: posix.read
+/// and MSG_DONTWAIT). This path is the recv, so the latch still means "retry
+/// the syscall" and a subsequent blocking recv still parks on a fresh edge.
+///
+/// io_uring does not use this table; its try-fill is a stack recv with no SQE.
+pub fn tryIo(self: anytype, state: anytype, c: *Completion) void {
+    const Backend = @TypeOf(self.*);
+    const fd = netHandle(c);
+    const dir = dirForOp(c);
+    if (hasWaiters(self, fd, dir)) {
+        c.setError(error.WouldBlock);
+        state.markCompletedFromBackend(c);
+        return;
+    }
+    var probe = Backend.probeEvent(fd, dir);
+    while (true) {
+        switch (Backend.checkCompletion(c, &probe)) {
+            .completed => {
+                state.markCompletedFromBackend(c);
+                return;
+            },
+            .requeue => {
+                if (consumeReady(self, fd, dir)) continue;
+                c.setError(error.WouldBlock);
+                state.markCompletedFromBackend(c);
+                return;
+            },
+        }
+    }
+}
+
+pub fn submitRecv(self: anytype, state: anytype, c: *Completion) void {
+    if (c.cast(NetRecv).flags.dont_wait) {
+        tryIo(self, state, c);
+    } else {
+        submitIo(self, state, c);
+    }
+}
+
 /// Generic submit for socket read/write/accept-family ops: try the syscall
 /// optimistically (reusing checkCompletion with a no-error event) and only park
 /// on WouldBlock. Draining to EAGAIN first is what makes edge-triggered safe.

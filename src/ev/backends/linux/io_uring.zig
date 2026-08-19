@@ -535,6 +535,16 @@ fn submitInner(self: *Self, state: *LoopState, c: *Completion, is_new: bool) voi
         },
         .net_recv => {
             const data = c.cast(NetRecv);
+            // Try-fill: a stack recv, not IORING_OP_RECV. An SQE would complete
+            // later (a wait) and would race a subsequent blocking recv on the
+            // same socket. The socket is O_NONBLOCK; MSG_DONTWAIT is also set.
+            // There is no EV_CLEAR latch on this backend — the later SQE waits
+            // for new data on its own.
+            if (data.flags.dont_wait) {
+                common.handleNetRecvTry(c);
+                state.markCompletedFromBackend(c);
+                return;
+            }
             data.internal.msg = .{
                 .name = null,
                 .namelen = 0,
@@ -1750,6 +1760,7 @@ fn recvFlagsToMsg(flags: net.RecvFlags) u32 {
     if (flags.waitall) msg_flags |= linux.MSG.WAITALL;
     if (flags.oob) msg_flags |= linux.MSG.OOB;
     if (flags.trunc) msg_flags |= linux.MSG.TRUNC;
+    if (flags.dont_wait) msg_flags |= linux.MSG.DONTWAIT;
     return msg_flags;
 }
 
