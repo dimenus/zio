@@ -26,22 +26,34 @@ const meta = @import("meta.zig");
 //     asyncWait/asyncCancelWait. Useful for storing completions, results, or other
 //     data that varies per wait operation.
 //
-//   fn asyncWait(self: *Self, waiter: *Waiter) bool           // if WaitContext == void
-//   fn asyncWait(self: *Self, waiter: *Waiter, ctx: *WaitContext) bool  // if WaitContext != void
+//   fn asyncWait(self: *Self, waiter: *Waiter) AsyncWaitState           // if WaitContext == void
+//   fn asyncWait(self: *Self, waiter: *Waiter, ctx: *WaitContext) AsyncWaitState  // if WaitContext != void
 //     Register for notification when this future completes.
 //
 //     If WaitContext != void, the ctx parameter points to caller-allocated per-wait state
 //     that persists for the duration of this wait operation.
 //
-//     Returns:
-//       - false: Operation already complete (fast path). Result is available via getResult().
-//                The waiter was NOT added to any queue.
-//       - true: Operation pending (slow path). The waiter was added to an internal wait
-//               queue and will be woken via waiter.wake() when the operation completes.
+//     Returns (see common.AsyncWaitState):
+//       - .ready: Operation complete (fast path) AND this waiter WON the select
+//                 (the future called waiter.tryClaim() BEFORE any consuming side
+//                 effect). Result is available via getResult(). Nothing was
+//                 registered.
+//       - .queued: Operation pending (slow path). The waiter was added to an
+//                  internal wait queue and will be woken via waiter.wake() when
+//                  the operation completes.
+//       - .lost: Another branch of the same select already won. The future
+//                consumed NOTHING and registered NOTHING. Only select waiters
+//                can lose; a direct waiter's claim always succeeds.
+//
+//     The claim-before-consume rule is the load-bearing invariant: a fast path
+//     that consumed first and reported ready afterwards let select() overwrite
+//     a concurrent claim of an earlier-registered branch, and the claimed item
+//     died on the select's dead stack frame.
 //
 //     Guarantees:
-//       - If returns false, getResult() can be called immediately
-//       - If returns true, waiter.wake() will be called exactly once when complete
+//       - If .ready, getResult() can be called immediately and the winner slot
+//         holds this branch's index
+//       - If .queued, waiter.wake() will be called exactly once when complete
 //       - Thread-safe: can be called from any thread
 //       - The ctx pointer (if present) remains valid until asyncCancelWait() or waiter.wake()
 //
@@ -264,9 +276,11 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
         w.* = Waiter.initSelect(&waiter, &winner, i);
     }
 
-    // Track how many futures we've registered with (for cleanup).
-    // Only incremented when asyncWait returns true (future is pending).
-    var registered_count: usize = 0;
+    // Per-branch registration state. A prefix count is not enough once a
+    // branch can report `.lost` (nothing registered) between two `.queued`
+    // branches; cancel/cleanup must touch exactly the queued set.
+    const BranchState = enum { untouched, queued, lost };
+    var states = [_]BranchState{.untouched} ** fields.len;
 
     // The cancel path runs its own epilogue (it must resolve every branch
     // BEFORE deciding whether a claim won); this flag keeps the defer from
@@ -277,21 +291,26 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
     defer if (!cleanup_done) {
         const winner_index = winner.load(.acquire);
 
-        // Count expected signals: all registered futures will signal unless we cancel them.
-        // Successfully canceled futures (asyncCancelWait returns true) won't signal.
-        var expected: u32 = @intCast(registered_count);
+        // Count expected signals: every queued branch will signal unless we
+        // cancel it; `.lost` and `.untouched` branches registered nothing
+        // and never signal.
+        var expected: u32 = 0;
         inline for (fields, 0..) |field, i| {
-            // Only cancel if we registered and didn't win
-            if (i < registered_count and winner_index != i) {
-                var future = @field(futures, field.name);
-                const was_removed = if (comptime hasWaitContext(field.type))
-                    future.asyncCancelWait(&waiters[i], &@field(contexts, field.name))
-                else
-                    future.asyncCancelWait(&waiters[i]);
+            if (states[i] == .queued) {
+                if (winner_index != i) {
+                    var future = @field(futures, field.name);
+                    const was_removed = if (comptime hasWaitContext(field.type))
+                        future.asyncCancelWait(&waiters[i], &@field(contexts, field.name))
+                    else
+                        future.asyncCancelWait(&waiters[i]);
 
-                if (was_removed) {
-                    // Successfully removed from queue - won't signal
-                    expected -= 1;
+                    if (!was_removed) {
+                        // Claimed or completing: its signal is in flight.
+                        expected += 1;
+                    }
+                } else {
+                    // The winner signals exactly once.
+                    expected += 1;
                 }
             }
         }
@@ -300,24 +319,53 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
         waiter.wait(expected, .no_cancel);
     };
 
-    // Add waiters to all waiting lists - fast path: return immediately if already complete
+    // Fast-path/registration pass. The claim-before-ready contract
+    // (`AsyncWaitState` in common.zig) makes the old clobber unsayable:
+    // `.ready` means the future already WON the winner slot before it
+    // consumed anything, so no concurrent claim of an earlier branch can be
+    // overwritten. `.lost` means another branch won during this pass; that
+    // branch's signal is in flight and drives the wait below.
+    var lost_any = false;
     inline for (fields, 0..) |field, i| {
         const future = @field(futures, field.name);
-        const waiting = if (comptime hasWaitContext(field.type))
+        const state = if (comptime hasWaitContext(field.type))
             future.asyncWait(&waiters[i], &@field(contexts, field.name))
         else
             future.asyncWait(&waiters[i]);
 
-        if (!waiting) {
-            winner.store(i, .release);
-            const result = if (comptime hasWaitContext(field.type))
-                future.getResult(&@field(contexts, field.name))
-            else
-                future.getResult();
-            return @unionInit(U, field.name, result);
+        switch (state) {
+            .ready => {
+                std.debug.assert(winner.load(.acquire) == i);
+                const result = if (comptime hasWaitContext(field.type))
+                    future.getResult(&@field(contexts, field.name))
+                else
+                    future.getResult();
+                return @unionInit(U, field.name, result);
+            },
+            .queued => states[i] = .queued,
+            .lost => {
+                states[i] = .lost;
+                lost_any = true;
+            },
         }
-
-        registered_count += 1;
+    }
+    if (lost_any) {
+        // Some queued branch was claimed while this pass ran; absorb its
+        // signal (which also orders its result copy) and deliver it.
+        waiter.wait(1, .no_cancel);
+        const winner_index = winner.load(.acquire);
+        std.debug.assert(winner_index != NO_WINNER);
+        inline for (fields, 0..) |field, i| {
+            if (i == winner_index) {
+                const future = @field(futures, field.name);
+                const result = if (comptime hasWaitContext(field.type))
+                    future.getResult(&@field(contexts, field.name))
+                else
+                    future.getResult();
+                return @unionInit(U, field.name, result);
+            }
+        }
+        unreachable;
     }
 
     // Wait for one to complete (Waiter.wait handles spurious wakeups)
@@ -333,7 +381,7 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
         // cancelable operation.
         var expected: u32 = 0;
         inline for (fields, 0..) |field, i| {
-            if (i < registered_count) {
+            if (states[i] == .queued) {
                 var future = @field(futures, field.name);
                 const was_removed = if (comptime hasWaitContext(field.type))
                     future.asyncCancelWait(&waiters[i], &@field(contexts, field.name))
@@ -400,22 +448,26 @@ pub fn selectAwaitables(awaitables: []const *Awaitable) Cancelable!usize {
         w.* = Waiter.initSelect(&waiter, &winner, i);
     }
 
-    // Only incremented when asyncWait returns true (future is pending).
-    var registered_count: usize = 0;
+    // Per-branch registration state; see select() for why a prefix count
+    // is not enough.
+    const BranchState = enum { untouched, queued, lost };
+    var states = [_]BranchState{.untouched} ** max_awaitables;
 
     defer {
         const winner_index = winner.load(.acquire);
 
-        // Count expected signals: all registered futures will signal unless we cancel them.
-        // Successfully canceled futures (asyncCancelWait returns true) won't signal.
-        var expected: u32 = @intCast(registered_count);
-        for (awaitables[0..registered_count], waiters[0..registered_count], 0..) |awaitable, *w, i| {
+        // Count expected signals: every queued branch signals unless its
+        // cancel removed it; `.lost`/`.untouched` registered nothing.
+        var expected: u32 = 0;
+        for (awaitables, waiters[0..awaitables.len], 0..) |awaitable, *w, i| {
+            if (states[i] != .queued) continue;
             if (winner_index != i) {
                 const was_removed = awaitable.asyncCancelWait(w);
-                if (was_removed) {
-                    // Successfully removed from queue - won't signal
-                    expected -= 1;
+                if (!was_removed) {
+                    expected += 1;
                 }
+            } else {
+                expected += 1;
             }
         }
 
@@ -423,15 +475,27 @@ pub fn selectAwaitables(awaitables: []const *Awaitable) Cancelable!usize {
         waiter.wait(expected, .no_cancel);
     }
 
-    for (awaitables, waiters[0..awaitables.len]) |awaitable, *w| {
-        const waiting = awaitable.asyncWait(w);
-
-        if (!waiting) {
-            winner.store(w.mode.select.index, .release);
-            return w.mode.select.index;
+    var lost_any = false;
+    for (awaitables, waiters[0..awaitables.len], 0..) |awaitable, *w, i| {
+        switch (awaitable.asyncWait(w)) {
+            .ready => {
+                std.debug.assert(winner.load(.acquire) == i);
+                return i;
+            },
+            .queued => states[i] = .queued,
+            .lost => {
+                states[i] = .lost;
+                lost_any = true;
+            },
         }
-
-        registered_count += 1;
+    }
+    if (lost_any) {
+        // A queued branch was claimed during this pass; absorb its signal
+        // and deliver it.
+        waiter.wait(1, .no_cancel);
+        const winner_index = winner.load(.acquire);
+        std.debug.assert(winner_index != NO_WINNER);
+        return winner_index;
     }
 
     // Wait for one to complete (Waiter.wait handles spurious wakeups)
@@ -456,14 +520,19 @@ fn waitInternal(future: anytype, comptime flags: WaitFlags) Cancelable!WaitResul
 
     // Fast path: check if already complete
     var fut = future;
-    const added = if (has_context)
+    const state = if (has_context)
         fut.asyncWait(&waiter, &context)
     else
         fut.asyncWait(&waiter);
 
-    if (!added) {
-        const result = if (has_context) fut.getResult(&context) else fut.getResult();
-        return .{ .value = result };
+    switch (state) {
+        .ready => {
+            const result = if (has_context) fut.getResult(&context) else fut.getResult();
+            return .{ .value = result };
+        },
+        // A direct waiter's claim always succeeds.
+        .lost => unreachable,
+        .queued => {},
     }
 
     // Clean up waiter on exit

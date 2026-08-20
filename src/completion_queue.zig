@@ -332,22 +332,25 @@ pub const CompletionQueue = struct {
         return !self.completed.isEmpty() or (self.closed and self.pending.isEmpty());
     }
 
-    pub fn asyncWait(self: *CompletionQueue, waiter: *Waiter, ctx: *WaitContext) bool {
+    pub fn asyncWait(self: *CompletionQueue, waiter: *Waiter, ctx: *WaitContext) common.AsyncWaitState {
         // Registration and delivery share `mutex`, so there is no
         // check-then-register window and no futex bucket: a completion
         // either exists now (report ready) or arrives later through
         // `claimRegisteredLocked`'s one-to-one handoff.
+        //
+        // The ready path consumes nothing (`getResult`/`next` pop), but the
+        // select must still be won before reporting ready.
         ctx.* = .{ .waiter = waiter, .address = 0 };
         self.mutex.lock();
         const ready = !self.completed.isEmpty() or (self.closed and self.pending.isEmpty());
         if (ready) {
             self.mutex.unlock();
-            return false;
+            return if (waiter.tryClaim()) .ready else .lost;
         }
         std.debug.assert(self.reg == null); // one driver, one registered wait
         self.reg = ctx;
         self.mutex.unlock();
-        return true;
+        return .queued;
     }
 
     pub fn asyncCancelWait(self: *CompletionQueue, waiter: *Waiter, ctx: *WaitContext) bool {
