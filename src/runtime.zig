@@ -21,6 +21,15 @@ pub fn setAnnounceRunningWakes(on: bool) void {
     announce_running_wakes = on;
 }
 
+/// Second A/B knob: whether a poll drain with N>=2 freshly woken tasks
+/// wakes ceil(log2 N) parked executors speculatively (`batchWakeSleepers`).
+/// Default true is the shipped behaviour.
+pub var batch_wake_sleepers: bool = true;
+
+pub fn setBatchWakeSleepers(on: bool) void {
+    batch_wake_sleepers = on;
+}
+
 const ev = @import("ev/root.zig");
 const os = @import("os/root.zig");
 const cgroup = @import("cgroup.zig");
@@ -1928,6 +1937,7 @@ pub const Runtime = struct {
     fn batchWakeSleepers(self: *Runtime, ready: usize, hint: ExecutorId) u64 {
         if (comptime !zio_options.task_migration) return 0;
 
+        if (!batch_wake_sleepers) return 0; // A/B knob, see `batch_wake_sleepers`
         if (!self.stealingActive() or ready < 2) return 0;
         if (self.idle_mask.load(.seq_cst) == 0) return 0;
 
