@@ -7,6 +7,20 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 const zio_options = @import("zio_options");
 
+/// A/B measurement knob, not a tuning API: whether a wake issued by a RUNNING
+/// task onto an empty local ring arms a searcher (wakes a parked executor).
+/// Default true is the shipped behaviour. starh2's width sweep measured the
+/// voluntary context switches per request climbing from 0.08 (2 executors)
+/// to 2.0 (12 executors) on a message-passing per-connection topology; this
+/// knob tests how much of that is the announce itself.
+pub var announce_running_wakes: bool = true;
+
+/// Set the A/B knob before the runtime starts. Not thread-safe by design: a
+/// process-wide switch read on the scheduling hot path.
+pub fn setAnnounceRunningWakes(on: bool) void {
+    announce_running_wakes = on;
+}
+
 const ev = @import("ev/root.zig");
 const os = @import("os/root.zig");
 const cgroup = @import("cgroup.zig");
@@ -1056,7 +1070,11 @@ pub const Executor = struct {
         const was_empty = self.run_queue.push(&task.awaitable.wait_node);
         if (self.draining_wakes) return; // one batched announce after the drain
         if (self.kind == .timer) return;
-        if (!was_empty or self.current_task != null) {
+        // A/B knob (see `announce_running_wakes`): with it off, a wake from a
+        // running task onto an EMPTY ring does not announce; the woken task
+        // waits for this executor's next step, the way tokio's LIFO slot
+        // does. A non-empty ring still announces.
+        if (!was_empty or (self.current_task != null and announce_running_wakes)) {
             self.runtime.armSearcher(self.id);
         }
     }
