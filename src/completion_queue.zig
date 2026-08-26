@@ -209,14 +209,9 @@ pub const CompletionQueue = struct {
         while (true) {
             const seen = self.signal.load(.acquire);
 
-            self.mutex.lock();
-            self.checkSingleDriverLocked();
-            const node = self.completed.pop();
-            const drained = node == null and self.closed and self.pending.isEmpty();
-            self.mutex.unlock();
-
-            if (node) |n| return completionFromGroup(n);
-            if (drained) return error.Closed;
+            const taken = self.consumeAsDriver(.take_head).take_head;
+            if (taken.node) |n| return completionFromGroup(n);
+            if (taken.drained) return error.Closed;
 
             // A bare submit does not bump `signal`: a driver parked here is
             // waiting for a completion, and the submitted operation delivers
@@ -243,14 +238,9 @@ pub const CompletionQueue = struct {
         while (true) {
             const seen = self.signal.load(.acquire);
 
-            self.mutex.lock();
-            self.checkSingleDriverLocked();
-            const node = self.completed.pop();
-            const drained = node == null and self.closed and self.pending.isEmpty();
-            self.mutex.unlock();
-
-            if (node) |n| return completionFromGroup(n);
-            if (drained) return error.Closed;
+            const taken = self.consumeAsDriver(.take_head).take_head;
+            if (taken.node) |n| return completionFromGroup(n);
+            if (taken.drained) return error.Closed;
 
             Futex.timedWait(&self.signal.raw, seen, timeout) catch |err| switch (err) {
                 error.Canceled => {
@@ -261,12 +251,9 @@ pub const CompletionQueue = struct {
                     // A completion, or the close, can still have landed
                     // together with the timeout; report those rather than a
                     // timeout that did not happen.
-                    self.mutex.lock();
-                    const n = self.completed.pop();
-                    const drained_now = n == null and self.closed and self.pending.isEmpty();
-                    self.mutex.unlock();
-                    if (n) |x| return completionFromGroup(x);
-                    return if (drained_now) error.Closed else error.Timeout;
+                    const last = self.consumeAsDriver(.take_head).take_head;
+                    if (last.node) |x| return completionFromGroup(x);
+                    return if (last.drained) error.Closed else error.Timeout;
                 },
             };
         }
@@ -309,12 +296,8 @@ pub const CompletionQueue = struct {
     /// Non-blocking poll for the next completed operation.
     /// Returns null if no completions are ready yet.
     pub fn next(self: *CompletionQueue) ?*Completion {
-        self.mutex.lock();
-        self.checkSingleDriverLocked();
-        const node = self.completed.pop();
-        self.mutex.unlock();
-
-        if (node) |n| {
+        const taken = self.consumeAsDriver(.take_head).take_head;
+        if (taken.node) |n| {
             return completionFromGroup(n);
         }
         return null;
@@ -327,6 +310,61 @@ pub const CompletionQueue = struct {
     fn checkSingleDriverLocked(self: *CompletionQueue) void {
         if (self.reg != null) {
             @panic("CompletionQueue: driven by two tasks (a select is parked on the queue); one task must own wait/next/cancel/cancelAll");
+        }
+    }
+
+    const DriverConsumeOp = union(enum) {
+        /// Pop the head completion, and report the terminal drained state.
+        take_head,
+        /// Unlink one specific node from `completed`, or classify where it is.
+        take_specific: *GroupNode,
+        /// One teardown pass: read whether `pending` is empty, and for
+        /// `.discard` drop every completed result.
+        drain: Results,
+    };
+
+    const DriverConsumeResult = union(enum) {
+        take_head: struct { node: ?*GroupNode, drained: bool },
+        take_specific: enum { taken, pending, absent },
+        drain: struct { pending_empty: bool },
+    };
+
+    /// The single consumption surface for the driver side of `completed`.
+    /// Owns the whole critical section: lock, the single-driver check, the
+    /// operation, unlock. Every driver-entry consumer (`wait`, `timedWait`
+    /// including its timeout re-check, `next`, `cancel`, `drainPending`)
+    /// goes through here, so the check cannot be omitted at one site while
+    /// the others keep it — that omission shipped three times as a
+    /// convention. The only consumers outside this function are the select
+    /// side (`asyncWait`, `claimToRegistered`), which legitimately run with
+    /// `reg` set because the parked select IS the driver; a source-invariant
+    /// test at the bottom of this file holds that list closed.
+    fn consumeAsDriver(self: *CompletionQueue, op: DriverConsumeOp) DriverConsumeResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.checkSingleDriverLocked();
+        switch (op) {
+            .take_head => {
+                const node = self.completed.pop();
+                const drained = node == null and self.closed and self.pending.isEmpty();
+                return .{ .take_head = .{ .node = node, .drained = drained } };
+            },
+            .take_specific => |node| {
+                if (unlink(&self.completed, node)) {
+                    return .{ .take_specific = .taken };
+                }
+                return .{ .take_specific = if (contains(&self.pending, node)) .pending else .absent };
+            },
+            .drain => |results| {
+                // Read `pending` first: once it is empty every result is in
+                // `completed`, so a discard pass in the same critical
+                // section drops all of them.
+                const pending_empty = self.pending.isEmpty();
+                if (results == .discard) {
+                    while (self.completed.pop()) |_| {}
+                }
+                return .{ .drain = .{ .pending_empty = pending_empty } };
+            },
         }
     }
 
@@ -495,22 +533,17 @@ pub const CompletionQueue = struct {
     /// and let the driver do the cancel. The wait here cannot itself be
     /// canceled.
     pub fn cancel(self: *CompletionQueue, c: *Completion) void {
-        self.mutex.lock();
-        self.checkSingleDriverLocked();
-        if (unlink(&self.completed, &c.group)) {
+        switch (self.consumeAsDriver(.{ .take_specific = &c.group }).take_specific) {
             // Finished already, just not taken yet. Nothing to cancel.
-            self.mutex.unlock();
-            return;
-        }
-        const was_pending = contains(&self.pending, &c.group);
-        self.mutex.unlock();
-
-        if (!was_pending) {
-            // Handed out by `wait` already, or never submitted here. Either way
-            // the caller holds a finished completion; a live one would mean it
-            // belongs to some other queue or group.
-            std.debug.assert(c.loadState().phase == .dead);
-            return;
+            .taken => return,
+            .absent => {
+                // Handed out by `wait` already, or never submitted here.
+                // Either way the caller holds a finished completion; a live
+                // one would mean it belongs to some other queue or group.
+                std.debug.assert(c.loadState().phase == .dead);
+                return;
+            },
+            .pending => {},
         }
 
         getCurrentExecutor().loopCancel(c);
@@ -518,15 +551,16 @@ pub const CompletionQueue = struct {
         while (true) {
             const seen = self.signal.load(.acquire);
 
-            self.mutex.lock();
-            const taken = unlink(&self.completed, &c.group);
-            self.mutex.unlock();
-
-            if (taken) return;
-
-            // Under the lock the node is in exactly one of the two queues, so
-            // not being in `completed` means it is still pending.
-            Futex.waitUncancelable(&self.signal.raw, seen);
+            switch (self.consumeAsDriver(.{ .take_specific = &c.group }).take_specific) {
+                .taken => return,
+                // Under the lock the node is in exactly one of the two
+                // queues, so not taken means it is still pending.
+                .pending => Futex.waitUncancelable(&self.signal.raw, seen),
+                // `ownerCallback` moves a node from `pending` to `completed`
+                // inside one critical section, so a node classified pending
+                // above cannot be observed in neither queue.
+                .absent => unreachable,
+            }
         }
     }
 
@@ -601,16 +635,8 @@ pub const CompletionQueue = struct {
         while (true) {
             const seen = self.signal.load(.acquire);
 
-            self.mutex.lock();
-            const pending_empty = self.pending.isEmpty();
-            // Read `pending` first: once it is empty every result is in
-            // `completed`, so this pass drops all of them.
-            if (results == .discard) {
-                while (self.completed.pop()) |_| {}
-            }
-            self.mutex.unlock();
-
-            if (pending_empty) break;
+            const pass = self.consumeAsDriver(.{ .drain = results }).drain;
+            if (pass.pending_empty) break;
 
             Futex.waitUncancelable(&self.signal.raw, seen);
         }
@@ -1676,4 +1702,63 @@ test "CompletionQueue: teardown drain leaves the queue memory quiescent" {
             }
         }
     }
+}
+
+test "CompletionQueue: completed is consumed only through consumeAsDriver and the select claim path" {
+    // The single-driver check was omitted at consuming sites three separate
+    // times while it was a convention. This test closes the list of
+    // functions that may consume from `completed`; a new consumer must
+    // either route through `consumeAsDriver` or be added here with the same
+    // reasoning as the select-side exceptions.
+    const src = @embedFile("completion_queue.zig");
+    // The needles are split so the scan cannot match its own source lines.
+    try expectConsumersAre(src, "self.completed" ++ ".pop()", &.{ "consumeAsDriver", "asyncWait", "claimToRegistered" }, 4);
+    try expectConsumersAre(src, "unlink(&self" ++ ".completed", &.{"consumeAsDriver"}, 1);
+    // `remove` bypasses the membership check that makes `unlink` safe here.
+    try std.testing.expect(std.mem.count(u8, src, "completed" ++ ".remove") == 0);
+    // The check itself must stay where the routing puts it: inside the
+    // dispatcher, and in `requestCancelAll`'s pending walk. Deleting it
+    // there would leave the routing intact and the protection gone.
+    try expectConsumersAre(src, "self." ++ "checkSingleDriverLocked()", &.{ "consumeAsDriver", "requestCancelAll" }, 2);
+}
+
+fn expectConsumersAre(src: []const u8, needle: []const u8, allowed: []const []const u8, expected_count: usize) !void {
+    var found: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, needle)) |at| : (i = at + needle.len) {
+        found += 1;
+        const owner = enclosingFnName(src, at) orelse {
+            std.debug.print("`{s}` outside any function body\n", .{needle});
+            return error.ConsumerOutsideFunction;
+        };
+        for (allowed) |name| {
+            if (std.mem.eql(u8, owner, name)) break;
+        } else {
+            std.debug.print("`{s}` in fn `{s}`, which is not an allowed consumer\n", .{ needle, owner });
+            return error.ForbiddenConsumer;
+        }
+    }
+    // The count is exact in both directions: fewer occurrences means the
+    // needle drifted from the code and this check went blind, which must be
+    // loud, never a silent shrink.
+    try std.testing.expectEqual(expected_count, found);
+}
+
+/// The name of the function whose declaration is nearest above `at`.
+/// Declarations are matched per line (`fn ` or `pub fn ` after indentation),
+/// so a `fn` inside a doc comment cannot match.
+fn enclosingFnName(src: []const u8, at: usize) ?[]const u8 {
+    var line_end = at;
+    while (line_end > 0) {
+        const line_start = if (std.mem.lastIndexOfScalar(u8, src[0..line_end], '\n')) |nl| nl + 1 else 0;
+        const line = std.mem.trimStart(u8, src[line_start..line_end], " ");
+        const decl = if (std.mem.startsWith(u8, line, "pub fn ")) line["pub fn ".len..] else if (std.mem.startsWith(u8, line, "fn ")) line["fn ".len..] else null;
+        if (decl) |d| {
+            const paren = std.mem.indexOfScalar(u8, d, '(') orelse return null;
+            return d[0..paren];
+        }
+        if (line_start == 0) return null;
+        line_end = line_start - 1;
+    }
+    return null;
 }
