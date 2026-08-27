@@ -37,14 +37,19 @@ const max_due = 32;
 pub const pipe_buf_cap = 4096;
 const fd_base: i32 = 100000;
 
+const Parked = struct {
+    c: *anyopaque,
+    id: u32,
+};
+
 const End = struct {
     used: bool = false,
     peer: u8 = 0,
     closed: bool = false,
     buf: [pipe_buf_cap]u8 = undefined,
     buf_len: usize = 0,
-    pending_recv: ?*anyopaque = null,
-    pending_send: ?*anyopaque = null,
+    pending_recv: ?Parked = null,
+    pending_send: ?Parked = null,
 };
 
 var ends: [max_ends]End = @splat(.{});
@@ -210,12 +215,17 @@ pub fn stateDigest() u64 {
         std.mem.writeInt(u16, eb[5..7], @truncate(e.buf_len), .little);
         eb[7] = 0;
         h.update(&eb);
+        var ids: [8]u8 = undefined;
+        std.mem.writeInt(u32, ids[0..4], if (e.pending_recv) |p| p.id else 0, .little);
+        std.mem.writeInt(u32, ids[4..8], if (e.pending_send) |p| p.id else 0, .little);
+        h.update(&ids);
         if (e.used and e.buf_len > 0) {
             h.update(e.buf[0..e.buf_len]);
         }
     }
-    std.mem.writeInt(u64, buf[0..8], due_len, .little);
-    h.update(buf[0..8]);
+    std.mem.writeInt(u32, buf[0..4], next_io_id, .little);
+    std.mem.writeInt(u64, buf[4..12], due_len, .little);
+    h.update(buf[0..12]);
     var d: usize = 0;
     while (d < due_len) : (d += 1) {
         std.mem.writeInt(u64, buf[0..8], due[d].due_at, .little);
@@ -301,14 +311,18 @@ fn ioDelayNs() u64 {
     return if (pickIndex(2) == 0) 1_000_000 else 5_000_000;
 }
 
-fn pushDueKind(c: *anyopaque, kind: DueKind) void {
-    if (due_len >= max_due) panic("sim: I/O due list full", .{});
+fn allocOpId() u32 {
     next_io_id += 1;
+    return next_io_id;
+}
+
+fn pushDueKind(c: *anyopaque, kind: DueKind, id: u32) void {
+    if (due_len >= max_due) panic("sim: I/O due list full", .{});
     due[due_len] = .{
         .c = c,
         .due_at = clock_ns + ioDelayNs(),
         .kind = kind,
-        .id = next_io_id,
+        .id = id,
     };
     due_len += 1;
 }
@@ -348,60 +362,63 @@ pub const IoSubmit = union(enum) {
 
 /// Copy `src` into the peer's recv buffer.
 pub fn sendBytes(fd: i32, src: []const u8, send_c: *anyopaque) IoSubmit {
-    return copySend(fd, src, send_c, true);
+    if (endIndex(fd) == null) return .bad_fd;
+    return copySend(fd, src, send_c, allocOpId(), true);
 }
 
 /// Harvest a capacity-woken send: copy without re-queueing this completion.
-pub fn harvestSend(fd: i32, src: []const u8, send_c: *anyopaque) IoSubmit {
-    return copySend(fd, src, send_c, false);
+/// `id` is the submit-time id from the due entry.
+pub fn harvestSend(fd: i32, src: []const u8, send_c: *anyopaque, id: u32) IoSubmit {
+    return copySend(fd, src, send_c, id, false);
 }
 
-fn copySend(fd: i32, src: []const u8, send_c: *anyopaque, schedule: bool) IoSubmit {
+fn copySend(fd: i32, src: []const u8, send_c: *anyopaque, id: u32, schedule: bool) IoSubmit {
     const i = endIndex(fd) orelse return .bad_fd;
     if (ends[i].closed) return .eof;
     const p = ends[i].peer;
     if (ends[p].closed) return .eof;
     if (src.len == 0) {
-        if (schedule) pushDueKind(send_c, .send);
+        if (schedule) pushDueKind(send_c, .send, id);
         return .{ .due = 0 };
     }
     const space = pipe_buf_cap - ends[p].buf_len;
     if (space == 0) {
         if (ends[i].pending_send != null) panic("sim: two sends parked on one fd", .{});
-        ends[i].pending_send = send_c;
+        ends[i].pending_send = .{ .c = send_c, .id = id };
         return .parked;
     }
     const n = @min(src.len, space);
     @memcpy(ends[p].buf[ends[p].buf_len..][0..n], src[0..n]);
     ends[p].buf_len += n;
-    if (schedule) pushDueKind(send_c, .send);
+    if (schedule) pushDueKind(send_c, .send, id);
     if (ends[p].pending_recv) |rc| {
         ends[p].pending_recv = null;
-        pushDueKind(rc, .recv);
+        pushDueKind(rc.c, .recv, rc.id);
     }
     return .{ .due = n };
 }
 
 pub fn recvInto(fd: i32, dst: []u8, recv_c: *anyopaque, dont_wait: bool) IoSubmit {
     const i = endIndex(fd) orelse return .bad_fd;
+    const id = allocOpId();
     if (ends[i].buf_len == 0) {
         if (ends[i].closed or ends[ends[i].peer].closed) {
-            pushDueKind(recv_c, .recv);
+            pushDueKind(recv_c, .recv, id);
             return .eof;
         }
         if (dont_wait) return .would_block;
         if (ends[i].pending_recv != null) panic("sim: two recvs parked on one fd", .{});
-        ends[i].pending_recv = recv_c;
+        ends[i].pending_recv = .{ .c = recv_c, .id = id };
         return .parked;
     }
     const n = drainBuf(fd, dst);
-    pushDueKind(recv_c, .recv);
+    pushDueKind(recv_c, .recv, id);
     // A send parks on the sender end when this (recv) buffer is full.
     // Draining it must wake the peer's pending_send, not ours.
     const p = ends[i].peer;
     if (ends[p].pending_send) |sc| {
         ends[p].pending_send = null;
-        pushDueKind(sc, .send);
+        pushDueKind(sc.c, .send, sc.id);
     }
     return .{ .due = n };
 }
@@ -424,37 +441,42 @@ pub fn recvIsEof(fd: i32) bool {
 
 pub fn closeFd(fd: i32, close_c: *anyopaque) enum { due, bad_fd } {
     const i = endIndex(fd) orelse return .bad_fd;
+    const id = allocOpId();
     ends[i].closed = true;
     if (ends[i].pending_recv) |rc| {
         ends[i].pending_recv = null;
-        pushDueKind(rc, .recv);
+        pushDueKind(rc.c, .recv, rc.id);
     }
     if (ends[i].pending_send) |sc| {
         ends[i].pending_send = null;
-        pushDueKind(sc, .send);
+        pushDueKind(sc.c, .send, sc.id);
     }
     const p = ends[i].peer;
     if (ends[p].pending_recv) |rc| {
         ends[p].pending_recv = null;
-        pushDueKind(rc, .recv);
+        pushDueKind(rc.c, .recv, rc.id);
     }
     if (ends[p].pending_send) |sc| {
         ends[p].pending_send = null;
-        pushDueKind(sc, .send);
+        pushDueKind(sc.c, .send, sc.id);
     }
-    pushDueKind(close_c, .close);
+    pushDueKind(close_c, .close, id);
     return .due;
 }
 
 pub fn cancelIo(c: *anyopaque) bool {
     for (&ends) |*e| {
-        if (e.pending_recv == c) {
-            e.pending_recv = null;
-            return true;
+        if (e.pending_recv) |p| {
+            if (p.c == c) {
+                e.pending_recv = null;
+                return true;
+            }
         }
-        if (e.pending_send == c) {
-            e.pending_send = null;
-            return true;
+        if (e.pending_send) |p| {
+            if (p.c == c) {
+                e.pending_send = null;
+                return true;
+            }
         }
     }
     var i: usize = 0;
@@ -506,4 +528,83 @@ pub fn mutantOmitTimeoutRecheck() bool {
 pub fn mutantArmTimerStale() bool {
     if (comptime !compiled_in) return false;
     return comptime std.mem.eql(u8, zio_options.sim_mutant, "arm_timer_stale");
+}
+
+pub const ProbeOut = struct {
+    trace: u64,
+    state: u64,
+    events: u64,
+    clock: u64,
+};
+
+pub const WakeFirst = enum { a, b };
+
+/// Two parked recvs submitted A then B. Wake order is `first`. Submit ids
+/// must make the two orders hash differently.
+pub fn runWakeOrderProbe(seed_value: u64, first: WakeFirst) ProbeOut {
+    if (comptime !compiled_in) unreachable;
+    begin(seed_value);
+    defer end();
+
+    const pa = pipePair();
+    const pb = pipePair();
+    var ca: u8 = 1;
+    var cb: u8 = 2;
+    var sa: u8 = 3;
+    var sb: u8 = 4;
+    var da: [1]u8 = undefined;
+    var db: [1]u8 = undefined;
+
+    switch (recvInto(pa[0], &da, &ca, false)) {
+        .parked => {},
+        else => panic("probe: recv A should park", .{}),
+    }
+    switch (recvInto(pb[0], &db, &cb, false)) {
+        .parked => {},
+        else => panic("probe: recv B should park", .{}),
+    }
+
+    const payload = "x";
+    if (first == .a) {
+        switch (sendBytes(pa[1], payload, &sa)) {
+            .due => {},
+            else => panic("probe: send A should complete", .{}),
+        }
+        switch (sendBytes(pb[1], payload, &sb)) {
+            .due => {},
+            else => panic("probe: send B should complete", .{}),
+        }
+    } else {
+        switch (sendBytes(pb[1], payload, &sb)) {
+            .due => {},
+            else => panic("probe: send B should complete", .{}),
+        }
+        switch (sendBytes(pa[1], payload, &sa)) {
+            .due => {},
+            else => panic("probe: send A should complete", .{}),
+        }
+    }
+
+    advanceNs(10_000_000);
+    var buf: [8]TakenDue = undefined;
+    const n = takeDue(&buf);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        emit(.io_complete, 0, buf[i].id);
+    }
+
+    return .{
+        .trace = traceHash(),
+        .state = stateDigest(),
+        .events = event_count,
+        .clock = clock_ns,
+    };
+}
+
+test "submit I/O id is stable across wake order" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    const ab = runWakeOrderProbe(1, .a);
+    const ba = runWakeOrderProbe(1, .b);
+    try std.testing.expect(ab.state != ba.state);
+    try std.testing.expect(ab.trace != ba.trace);
 }

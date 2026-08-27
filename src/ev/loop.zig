@@ -1656,7 +1656,7 @@ pub const Loop = struct {
                         // only for a closed peer.
                         const op = c.cast(NetSend);
                         const src = firstWriteSlice(op.buffer);
-                        switch (sim.harvestSend(op.handle, src, c)) {
+                        switch (sim.harvestSend(op.handle, src, c, buf[i].id)) {
                             .due => |sent| c.setResult(.net_send, sent),
                             .eof => c.setError(error.BrokenPipe),
                             .parked => continue,
