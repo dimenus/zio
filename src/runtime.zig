@@ -558,8 +558,19 @@ pub const Executor = struct {
         errdefer cleanupStackGrowth();
 
         // Initialize this executor's random state from OS entropy.
-        try random_mod.setup(&self.random_state);
-        self.steal_prng = std.Random.DefaultPrng.init(self.random_state.csprng.random().int(u64));
+        // Sim mode seeds from the DST seed so the CSPRNG is not a hidden
+        // source of nondeterminism.
+        if (comptime zio_options.sim) {
+            const sim = @import("sim.zig");
+            var seed_bytes: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+            var seed_prng = std.Random.DefaultPrng.init(sim.seed());
+            seed_prng.fill(&seed_bytes);
+            self.random_state.csprng = .init(seed_bytes);
+            self.steal_prng = .init(sim.seed() ^ 0x9E3779B97F4A7C15);
+        } else {
+            try random_mod.setup(&self.random_state);
+            self.steal_prng = std.Random.DefaultPrng.init(self.random_state.csprng.random().int(u64));
+        }
 
         try self.loop.init(.{
             .allocator = self.runtime.allocator,
@@ -1003,6 +1014,28 @@ pub const Executor = struct {
         // can't starve timers or I/O.
         if (!self.tickBudgetLeft()) {
             return null;
+        }
+
+        if (comptime zio_options.sim) {
+            const sim = @import("sim.zig");
+            const cap = LocalRunQueue(WaitNode, zio_options.task_migration).capacity;
+            var buf: [cap]*WaitNode = undefined;
+            var n: usize = 0;
+            while (n < cap) {
+                buf[n] = self.run_queue.pop() orelse break;
+                n += 1;
+            }
+            if (n == 0) return null;
+            const pick: usize = if (n == 1) 0 else sim.pickIndex(n);
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                if (i == pick) continue;
+                _ = self.run_queue.push(buf[i]);
+            }
+            self.spendQuantum();
+            const task = AnyTask.fromWaitNode(buf[pick]);
+            sim.emit(.task_switch, sim.taskId(@intFromPtr(task)), self.id);
+            return task;
         }
 
         const node = self.run_queue.pop() orelse return null;
@@ -1487,6 +1520,14 @@ pub const Runtime = struct {
 
         const num_executors = options.executors.resolve();
         const num_workers = if (options.enable_main_executor) num_executors - 1 else num_executors;
+
+        if (comptime zio_options.sim) {
+            const sim = @import("sim.zig");
+            if (!sim.isBegun()) @panic("sim: begin() before Runtime.init");
+            if (num_executors != 1 or !options.enable_main_executor) {
+                @panic("sim: M1 requires executors=1 with the main executor");
+            }
+        }
 
         self.* = .{
             .allocator = allocator,

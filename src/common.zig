@@ -227,6 +227,10 @@ pub const Waiter = struct {
             .direct => |*d| {
                 if (d.task) |task| {
                     _ = d.notify.state.fetchAdd(1, .release);
+                    if (comptime @import("zio_options").sim) {
+                        const sim = @import("sim.zig");
+                        sim.emit(.wake, sim.taskId(@intFromPtr(task)), 0);
+                    }
                     task.wake();
                 } else {
                     d.notify.signal();

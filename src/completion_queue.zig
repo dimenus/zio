@@ -73,6 +73,8 @@ const Closeable = common.Closeable;
 const Waiter = common.Waiter;
 const Timeout = @import("time.zig").Timeout;
 const Completion = ev.Completion;
+const zio_options = @import("zio_options");
+const sim = @import("sim.zig");
 
 pub const CompletionQueue = struct {
     mutex: os.Mutex,
@@ -251,9 +253,20 @@ pub const CompletionQueue = struct {
                     // A completion, or the close, can still have landed
                     // together with the timeout; report those rather than a
                     // timeout that did not happen.
-                    const last = self.consumeAsDriver(.take_head).take_head;
-                    if (last.node) |x| return completionFromGroup(x);
-                    return if (last.drained) error.Closed else error.Timeout;
+                    if (!sim.mutantOmitTimeoutRecheck()) {
+                        const last = self.consumeAsDriver(.take_head).take_head;
+                        if (last.node) |x| return completionFromGroup(x);
+                        if (last.drained) return error.Closed;
+                    }
+                    if (comptime zio_options.sim) {
+                        self.mutex.lock();
+                        const leaked = !self.completed.isEmpty();
+                        self.mutex.unlock();
+                        if (leaked) {
+                            @panic("CompletionQueue: timedWait Timeout with a ready completion");
+                        }
+                    }
+                    return error.Timeout;
                 },
             };
         }
@@ -346,6 +359,12 @@ pub const CompletionQueue = struct {
         switch (op) {
             .take_head => {
                 const node = self.completed.pop();
+                if (comptime zio_options.sim) {
+                    if (node) |n| {
+                        const c = completionFromGroup(n);
+                        sim.emit(.cq_pop, @intFromEnum(c.op), 0);
+                    }
+                }
                 const drained = node == null and self.closed and self.pending.isEmpty();
                 return .{ .take_head = .{ .node = node, .drained = drained } };
             },

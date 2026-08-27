@@ -25,6 +25,8 @@ const net = @import("../os/net.zig");
 const common = @import("backends/common.zig");
 
 const log = @import("../common.zig").log;
+const zio_options = @import("zio_options");
+const sim = @import("../sim.zig");
 
 const in_safe_mode = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
 const in_debug_mode = builtin.mode == .Debug;
@@ -417,7 +419,25 @@ pub const LoopState = struct {
     pub fn armTimer(self: *LoopState, timer: *Timer) void {
         switch (timer.timeout) {
             .none => timer.deadline = .{ .value = std.math.maxInt(time.TimeInt) },
-            .duration => |d| timer.deadline = self.nowFor(timer.clock).addDuration(d),
+            .duration => |d| {
+                var now = self.nowFor(timer.clock);
+                if (comptime zio_options.sim) {
+                    if (sim.mutantArmTimerStale()) {
+                        now = .fromNanoseconds(0);
+                    }
+                }
+                timer.deadline = now.addDuration(d);
+                if (comptime zio_options.sim) {
+                    if (d.value > 0) {
+                        const dl = timer.deadline.toNanoseconds();
+                        const true_now = sim.nowNs();
+                        const dur = d.toNanoseconds();
+                        if (dl + 1 < true_now + dur) {
+                            @panic("armTimer backdated: deadline behind true now + duration");
+                        }
+                    }
+                }
+            },
             .deadline => |ts| timer.deadline = ts,
         }
         self.timers[clockIndex(timer.clock)].insert(timer);
@@ -607,6 +627,7 @@ pub const Loop = struct {
         // If we're the first to request a wake since the last poll, do the syscall.
         // Subsequent wakers see true and skip - the syscall is already pending.
         if (self.state.wake_requested.fetchOr(LoopState.wake_loop, .acq_rel) == 0) {
+            if (comptime zio_options.sim) return;
             self.backend.wake(&self.state);
         }
     }
@@ -614,6 +635,7 @@ pub const Loop = struct {
     /// Wake up the loop to process async handles (thread-safe)
     pub fn wakeAsync(self: *Loop) void {
         if (self.state.wake_requested.fetchOr(LoopState.wake_async, .acq_rel) == 0) {
+            if (comptime zio_options.sim) return;
             self.backend.wake(&self.state);
         }
     }
@@ -705,7 +727,9 @@ pub const Loop = struct {
             }
 
             if (target.state.wake_requested.fetchOr(LoopState.wake_cancel, .acq_rel) == 0) {
-                target.backend.wake(&target.state);
+                if (comptime !zio_options.sim) {
+                    target.backend.wake(&target.state);
+                }
             }
         }
     }
@@ -1036,7 +1060,22 @@ pub const Loop = struct {
                 self.state.unlockTimers();
 
                 // Mark completions outside the lock
+                if (comptime zio_options.sim) {
+                    // Same-deadline fire order is a real source of
+                    // nondeterminism. Shuffle the batch with the sim RNG.
+                    var i: usize = batch_count;
+                    while (i > 1) {
+                        i -= 1;
+                        const j = sim.pickIndex(i + 1);
+                        const tmp = batch[i];
+                        batch[i] = batch[j];
+                        batch[j] = tmp;
+                    }
+                }
                 for (batch[0..batch_count]) |timer| {
+                    if (comptime zio_options.sim) {
+                        sim.emit(.timer_fire, @intFromEnum(clock), @truncate(timer.deadline.value));
+                    }
                     self.state.markCompleted(&timer.c);
                     fired = true;
                 }
@@ -1384,6 +1423,9 @@ pub const Loop = struct {
     /// Timer deadlines, pending completions, and the loop's `max_wait` option
     /// can all shorten the wait; they never lengthen it.
     pub fn poll(self: *Loop, wait_cap: Duration) !void {
+        if (comptime zio_options.sim) {
+            return self.pollSim(wait_cap);
+        }
         std.debug.assert(self.state.initialized);
         if (self.done()) return;
 
@@ -1444,6 +1486,57 @@ pub const Loop = struct {
         // Only if we timed out: the timeout was the earliest deadline, so
         // waking ahead of it means nothing has expired.
         if (timed_out) {
+            _ = self.checkTimers();
+        }
+    }
+
+    /// Sim poll: never call the kernel backend. Advance the logical clock
+    /// by the timeout the real poll would have slept, then fire timers.
+    /// A full park with no timer and no completion is a deadlock.
+    fn pollSim(self: *Loop, wait_cap: Duration) !void {
+        std.debug.assert(self.state.initialized);
+        if (self.done()) return;
+
+        const wait = wait_cap.value != 0;
+
+        self.state.updateNow();
+        const timer_result = self.checkTimers();
+        self.state.sweepResend();
+
+        var timeout: Duration = .zero;
+        if (wait) {
+            if (!self.state.completions.empty() or !self.state.work_completions.empty() or timer_result.fired) {
+                timeout = .zero;
+            } else if (timer_result.next_timeout) |t| {
+                timeout = if (t.value < self.max_wait.value) t else self.max_wait;
+            } else {
+                timeout = self.max_wait;
+            }
+            if (wait_cap.value < timeout.value) {
+                timeout = wait_cap;
+            }
+        }
+
+        const wake_flags = self.state.wake_requested.swap(0, .acq_rel);
+
+        if (timeout.value != 0) {
+            if (timer_result.next_timeout == null and timeout.value >= self.max_wait.value) {
+                sim.deadlock();
+            }
+            sim.advanceNs(timeout.toNanoseconds());
+        }
+
+        self.state.updateNow();
+
+        if (wake_flags & LoopState.wake_async != 0) {
+            self.processAsyncHandles();
+        }
+        if (wake_flags & LoopState.wake_cancel != 0) {
+            self.processCancelQueue();
+        }
+        self.processCompletions();
+
+        if (timeout.value != 0) {
             _ = self.checkTimers();
         }
     }

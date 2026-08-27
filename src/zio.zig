@@ -95,6 +95,10 @@ pub const ev = @import("ev/root.zig");
 /// Low-level OS APIs.
 pub const os = @import("os/root.zig");
 
+/// Deterministic simulation (DST). Production builds compile this module
+/// with `sim=false`; `begin` panics unless the harness built `-Dsim=true`.
+pub const sim = @import("sim.zig");
+
 test {
     std.testing.refAllDecls(@This());
     _ = @import("io.zig");
