@@ -141,15 +141,33 @@ fn checkSelfWait(task: *AnyTask, future: anytype) void {
     }
 }
 
-/// A CQ WaitContext deposit that is still in `claimed` at select return
+/// A CQ or channel WaitContext deposit that is still set at select return
 /// was not consumed by getResult and was not restored. Panic.
 fn assertNoAbandonedDeposit(contexts: anytype) void {
     inline for (@typeInfo(@TypeOf(contexts)).@"struct".fields) |cf| {
-        if (comptime @hasField(cf.type, "claimed")) {
-            if (@field(contexts, cf.name).claimed != null) {
-                @panic("select: frame exit abandons a claimed deposit");
-            }
+        assertDepositField(@field(contexts, cf.name));
+    }
+}
+
+fn assertDepositField(ctx: anytype) void {
+    const T = @TypeOf(ctx);
+    if (comptime @hasField(T, "claimed")) {
+        if (ctx.claimed != null) {
+            @panic("select: frame exit abandons a claimed deposit");
         }
+    }
+    if (comptime @hasField(T, "result_set")) {
+        if (ctx.result_set) {
+            @panic("select: frame exit abandons a channel deposit");
+        }
+    }
+    if (comptime @hasField(T, "succeeded")) {
+        if (ctx.succeeded) {
+            @panic("select: frame exit abandons a channel deposit");
+        }
+    }
+    if (comptime @hasField(T, "impl_ctx")) {
+        assertDepositField(ctx.impl_ctx);
     }
 }
 

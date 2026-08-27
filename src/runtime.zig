@@ -773,6 +773,27 @@ pub const Executor = struct {
             }
         }
         if (ready_n > 0) {
+            // Half the time, harvest due I/O/timers before the ready batch.
+            // Without that, a canceled select always runs (deregisters)
+            // before poll can fire a claim into it.
+            if (sim.pickIndex(2) == 0) {
+                for (execs) |e| {
+                    e.loop.bindThread();
+                    setCurrentExecutor(e);
+                    try e.loop.poll(.zero);
+                    e.drainDispatched();
+                }
+                home.loop.bindThread();
+                setCurrentExecutor(home);
+                ready_n = 0;
+                for (execs) |e| {
+                    if (simHasReady(e)) {
+                        ready[ready_n] = e;
+                        ready_n += 1;
+                    }
+                }
+                if (ready_n == 0) return;
+            }
             const pick = if (ready_n == 1) 0 else sim.pickIndex(ready_n);
             simRunOneTask(ready[pick]);
             home.loop.bindThread();

@@ -449,10 +449,13 @@ const AsyncSendImpl = struct {
     }
 
     pub fn asyncCancelWait(self: *const SendSelf, waiter: *Waiter, ctx: *WaitContext) bool {
-        _ = ctx;
         self.channel.mutex.lockUncancelable();
         const was_in_queue = self.channel.sender_queue.remove(&waiter.node);
         self.channel.mutex.unlock();
+
+        if (!waiter.isDirect() and ctx.succeeded and !waiter.didWin()) {
+            @panic("Channel: select cancel abandons a claimed send");
+        }
 
         if (was_in_queue) {
             return true;
@@ -463,6 +466,7 @@ const AsyncSendImpl = struct {
 
     pub fn getResult(self: *const SendSelf, ctx: *WaitContext) Closeable!void {
         if (ctx.succeeded) {
+            ctx.succeeded = false;
             return {};
         }
         std.debug.assert(self.channel.closed);
@@ -546,10 +550,13 @@ const AsyncReceiveImpl = struct {
     }
 
     pub fn asyncCancelWait(self: *const RecvSelf, waiter: *Waiter, ctx: *WaitContext) bool {
-        _ = ctx;
         self.channel.mutex.lockUncancelable();
         const was_in_queue = self.channel.receiver_queue.remove(&waiter.node);
         self.channel.mutex.unlock();
+
+        if (!waiter.isDirect() and ctx.result_set and !waiter.didWin()) {
+            @panic("Channel: select cancel abandons a claimed deposit");
+        }
 
         if (was_in_queue) {
             return true;
@@ -561,6 +568,7 @@ const AsyncReceiveImpl = struct {
     pub fn getResult(self: *const RecvSelf, ctx: *WaitContext) Closeable!void {
         // Result already set by direct transfer or fast path
         if (ctx.result_set) {
+            ctx.result_set = false;
             return;
         }
 
