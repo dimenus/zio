@@ -741,12 +741,29 @@ pub const Executor = struct {
 
     pub fn simCoopYield(self: *Executor) void {
         if (sim_coop_depth != 0) return;
-        if (self.runtime.executors.items.len < 2) return;
         sim_coop_depth = 1;
         defer sim_coop_depth = 0;
+
+        const execs = self.runtime.executors.items;
+        // Called from a task (select settle/sweep): harvest due timers and
+        // I/O so a CQ ownerCallback can claim before settle deregisters.
+        // Called from poll (current_task is null): skip, nested poll on
+        // this loop is unsafe; mux already harvests between ready steps.
+        if (self.current_task != null) {
+            for (execs) |e| {
+                e.loop.bindThread();
+                setCurrentExecutor(e);
+                e.loop.poll(.zero) catch {};
+                e.drainDispatched();
+            }
+            self.loop.bindThread();
+            setCurrentExecutor(self);
+        }
+
+        if (execs.len < 2) return;
         var ready: [2]*Executor = undefined;
         var n: usize = 0;
-        for (self.runtime.executors.items) |e| {
+        for (execs) |e| {
             if (e == self) continue;
             if (simHasReady(e)) {
                 ready[n] = e;
