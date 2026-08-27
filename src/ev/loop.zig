@@ -423,14 +423,14 @@ pub const LoopState = struct {
                 var now = self.nowFor(timer.clock);
                 if (comptime zio_options.sim) {
                     if (sim.mutantArmTimerStale()) {
-                        now = .fromNanoseconds(0);
+                        now = .fromNanoseconds(sim.epochNs(@intFromEnum(timer.clock)));
                     }
                 }
                 timer.deadline = now.addDuration(d);
                 if (comptime zio_options.sim) {
                     if (d.value > 0) {
                         const dl = timer.deadline.toNanoseconds();
-                        const true_now = sim.nowNs();
+                        const true_now = sim.nowNsFor(@intFromEnum(timer.clock));
                         const dur = d.toNanoseconds();
                         if (dl + 1 < true_now + dur) {
                             @panic("armTimer backdated: deadline behind true now + duration");

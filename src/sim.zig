@@ -63,6 +63,10 @@ pub fn setClockRouted(routed: bool) void {
     clock_routed = routed;
 }
 
+/// Unix-scale offset for `.real`, matching the #717 witness: a `.real`
+/// timestamp is ~1.7e18 ns and must not sit on the awake heap.
+pub const real_epoch_ns: u64 = 1_700_000_000_000_000_000;
+
 /// Logical time in nanoseconds. Panics if sim mode is on but the clock is
 /// not routed here (the D4 trip).
 pub fn nowNs() u64 {
@@ -70,6 +74,17 @@ pub fn nowNs() u64 {
     if (!begun) @panic("sim: clock read before begin");
     if (!clock_routed) @panic("sim: real clock_gettime");
     return clock_ns;
+}
+
+/// Wall-clock now. `clock_idx` is `@intFromEnum(time.Clock)`. `.real` (2)
+/// lives in a distinct epoch so `AutoCancel.setClock(..., .real)` is
+/// load-bearing: a `.real` deadline on the awake heap never fires.
+pub fn nowNsFor(clock_idx: u8) u64 {
+    return nowNs() + epochNs(clock_idx);
+}
+
+pub fn epochNs(clock_idx: u8) u64 {
+    return if (clock_idx == 2) real_epoch_ns else 0;
 }
 
 pub fn advanceNs(ns: u64) void {
@@ -151,9 +166,9 @@ pub fn forbidKernelFutex() void {
 }
 
 pub fn printScope() void {
-    std.debug.print("SCOPE simulated: clock, futex_park, task_pick, timer_heap, cq, executor_csprng\n", .{});
+    std.debug.print("SCOPE simulated: clock, futex_park, task_pick, timer_heap, cq, executor_csprng, real_epoch\n", .{});
     std.debug.print("SCOPE real: kqueue_fd (Loop.init, never polled), allocator, libc\n", .{});
-    std.debug.print("SCOPE unsimulated: io_uring, file_io, net_io, extra_os_threads, dns, boot_vs_awake (one logical clock)\n", .{});
+    std.debug.print("SCOPE unsimulated: io_uring, file_io, net_io, extra_os_threads, dns, boot_vs_awake (boot==awake)\n", .{});
 }
 
 pub fn mutantOmitTimeoutRecheck() bool {

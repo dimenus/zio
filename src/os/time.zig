@@ -54,7 +54,7 @@ const zio_options = @import("zio_options");
 
 pub fn now(clock: Clock) Timestamp {
     if (comptime zio_options.sim) {
-        return Timestamp.fromNanoseconds(@import("../sim.zig").nowNs());
+        return Timestamp.fromNanoseconds(@import("../sim.zig").nowNsFor(@intFromEnum(clock)));
     }
     return nowHost(clock);
 }
