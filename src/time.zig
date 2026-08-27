@@ -551,6 +551,10 @@ pub const Timeout = union(enum) {
         timer: ev.Timer = ev.Timer.init(.{ .duration = .zero }),
         waiter: ?*Waiter = null,
         fired: std.atomic.Value(bool) = .init(false),
+
+        pub fn holdsDeposit(_: *const WaitContext) bool {
+            return false;
+        }
     };
 
     pub fn asyncWait(self: *const Timeout, waiter: *Waiter, ctx: *WaitContext) common.AsyncWaitState {

@@ -247,6 +247,10 @@ pub const Group = struct {
         /// asyncCancelWait must keep reporting it as an in-flight signal so
         /// the caller's cleanup outwaits it.
         pending_signal: bool = false,
+
+        pub fn holdsDeposit(_: *const WaitContext) bool {
+            return false;
+        }
     };
 
     pub fn getResult(self: *Group, ctx: *WaitContext) void {

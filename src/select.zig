@@ -115,8 +115,10 @@ const meta = @import("meta.zig");
 //     holdsDeposit() is false afterwards. A select loser that still holds a
 //     deposit at asyncCancelWait, or a frame exit that still holds one, is a
 //     protocol violation and panics.
-//     WaitContext that can hold a deposit implements:
+//     Every non-void WaitContext implements:
 //       pub fn holdsDeposit(self: *const WaitContext) bool
+//     Contexts that never own a deposit return false. Missing the method is
+//     a compile error. Do not infer ownership from field names.
 
 /// Extract the Future type from a pointer or value type
 fn FutureType(comptime T: type) type {
@@ -144,7 +146,7 @@ fn checkSelfWait(task: *AnyTask, future: anytype) void {
         if (std.meta.hasMethod(@TypeOf(future), "toAwaitable")) {
             const awaitable_ptr = future.toAwaitable();
             if (awaitable_ptr == &task.awaitable) {
-                std.debug.panic("cannot wait on self (would deadlock)", .{});
+                sim.protocolPanic("cannot wait on self (would deadlock)");
             }
         }
     }
@@ -160,19 +162,11 @@ fn assertNoAbandonedDeposit(contexts: anytype) void {
 
 fn assertDepositField(ctx: anytype) void {
     const T = @TypeOf(ctx);
-    if (comptime @hasDecl(T, "holdsDeposit")) {
-        if (ctx.holdsDeposit()) {
-            sim.protocolPanic("select: frame exit abandons a claimed deposit");
-        }
-    } else {
-        comptime {
-            if (@hasField(T, "result") or @hasField(T, "result_set") or @hasField(T, "succeeded")) {
-                @compileError(@typeName(T) ++ " stores a deposit but has no holdsDeposit()");
-            }
-        }
+    if (comptime !@hasDecl(T, "holdsDeposit")) {
+        @compileError(@typeName(T) ++ " WaitContext must implement holdsDeposit()");
     }
-    if (comptime @hasField(T, "impl_ctx")) {
-        assertDepositField(ctx.impl_ctx);
+    if (ctx.holdsDeposit()) {
+        sim.protocolPanic("select: frame exit abandons a claimed deposit");
     }
 }
 
@@ -180,7 +174,11 @@ fn assertDepositField(ctx: anytype) void {
 fn FutureWaitContext(comptime future_type: type) type {
     const Future = FutureType(future_type);
     if (@hasDecl(Future, "WaitContext")) {
-        return Future.WaitContext;
+        const W = Future.WaitContext;
+        if (W != void and !@hasDecl(W, "holdsDeposit")) {
+            @compileError(@typeName(W) ++ " WaitContext must implement holdsDeposit()");
+        }
+        return W;
     }
     return void;
 }
@@ -504,7 +502,7 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
 
     const winner_index = winner.load(.acquire);
     if (winner_index == NO_WINNER) {
-        std.debug.assert(canceled);
+        if (!canceled) sim.protocolPanic("select: no winner without cancellation");
         return error.Canceled;
     }
 
@@ -537,7 +535,7 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
 pub fn selectAwaitables(awaitables: []const *Awaitable) Cancelable!usize {
     const max_awaitables = 64;
     if (awaitables.len > max_awaitables) {
-        @panic("selectAwaitables: too many awaitables (max 64)");
+        sim.protocolPanic("selectAwaitables: too many awaitables (max 64)");
     }
 
     var winner: std.atomic.Value(usize) = .init(NO_WINNER);
@@ -601,7 +599,7 @@ pub fn selectAwaitables(awaitables: []const *Awaitable) Cancelable!usize {
 
     const winner_index = winner.load(.acquire);
     if (winner_index == NO_WINNER) {
-        std.debug.assert(canceled);
+        if (!canceled) sim.protocolPanic("select: no winner without cancellation");
         return error.Canceled;
     }
     // The cancelable wait consumed the cancellation request but a claimed
@@ -1173,7 +1171,13 @@ test "select: promotes a notification that bounced off the commit fence" {
         event: *ResetEvent,
 
         pub const Result = void;
-        pub const WaitContext = struct { fenced: bool = false };
+        pub const WaitContext = struct {
+            fenced: bool = false,
+
+            pub fn holdsDeposit(_: *const WaitContext) bool {
+                return false;
+            }
+        };
 
         pub fn asyncWait(self: *@This(), waiter: *Waiter, ctx: *WaitContext) common.AsyncWaitState {
             if (ctx.fenced) {

@@ -6,6 +6,7 @@
 // paths do not exist there.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zio_options = @import("zio_options");
 
 pub const compiled_in = zio_options.sim;
@@ -47,14 +48,28 @@ const End = struct {
 };
 
 var ends: [max_ends]End = @splat(.{});
+
+pub const DueKind = enum(u8) {
+    recv = 1,
+    send = 2,
+    close = 3,
+};
+
 const Due = struct {
     c: *anyopaque,
     due_at: u64,
-    kind: u8,
+    kind: DueKind,
+    id: u32,
+};
+
+pub const TakenDue = struct {
+    c: *anyopaque,
+    id: u32,
 };
 
 var due: [max_due]Due = undefined;
 var due_len: usize = 0;
+var next_io_id: u32 = 0;
 
 pub fn isBegun() bool {
     return begun;
@@ -68,7 +83,7 @@ pub fn begin(seed_value: u64) void {
     if (comptime !compiled_in) {
         @panic("sim: not compiled in (build zio with -Dsim=true)");
     }
-    if (begun) @panic("sim: begin() called twice without end()");
+    if (begun) panic("sim: begin() called twice without end()", .{});
     begun = true;
     clock_routed = true;
     current_seed = seed_value;
@@ -84,6 +99,7 @@ pub fn begin(seed_value: u64) void {
 fn resetIo() void {
     ends = @splat(.{});
     due_len = 0;
+    next_io_id = 0;
 }
 
 pub fn end() void {
@@ -103,8 +119,8 @@ pub const real_epoch_ns: u64 = 1_700_000_000_000_000_000;
 /// not routed here (the D4 trip).
 pub fn nowNs() u64 {
     if (comptime !compiled_in) unreachable;
-    if (!begun) @panic("sim: clock read before begin");
-    if (!clock_routed) @panic("sim: real clock_gettime");
+    if (!begun) panic("sim: clock read before begin", .{});
+    if (!clock_routed) panic("sim: real clock_gettime", .{});
     return clock_ns;
 }
 
@@ -121,14 +137,14 @@ pub fn epochNs(clock_idx: u8) u64 {
 
 pub fn advanceNs(ns: u64) void {
     if (comptime !compiled_in) return;
-    if (!begun) @panic("sim: advance before begin");
+    if (!begun) panic("sim: advance before begin", .{});
     clock_ns +|= ns;
 }
 
 pub fn pickIndex(n: usize) usize {
     if (comptime !compiled_in) unreachable;
-    if (!begun) @panic("sim: pick before begin");
-    if (n == 0) @panic("sim: pickIndex(0)");
+    if (!begun) panic("sim: pick before begin", .{});
+    if (n == 0) panic("sim: pickIndex(0)", .{});
     if (n == 1) return 0;
     return rng.random().uintLessThan(usize, n);
 }
@@ -140,7 +156,7 @@ pub fn taskId(ptr: usize) u32 {
     while (i < task_id_len) : (i += 1) {
         if (task_ids[i].ptr == ptr) return task_ids[i].id;
     }
-    if (task_id_len >= task_ids.len) @panic("sim: task id table full");
+    if (task_id_len >= task_ids.len) panic("sim: task id table full", .{});
     const id = next_task_id;
     next_task_id += 1;
     task_ids[task_id_len] = .{ .ptr = ptr, .id = id };
@@ -203,26 +219,26 @@ pub fn stateDigest() u64 {
     var d: usize = 0;
     while (d < due_len) : (d += 1) {
         std.mem.writeInt(u64, buf[0..8], due[d].due_at, .little);
-        buf[8] = due[d].kind;
-        h.update(buf[0..9]);
+        std.mem.writeInt(u32, buf[8..12], due[d].id, .little);
+        buf[12] = @intFromEnum(due[d].kind);
+        h.update(buf[0..13]);
     }
     return h.final();
 }
 
 pub fn panic(comptime fmt: []const u8, args: anytype) noreturn {
-    std.debug.print(
-        "TRACE_HASH={x:0>16} SEED={d} events={d}\n",
-        .{ hasher.final(), current_seed, event_count },
-    );
+    if (comptime compiled_in) {
+        const h = if (begun) hasher.final() else 0;
+        std.debug.print(
+            "TRACE_HASH={x:0>16} SEED={d} events={d}\n",
+            .{ h, current_seed, event_count },
+        );
+    }
     std.debug.panic(fmt, args);
 }
 
 pub fn protocolPanic(comptime msg: []const u8) noreturn {
-    if (comptime compiled_in) {
-        panic("{s}", .{msg});
-    } else {
-        @panic(msg);
-    }
+    panic("{s}", .{msg});
 }
 
 pub fn deadlock() noreturn {
@@ -242,7 +258,11 @@ pub fn forbidBackendPoll() noreturn {
 pub fn printScope() void {
     std.debug.print("SCOPE simulated: clock, futex_park, task_pick, timer_heap, cq, executor_csprng, real_epoch, net_pipe, extra_logical_executors\n", .{});
     std.debug.print("SCOPE real: allocator, libc\n", .{});
-    std.debug.print("SCOPE unsimulated: file_io, connect_accept, extra_os_threads, dns, boot_vs_awake (boot==awake), spawn_blocking (panics), backend_kernel (poll never called; Darwin Loop.init does not open a kqueue fd)\n", .{});
+    if (builtin.os.tag.isDarwin()) {
+        std.debug.print("SCOPE unsimulated: file_io, connect_accept, extra_os_threads, dns, boot_vs_awake (boot==awake), spawn_blocking (panics), backend_kernel (poll never called; Loop.init does not open a kqueue fd)\n", .{});
+    } else {
+        std.debug.print("SCOPE unsimulated: file_io, connect_accept, extra_os_threads, dns, boot_vs_awake (boot==awake), spawn_blocking (panics), backend_kernel (poll never called)\n", .{});
+    }
 }
 
 fn endIndex(fd: i32) ?u8 {
@@ -261,13 +281,13 @@ fn allocEnd() u8 {
             return i;
         }
     }
-    @panic("sim: pipe table full");
+    panic("sim: pipe table full", .{});
 }
 
 /// Bidirectional pair (socketpair shape). No kernel fd.
 pub fn pipePair() [2]i32 {
     if (comptime !compiled_in) unreachable;
-    if (!begun) @panic("sim: pipePair before begin");
+    if (!begun) panic("sim: pipePair before begin", .{});
     const a = allocEnd();
     const b = allocEnd();
     ends[a].peer = b;
@@ -281,13 +301,15 @@ fn ioDelayNs() u64 {
     return if (pickIndex(2) == 0) 1_000_000 else 5_000_000;
 }
 
-fn pushDue(c: *anyopaque) void {
-    pushDueKind(c, 0);
-}
-
-fn pushDueKind(c: *anyopaque, kind: u8) void {
-    if (due_len >= max_due) @panic("sim: I/O due list full");
-    due[due_len] = .{ .c = c, .due_at = clock_ns + ioDelayNs(), .kind = kind };
+fn pushDueKind(c: *anyopaque, kind: DueKind) void {
+    if (due_len >= max_due) panic("sim: I/O due list full", .{});
+    next_io_id += 1;
+    due[due_len] = .{
+        .c = c,
+        .due_at = clock_ns + ioDelayNs(),
+        .kind = kind,
+        .id = next_io_id,
+    };
     due_len += 1;
 }
 
@@ -340,22 +362,22 @@ fn copySend(fd: i32, src: []const u8, send_c: *anyopaque, schedule: bool) IoSubm
     const p = ends[i].peer;
     if (ends[p].closed) return .eof;
     if (src.len == 0) {
-        if (schedule) pushDueKind(send_c, 2);
+        if (schedule) pushDueKind(send_c, .send);
         return .{ .due = 0 };
     }
     const space = pipe_buf_cap - ends[p].buf_len;
     if (space == 0) {
-        if (ends[i].pending_send != null) @panic("sim: two sends parked on one fd");
+        if (ends[i].pending_send != null) panic("sim: two sends parked on one fd", .{});
         ends[i].pending_send = send_c;
         return .parked;
     }
     const n = @min(src.len, space);
     @memcpy(ends[p].buf[ends[p].buf_len..][0..n], src[0..n]);
     ends[p].buf_len += n;
-    if (schedule) pushDueKind(send_c, 2);
+    if (schedule) pushDueKind(send_c, .send);
     if (ends[p].pending_recv) |rc| {
         ends[p].pending_recv = null;
-        pushDueKind(rc, 1);
+        pushDueKind(rc, .recv);
     }
     return .{ .due = n };
 }
@@ -364,22 +386,22 @@ pub fn recvInto(fd: i32, dst: []u8, recv_c: *anyopaque, dont_wait: bool) IoSubmi
     const i = endIndex(fd) orelse return .bad_fd;
     if (ends[i].buf_len == 0) {
         if (ends[i].closed or ends[ends[i].peer].closed) {
-            pushDueKind(recv_c, 1);
+            pushDueKind(recv_c, .recv);
             return .eof;
         }
         if (dont_wait) return .would_block;
-        if (ends[i].pending_recv != null) @panic("sim: two recvs parked on one fd");
+        if (ends[i].pending_recv != null) panic("sim: two recvs parked on one fd", .{});
         ends[i].pending_recv = recv_c;
         return .parked;
     }
     const n = drainBuf(fd, dst);
-    pushDueKind(recv_c, 1);
+    pushDueKind(recv_c, .recv);
     // A send parks on the sender end when this (recv) buffer is full.
     // Draining it must wake the peer's pending_send, not ours.
     const p = ends[i].peer;
     if (ends[p].pending_send) |sc| {
         ends[p].pending_send = null;
-        pushDueKind(sc, 2);
+        pushDueKind(sc, .send);
     }
     return .{ .due = n };
 }
@@ -405,22 +427,22 @@ pub fn closeFd(fd: i32, close_c: *anyopaque) enum { due, bad_fd } {
     ends[i].closed = true;
     if (ends[i].pending_recv) |rc| {
         ends[i].pending_recv = null;
-        pushDueKind(rc, 1);
+        pushDueKind(rc, .recv);
     }
     if (ends[i].pending_send) |sc| {
         ends[i].pending_send = null;
-        pushDueKind(sc, 2);
+        pushDueKind(sc, .send);
     }
     const p = ends[i].peer;
     if (ends[p].pending_recv) |rc| {
         ends[p].pending_recv = null;
-        pushDueKind(rc, 1);
+        pushDueKind(rc, .recv);
     }
     if (ends[p].pending_send) |sc| {
         ends[p].pending_send = null;
-        pushDueKind(sc, 2);
+        pushDueKind(sc, .send);
     }
-    pushDueKind(close_c, 3);
+    pushDueKind(close_c, .close);
     return .due;
 }
 
@@ -448,14 +470,14 @@ pub fn cancelIo(c: *anyopaque) bool {
 
 /// Pop completions whose due_at is now, shuffled when n>1. Caller harvests.
 /// Future entries stay on the list.
-pub fn takeDue(out: []*anyopaque) usize {
+pub fn takeDue(out: []TakenDue) usize {
     var n: usize = 0;
     var w: usize = 0;
     var i: usize = 0;
     while (i < due_len) : (i += 1) {
         if (due[i].due_at <= clock_ns) {
-            if (n >= out.len) @panic("sim: takeDue buffer too small");
-            out[n] = due[i].c;
+            if (n >= out.len) panic("sim: takeDue buffer too small", .{});
+            out[n] = .{ .c = due[i].c, .id = due[i].id };
             n += 1;
         } else {
             due[w] = due[i];

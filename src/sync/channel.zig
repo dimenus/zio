@@ -474,7 +474,9 @@ const AsyncSendImpl = struct {
             ctx.succeeded = false;
             return {};
         }
-        std.debug.assert(self.channel.closed);
+        if (!self.channel.closed) {
+            sim.protocolPanic("Channel: send winner without a result");
+        }
         return error.Closed;
     }
 };
@@ -592,7 +594,10 @@ const AsyncReceiveImpl = struct {
             return;
         }
 
-        std.debug.assert(self.channel.closed);
+        if (!self.channel.closed) {
+            self.channel.mutex.unlock();
+            sim.protocolPanic("Channel: recv winner without a result");
+        }
         self.channel.mutex.unlock();
         return error.Closed;
     }

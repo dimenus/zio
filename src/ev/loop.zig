@@ -979,7 +979,7 @@ pub const Loop = struct {
             },
             .net_send_file => {
                 if (comptime zio_options.sim) {
-                    @panic("sim: unsimulated I/O op net_send_file");
+                    sim.panic("sim: unsimulated I/O op net_send_file", .{});
                 }
                 const op = completion.cast(NetSendFile);
                 switch (comptime Backend.capability(.net_send_file)) {
@@ -1623,7 +1623,7 @@ pub const Loop = struct {
                     .bad_fd => c.setError(error.FileDescriptorNotASocket),
                 }
             },
-            else => std.debug.panic("sim: unsimulated I/O op {s}", .{@tagName(c.op)}),
+            else => sim.panic("sim: unsimulated I/O op {s}", .{@tagName(c.op)}),
         }
     }
 
@@ -1634,11 +1634,11 @@ pub const Loop = struct {
     }
 
     fn harvestSimIo(self: *Loop) void {
-        var buf: [32]*anyopaque = undefined;
+        var buf: [32]sim.TakenDue = undefined;
         const n = sim.takeDue(&buf);
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            const c: *Completion = @ptrCast(@alignCast(buf[i]));
+            const c: *Completion = @ptrCast(@alignCast(buf[i].c));
             if (!c.has_result) {
                 switch (c.op) {
                     .net_recv => {
@@ -1669,7 +1669,7 @@ pub const Loop = struct {
                 }
             }
             if (!c.has_result) continue;
-            sim.emit(.io_complete, @intFromEnum(c.op), 0);
+            sim.emit(.io_complete, @intFromEnum(c.op), buf[i].id);
             self.state.markCompleted(c);
         }
     }

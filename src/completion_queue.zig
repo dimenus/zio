@@ -323,7 +323,7 @@ pub const CompletionQueue = struct {
     /// check. The caller holds the mutex.
     fn checkSingleDriverLocked(self: *CompletionQueue) void {
         if (self.reg != null) {
-            @panic("CompletionQueue: driven by two tasks (a select is parked on the queue); one task must own wait/next/cancel/cancelAll");
+            sim.protocolPanic("CompletionQueue: driven by two tasks (a select is parked on the queue); one task must own wait/next/cancel/cancelAll");
         }
     }
 
@@ -427,7 +427,7 @@ pub const CompletionQueue = struct {
         drained: bool = false,
 
         pub fn holdsDeposit(self: *const WaitContext) bool {
-            return self.claimed != null;
+            return self.claimed != null or self.drained;
         }
     };
 
@@ -437,12 +437,15 @@ pub const CompletionQueue = struct {
             ctx.claimed = null;
             return c;
         }
+        if (ctx.drained) {
+            ctx.drained = false;
+            return error.Closed;
+        }
         // A won CQ arm always carries its deposit: the claim popped the
         // completion, or latched the drained state, in the same critical
         // section that decided the winner word. Reaching here with neither
         // is a protocol violation.
-        std.debug.assert(ctx.drained);
-        return error.Closed;
+        sim.protocolPanic("CompletionQueue: winner without a completion or drained state");
     }
 
     pub fn asyncWait(self: *CompletionQueue, waiter: *Waiter, ctx: *WaitContext) common.AsyncWaitState {
@@ -488,7 +491,7 @@ pub const CompletionQueue = struct {
         if (!ctx.registered) {
             if (self.reg != null) {
                 self.mutex.unlock();
-                @panic("CompletionQueue: selected from two tasks; one task must drive the queue");
+                sim.protocolPanic("CompletionQueue: selected from two tasks; one task must drive the queue");
             }
             self.reg = .{ .waiter = waiter, .ctx = ctx };
             ctx.registered = true;
@@ -524,6 +527,7 @@ pub const CompletionQueue = struct {
                 self.completed.push(&c.group);
                 ctx.claimed = null;
             }
+            ctx.drained = false;
         }
         self.mutex.unlock();
         // A claim carries exactly one signal; without one, nothing is owed.

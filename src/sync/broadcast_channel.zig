@@ -262,7 +262,8 @@ const AsyncReceiveImpl = struct {
             return error.Closed;
         }
 
-        unreachable;
+        self.channel.mutex.unlock();
+        sim.protocolPanic("BroadcastChannel: recv winner without a result");
     }
 };
 
