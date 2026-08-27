@@ -739,43 +739,59 @@ pub const Executor = struct {
         exec.processCleanup();
     }
 
+    fn simCoopHarvest(self: *Executor, execs: []*Executor) void {
+        for (execs) |e| {
+            e.loop.bindThread();
+            setCurrentExecutor(e);
+            e.loop.poll(.zero) catch {};
+            e.drainDispatched();
+        }
+        self.loop.bindThread();
+        setCurrentExecutor(self);
+    }
+
     pub fn simCoopYield(self: *Executor) void {
         if (sim_coop_depth != 0) return;
         sim_coop_depth = 1;
         defer sim_coop_depth = 0;
 
         const execs = self.runtime.executors.items;
-        // Called from a task (select settle/sweep): harvest due timers and
-        // I/O so a CQ ownerCallback can claim before settle deregisters.
-        // Called from poll (current_task is null): skip, nested poll on
-        // this loop is unsafe; mux already harvests between ready steps.
-        if (self.current_task != null) {
-            for (execs) |e| {
-                e.loop.bindThread();
-                setCurrentExecutor(e);
-                e.loop.poll(.zero) catch {};
-                e.drainDispatched();
-            }
-            self.loop.bindThread();
-            setCurrentExecutor(self);
+        const sim = @import("sim.zig");
+        // From a task (select settle/sweep): seed whether to harvest due
+        // claims now. Always-on harvest made wait prefer a landed signal,
+        // so canceled=true never ran. pickIndex(2) keeps both early-claim
+        // and late-claim (pending cancel) in the explored space.
+        // From poll (current_task is null): skip, nested poll on this loop
+        // is unsafe.
+        const from_task = self.current_task != null;
+        if (from_task and sim.pickIndex(2) == 0) {
+            simCoopHarvest(self, execs);
         }
 
-        if (execs.len < 2) return;
-        var ready: [2]*Executor = undefined;
-        var n: usize = 0;
-        for (execs) |e| {
-            if (e == self) continue;
-            if (simHasReady(e)) {
-                ready[n] = e;
-                n += 1;
+        if (execs.len >= 2) {
+            var ready: [2]*Executor = undefined;
+            var n: usize = 0;
+            for (execs) |e| {
+                if (e == self) continue;
+                if (simHasReady(e)) {
+                    ready[n] = e;
+                    n += 1;
+                }
+            }
+            if (n > 0) {
+                const pick = if (n == 1) 0 else sim.pickIndex(n);
+                simRunOneTask(ready[pick]);
+                self.loop.bindThread();
+                setCurrentExecutor(self);
             }
         }
-        if (n == 0) return;
-        const sim = @import("sim.zig");
-        const pick = sim.pickIndex(n);
-        simRunOneTask(ready[pick]);
-        self.loop.bindThread();
-        setCurrentExecutor(self);
+
+        // After the task runs, a producer that just submitted still needs a
+        // poll for the CQ claim to land in this settle. Seeded again so
+        // some schedules leave the claim for later.
+        if (from_task and sim.pickIndex(2) == 0) {
+            simCoopHarvest(self, execs);
+        }
     }
 
     fn simMuxStep(rt: *Runtime, home: *Executor) !void {
