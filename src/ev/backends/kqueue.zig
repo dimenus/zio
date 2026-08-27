@@ -218,15 +218,14 @@ fn makeKey(ident: usize, filter: i32) u64 {
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
     if (comptime zio_options.sim) {
+        if (queue_size == 0) return error.InvalidQueueSize;
         shared_state.sock_table.acquire(allocator);
-        errdefer shared_state.sock_table.release();
-        const events = try allocator.alloc(std.c.Kevent, @max(queue_size, 1));
         self.* = .{
             .allocator = allocator,
             .shared = shared_state,
             .kqueue_fd = -1,
             .waker_ident = 0,
-            .events = events,
+            .events = &.{},
             .change_buffer = .empty,
         };
         return;
@@ -279,7 +278,9 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_s
 pub fn deinit(self: *Self) void {
     self.poll_queue.deinit(self.allocator);
     self.change_buffer.deinit(self.allocator);
-    self.allocator.free(self.events);
+    if (self.events.len != 0) {
+        self.allocator.free(self.events);
+    }
     if (self.kqueue_fd != -1) {
         _ = std.c.close(self.kqueue_fd);
     }

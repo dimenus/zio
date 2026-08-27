@@ -1032,8 +1032,8 @@ pub const RecvFlags = packed struct {
     /// semantics (e.g. Windows).
     trunc: bool = false,
     /// Complete immediately with `error.WouldBlock` when nothing is queued.
-    /// Never parks; see `zio.net.tryRead` on main. Sim honors this so a
-    /// merge onto that API does not deadlock an empty pipe.
+    /// Never parks; see `zio.net.tryRead`. Backends honor this inside loop
+    /// bookkeeping so a later blocking recv still wakes (kqueue EV_CLEAR).
     dont_wait: bool = false,
 };
 
@@ -1043,11 +1043,11 @@ fn recvFlagsToSys(flags: RecvFlags) c_int {
     if (flags.peek and @hasDecl(MSG, "PEEK")) sys_flags |= MSG.PEEK;
     if (flags.waitall and @hasDecl(MSG, "WAITALL")) sys_flags |= MSG.WAITALL;
     if (flags.oob and @hasDecl(MSG, "OOB")) sys_flags |= MSG.OOB;
-    if (flags.dont_wait and @hasDecl(MSG, "DONTWAIT")) sys_flags |= MSG.DONTWAIT;
     // MSG_TRUNC as an *input* flag is Linux-specific; on other POSIX systems
     // the constant exists only as an output flag. Restrict it to Linux to
     // avoid corrupting platforms that repurpose the bit.
     if (flags.trunc and builtin.os.tag == .linux) sys_flags |= MSG.TRUNC;
+    if (flags.dont_wait and @hasDecl(MSG, "DONTWAIT")) sys_flags |= MSG.DONTWAIT;
     return sys_flags;
 }
 

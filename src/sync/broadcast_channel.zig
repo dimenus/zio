@@ -13,6 +13,7 @@ const common = @import("../common.zig");
 const Waiter = common.Waiter;
 const Closeable = @import("../common.zig").Closeable;
 const Mutex = @import("Mutex.zig");
+const sim = @import("../sim.zig");
 
 /// Consumer position tracker.
 /// This is separate from the generic BroadcastChannel(T) since it only stores positions.
@@ -166,6 +167,10 @@ const AsyncReceiveImpl = struct {
     pub const WaitContext = struct {
         result_ptr: [*]u8 = undefined,
         result: ?(Closeable || error{Lagged})!void = null,
+
+        pub fn holdsDeposit(self: *const WaitContext) bool {
+            return self.result != null;
+        }
     };
 
     pub fn asyncWait(self: *const RecvSelf, waiter: *Waiter, ctx: *WaitContext, result_ptr: [*]u8) common.AsyncWaitState {
@@ -214,16 +219,19 @@ const AsyncReceiveImpl = struct {
     }
 
     pub fn asyncCancelWait(self: *const RecvSelf, waiter: *Waiter, ctx: *WaitContext) bool {
-        _ = ctx;
         self.channel.mutex.lockUncancelable();
         const was_in_queue = self.channel.wait_queue.remove(&waiter.node);
         self.channel.mutex.unlock();
+        if (!waiter.isDirect() and ctx.holdsDeposit() and !waiter.didWin()) {
+            sim.protocolPanic("BroadcastChannel: select cancel abandons a claimed deposit");
+        }
         return was_in_queue;
     }
 
     pub fn getResult(self: *const RecvSelf, ctx: *WaitContext) (Closeable || error{Lagged})!void {
         // Fast path: result already set by asyncWait
         if (ctx.result) |r| {
+            ctx.result = null;
             return r;
         }
 
@@ -432,6 +440,10 @@ pub fn AsyncReceive(comptime T: type) type {
         pub const WaitContext = struct {
             impl_ctx: AsyncReceiveImpl.WaitContext = .{},
             result: T = undefined,
+
+            pub fn holdsDeposit(self: *const WaitContext) bool {
+                return self.impl_ctx.holdsDeposit();
+            }
         };
 
         fn init(channel: *BroadcastChannelImpl, consumer: *BroadcastChannelConsumer) Self {

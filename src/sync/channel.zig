@@ -11,6 +11,7 @@ const WaitNode = @import("../utils/wait_queue.zig").WaitNode;
 const select = @import("../select.zig").select;
 const ResetEvent = @import("ResetEvent.zig");
 const common = @import("../common.zig");
+const sim = @import("../sim.zig");
 const Waiter = common.Waiter;
 const Closeable = common.Closeable;
 const AsyncWaitState = common.AsyncWaitState;
@@ -458,7 +459,7 @@ const AsyncSendImpl = struct {
         self.channel.mutex.unlock();
 
         if (!waiter.isDirect() and ctx.succeeded and !waiter.didWin()) {
-            @panic("Channel: select cancel abandons a claimed send");
+            sim.protocolPanic("Channel: select cancel abandons a claimed send");
         }
 
         if (was_in_queue) {
@@ -563,7 +564,7 @@ const AsyncReceiveImpl = struct {
         self.channel.mutex.unlock();
 
         if (!waiter.isDirect() and ctx.result_set and !waiter.didWin()) {
-            @panic("Channel: select cancel abandons a claimed deposit");
+            sim.protocolPanic("Channel: select cancel abandons a claimed deposit");
         }
 
         if (was_in_queue) {

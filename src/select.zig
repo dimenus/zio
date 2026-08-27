@@ -9,6 +9,7 @@ const getCurrentTaskOrNull = @import("runtime.zig").getCurrentTaskOrNull;
 const getCurrentExecutor = @import("runtime.zig").getCurrentExecutor;
 const yield = @import("runtime.zig").yield;
 const zio_options = @import("zio_options");
+const sim = @import("sim.zig");
 const common = @import("common.zig");
 const Cancelable = common.Cancelable;
 const Waiter = common.Waiter;
@@ -161,7 +162,13 @@ fn assertDepositField(ctx: anytype) void {
     const T = @TypeOf(ctx);
     if (comptime @hasDecl(T, "holdsDeposit")) {
         if (ctx.holdsDeposit()) {
-            @panic("select: frame exit abandons a claimed deposit");
+            sim.protocolPanic("select: frame exit abandons a claimed deposit");
+        }
+    } else {
+        comptime {
+            if (@hasField(T, "result") or @hasField(T, "result_set") or @hasField(T, "succeeded")) {
+                @compileError(@typeName(T) ++ " stores a deposit but has no holdsDeposit()");
+            }
         }
     }
     if (comptime @hasField(T, "impl_ctx")) {

@@ -1650,11 +1650,25 @@ pub const Loop = struct {
                             c.setResult(.net_recv, sim.drainBuf(op.handle, dst));
                         }
                     },
-                    .net_send => c.setError(error.BrokenPipe),
+                    .net_send => {
+                        // Capacity-woken send: copy into the peer buffer.
+                        // Do not re-queue this completion. BrokenPipe is
+                        // only for a closed peer.
+                        const op = c.cast(NetSend);
+                        const src = firstWriteSlice(op.buffer);
+                        switch (sim.harvestSend(op.handle, src, c)) {
+                            .due => |sent| c.setResult(.net_send, sent),
+                            .eof => c.setError(error.BrokenPipe),
+                            .parked => continue,
+                            .would_block => unreachable,
+                            .bad_fd => c.setError(error.FileDescriptorNotASocket),
+                        }
+                    },
                     .net_close => c.setResult(.net_close, {}),
                     else => {},
                 }
             }
+            if (!c.has_result) continue;
             sim.emit(.io_complete, @intFromEnum(c.op), 0);
             self.state.markCompleted(c);
         }

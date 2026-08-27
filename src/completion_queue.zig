@@ -512,7 +512,7 @@ pub const CompletionQueue = struct {
             // A select waiter with a deposit whose winner word holds
             // another arm (or none) would drop the completion on frame
             // exit. That is a protocol violation, not a restore site.
-            @panic("CompletionQueue: select cancel abandons a claimed deposit");
+            sim.protocolPanic("CompletionQueue: select cancel abandons a claimed deposit");
         }
         if (was_claimed and waiter.isDirect()) {
             // A canceled generic wait abandons its deposit: put the

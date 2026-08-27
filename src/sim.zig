@@ -33,7 +33,7 @@ var task_id_len: u32 = 0;
 
 const max_ends = 32;
 const max_due = 32;
-const pipe_buf_cap = 4096;
+pub const pipe_buf_cap = 4096;
 const fd_base: i32 = 100000;
 
 const End = struct {
@@ -50,6 +50,7 @@ var ends: [max_ends]End = @splat(.{});
 const Due = struct {
     c: *anyopaque,
     due_at: u64,
+    kind: u8,
 };
 
 var due: [max_due]Due = undefined;
@@ -193,13 +194,17 @@ pub fn stateDigest() u64 {
         std.mem.writeInt(u16, eb[5..7], @truncate(e.buf_len), .little);
         eb[7] = 0;
         h.update(&eb);
+        if (e.used and e.buf_len > 0) {
+            h.update(e.buf[0..e.buf_len]);
+        }
     }
     std.mem.writeInt(u64, buf[0..8], due_len, .little);
     h.update(buf[0..8]);
     var d: usize = 0;
     while (d < due_len) : (d += 1) {
         std.mem.writeInt(u64, buf[0..8], due[d].due_at, .little);
-        h.update(buf[0..8]);
+        buf[8] = due[d].kind;
+        h.update(buf[0..9]);
     }
     return h.final();
 }
@@ -210,6 +215,14 @@ pub fn panic(comptime fmt: []const u8, args: anytype) noreturn {
         .{ hasher.final(), current_seed, event_count },
     );
     std.debug.panic(fmt, args);
+}
+
+pub fn protocolPanic(comptime msg: []const u8) noreturn {
+    if (comptime compiled_in) {
+        panic("{s}", .{msg});
+    } else {
+        @panic(msg);
+    }
 }
 
 pub fn deadlock() noreturn {
@@ -227,9 +240,9 @@ pub fn forbidBackendPoll() noreturn {
 }
 
 pub fn printScope() void {
-    std.debug.print("SCOPE simulated: clock, futex_park, task_pick, timer_heap, cq, executor_csprng, real_epoch, net_pipe, extra_logical_executors, backend_init_skip\n", .{});
+    std.debug.print("SCOPE simulated: clock, futex_park, task_pick, timer_heap, cq, executor_csprng, real_epoch, net_pipe, extra_logical_executors\n", .{});
     std.debug.print("SCOPE real: allocator, libc\n", .{});
-    std.debug.print("SCOPE unsimulated: file_io, connect_accept, extra_os_threads, dns, boot_vs_awake (boot==awake), spawn_blocking (panics)\n", .{});
+    std.debug.print("SCOPE unsimulated: file_io, connect_accept, extra_os_threads, dns, boot_vs_awake (boot==awake), spawn_blocking (panics), backend_kernel (poll never called; Darwin Loop.init does not open a kqueue fd)\n", .{});
 }
 
 fn endIndex(fd: i32) ?u8 {
@@ -269,8 +282,12 @@ fn ioDelayNs() u64 {
 }
 
 fn pushDue(c: *anyopaque) void {
+    pushDueKind(c, 0);
+}
+
+fn pushDueKind(c: *anyopaque, kind: u8) void {
     if (due_len >= max_due) @panic("sim: I/O due list full");
-    due[due_len] = .{ .c = c, .due_at = clock_ns + ioDelayNs() };
+    due[due_len] = .{ .c = c, .due_at = clock_ns + ioDelayNs(), .kind = kind };
     due_len += 1;
 }
 
@@ -309,12 +326,21 @@ pub const IoSubmit = union(enum) {
 
 /// Copy `src` into the peer's recv buffer.
 pub fn sendBytes(fd: i32, src: []const u8, send_c: *anyopaque) IoSubmit {
+    return copySend(fd, src, send_c, true);
+}
+
+/// Harvest a capacity-woken send: copy without re-queueing this completion.
+pub fn harvestSend(fd: i32, src: []const u8, send_c: *anyopaque) IoSubmit {
+    return copySend(fd, src, send_c, false);
+}
+
+fn copySend(fd: i32, src: []const u8, send_c: *anyopaque, schedule: bool) IoSubmit {
     const i = endIndex(fd) orelse return .bad_fd;
     if (ends[i].closed) return .eof;
     const p = ends[i].peer;
     if (ends[p].closed) return .eof;
     if (src.len == 0) {
-        pushDue(send_c);
+        if (schedule) pushDueKind(send_c, 2);
         return .{ .due = 0 };
     }
     const space = pipe_buf_cap - ends[p].buf_len;
@@ -326,10 +352,10 @@ pub fn sendBytes(fd: i32, src: []const u8, send_c: *anyopaque) IoSubmit {
     const n = @min(src.len, space);
     @memcpy(ends[p].buf[ends[p].buf_len..][0..n], src[0..n]);
     ends[p].buf_len += n;
-    pushDue(send_c);
+    if (schedule) pushDueKind(send_c, 2);
     if (ends[p].pending_recv) |rc| {
         ends[p].pending_recv = null;
-        pushDue(rc);
+        pushDueKind(rc, 1);
     }
     return .{ .due = n };
 }
@@ -338,7 +364,7 @@ pub fn recvInto(fd: i32, dst: []u8, recv_c: *anyopaque, dont_wait: bool) IoSubmi
     const i = endIndex(fd) orelse return .bad_fd;
     if (ends[i].buf_len == 0) {
         if (ends[i].closed or ends[ends[i].peer].closed) {
-            pushDue(recv_c);
+            pushDueKind(recv_c, 1);
             return .eof;
         }
         if (dont_wait) return .would_block;
@@ -347,13 +373,13 @@ pub fn recvInto(fd: i32, dst: []u8, recv_c: *anyopaque, dont_wait: bool) IoSubmi
         return .parked;
     }
     const n = drainBuf(fd, dst);
-    pushDue(recv_c);
+    pushDueKind(recv_c, 1);
     // A send parks on the sender end when this (recv) buffer is full.
     // Draining it must wake the peer's pending_send, not ours.
     const p = ends[i].peer;
     if (ends[p].pending_send) |sc| {
         ends[p].pending_send = null;
-        pushDue(sc);
+        pushDueKind(sc, 2);
     }
     return .{ .due = n };
 }
@@ -379,22 +405,22 @@ pub fn closeFd(fd: i32, close_c: *anyopaque) enum { due, bad_fd } {
     ends[i].closed = true;
     if (ends[i].pending_recv) |rc| {
         ends[i].pending_recv = null;
-        pushDue(rc);
+        pushDueKind(rc, 1);
     }
     if (ends[i].pending_send) |sc| {
         ends[i].pending_send = null;
-        pushDue(sc);
+        pushDueKind(sc, 2);
     }
     const p = ends[i].peer;
     if (ends[p].pending_recv) |rc| {
         ends[p].pending_recv = null;
-        pushDue(rc);
+        pushDueKind(rc, 1);
     }
     if (ends[p].pending_send) |sc| {
         ends[p].pending_send = null;
-        pushDue(sc);
+        pushDueKind(sc, 2);
     }
-    pushDue(close_c);
+    pushDueKind(close_c, 3);
     return .due;
 }
 
