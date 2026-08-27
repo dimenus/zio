@@ -15,6 +15,8 @@ const Work = @import("completion.zig").Work;
 const DelegatedWork = @import("completion.zig").DelegatedWork;
 const FileRead = @import("completion.zig").FileRead;
 const NetSend = @import("completion.zig").NetSend;
+const NetRecv = @import("completion.zig").NetRecv;
+const NetClose = @import("completion.zig").NetClose;
 const NetSendFile = @import("completion.zig").NetSendFile;
 const ReadBuf = @import("buf.zig").ReadBuf;
 const WriteBuf = @import("buf.zig").WriteBuf;
@@ -808,6 +810,10 @@ pub const Loop = struct {
             },
 
             inline else => |op| {
+                if (comptime zio_options.sim) {
+                    self.cancelSimIo(completion);
+                    return;
+                }
                 const op_data = completion.cast(op.toType());
                 switch (comptime Backend.capability(op)) {
                     .yes => self.backend.cancel(&self.state, completion),
@@ -946,6 +952,9 @@ pub const Loop = struct {
                 return;
             },
             .net_send_file => {
+                if (comptime zio_options.sim) {
+                    @panic("sim: unsimulated I/O op net_send_file");
+                }
                 const op = completion.cast(NetSendFile);
                 switch (comptime Backend.capability(.net_send_file)) {
                     .yes => self.backend.submit(&self.state, completion),
@@ -963,6 +972,10 @@ pub const Loop = struct {
                 return;
             },
             else => {
+                if (comptime zio_options.sim) {
+                    self.submitSimIo(completion);
+                    return;
+                }
                 switch (completion.op) {
                     inline else => |op| {
                         const op_data = completion.cast(op.toType());
@@ -1490,6 +1503,85 @@ pub const Loop = struct {
         }
     }
 
+    fn firstReadSlice(buf: ReadBuf) []u8 {
+        if (buf.iovecs.len == 0) return &.{};
+        const v = buf.iovecs[0];
+        return v.base[0..v.len];
+    }
+
+    fn firstWriteSlice(buf: WriteBuf) []const u8 {
+        if (buf.iovecs.len == 0) return &.{};
+        const v = buf.iovecs[0];
+        return v.base[0..v.len];
+    }
+
+    fn submitSimIo(self: *Loop, c: *Completion) void {
+        _ = self;
+        switch (c.op) {
+            .net_recv => {
+                const op = c.cast(NetRecv);
+                const dst = firstReadSlice(op.buffers);
+                switch (sim.recvInto(op.handle, dst, c)) {
+                    .due => |n| c.setResult(.net_recv, n),
+                    .eof => c.setResult(.net_recv, 0),
+                    .parked => {},
+                    .bad_fd => c.setError(error.FileDescriptorNotASocket),
+                }
+            },
+            .net_send => {
+                const op = c.cast(NetSend);
+                const src = firstWriteSlice(op.buffer);
+                switch (sim.sendBytes(op.handle, src, c)) {
+                    .due => |n| c.setResult(.net_send, n),
+                    .eof => c.setError(error.BrokenPipe),
+                    .parked => {},
+                    .bad_fd => c.setError(error.FileDescriptorNotASocket),
+                }
+            },
+            .net_close => {
+                const op = c.cast(NetClose);
+                switch (sim.closeFd(op.handle, c)) {
+                    .due => c.setResult(.net_close, {}),
+                    .bad_fd => c.setError(error.FileDescriptorNotASocket),
+                }
+            },
+            else => std.debug.panic("sim: unsimulated I/O op {s}", .{@tagName(c.op)}),
+        }
+    }
+
+    fn cancelSimIo(self: *Loop, c: *Completion) void {
+        _ = sim.cancelIo(c);
+        if (!c.has_result) c.setError(error.Canceled);
+        self.state.markCompleted(c);
+    }
+
+    fn harvestSimIo(self: *Loop) void {
+        var buf: [32]*anyopaque = undefined;
+        const n = sim.takeDue(&buf);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const c: *Completion = @ptrCast(@alignCast(buf[i]));
+            if (!c.has_result) {
+                switch (c.op) {
+                    .net_recv => {
+                        const op = c.cast(NetRecv);
+                        const dst = firstReadSlice(op.buffers);
+                        if (sim.recvIsEof(op.handle)) {
+                            c.setResult(.net_recv, 0);
+                        } else {
+                            c.setResult(.net_recv, sim.drainBuf(op.handle, dst));
+                        }
+                    },
+                    .net_send => c.setError(error.BrokenPipe),
+                    .net_close => c.setResult(.net_close, {}),
+                    else => {},
+                }
+            }
+            sim.emit(.io_complete, @intFromEnum(c.op), 0);
+            self.state.markCompleted(c);
+        }
+    }
+
     /// Sim poll: never call the kernel backend. Advance the logical clock
     /// by the timeout the real poll would have slept, then fire timers.
     /// A full park with no timer and no completion is a deadlock.
@@ -1505,7 +1597,7 @@ pub const Loop = struct {
 
         var timeout: Duration = .zero;
         if (wait) {
-            if (!self.state.completions.empty() or !self.state.work_completions.empty() or timer_result.fired) {
+            if (!self.state.completions.empty() or !self.state.work_completions.empty() or timer_result.fired or sim.hasDueIo()) {
                 timeout = .zero;
             } else if (timer_result.next_timeout) |t| {
                 timeout = if (t.value < self.max_wait.value) t else self.max_wait;
@@ -1534,10 +1626,13 @@ pub const Loop = struct {
         if (wake_flags & LoopState.wake_cancel != 0) {
             self.processCancelQueue();
         }
+        self.harvestSimIo();
         self.processCompletions();
 
         if (timeout.value != 0) {
             _ = self.checkTimers();
+            self.harvestSimIo();
+            self.processCompletions();
         }
     }
 };

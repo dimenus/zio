@@ -16,6 +16,7 @@ pub const yield = runtime.yield;
 pub const maybeYield = runtime.maybeYield;
 pub const sleep = runtime.sleep;
 pub const now = runtime.now;
+pub const getCurrentExecutor = runtime.getCurrentExecutor;
 
 pub const random = @import("random.zig").random;
 pub const randomSecure = @import("random.zig").randomSecure;

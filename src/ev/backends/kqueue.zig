@@ -28,6 +28,8 @@ const MachPort = @import("../completion.zig").MachPort;
 const ProcessWait = @import("../completion.zig").ProcessWait;
 const fs = @import("../../os/fs.zig");
 const sockreg = @import("../sockreg.zig");
+const zio_options = @import("zio_options");
+const sim = @import("../../sim.zig");
 
 pub const NetHandle = net.fd_t;
 
@@ -215,6 +217,20 @@ fn makeKey(ident: usize, filter: i32) u64 {
 }
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
+    if (comptime zio_options.sim) {
+        shared_state.sock_table.acquire(allocator);
+        errdefer shared_state.sock_table.release();
+        const events = try allocator.alloc(std.c.Kevent, @max(queue_size, 1));
+        self.* = .{
+            .allocator = allocator,
+            .shared = shared_state,
+            .kqueue_fd = -1,
+            .waker_ident = 0,
+            .events = events,
+            .change_buffer = .empty,
+        };
+        return;
+    }
     shared_state.sock_table.acquire(allocator);
     errdefer shared_state.sock_table.release();
     const kq = std.c.kqueue();
@@ -697,6 +713,7 @@ pub fn cancel(self: *Self, state: *LoopState, target: *Completion) void {
 }
 
 pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
+    if (comptime zio_options.sim) sim.forbidBackendPoll();
     var timeout_spec: std.c.timespec = undefined;
     const timeout_ptr: ?*const std.c.timespec = if (timeout.value < std.math.maxInt(time.TimeInt)) blk: {
         const timeout_ns = timeout.toNanoseconds();
