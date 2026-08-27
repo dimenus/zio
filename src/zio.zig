@@ -16,6 +16,7 @@ pub const yield = runtime.yield;
 pub const maybeYield = runtime.maybeYield;
 pub const sleep = runtime.sleep;
 pub const now = runtime.now;
+pub const getCurrentExecutor = runtime.getCurrentExecutor;
 
 pub const random = @import("random.zig").random;
 pub const randomSecure = @import("random.zig").randomSecure;
@@ -23,6 +24,7 @@ pub const RandomSecureError = @import("random.zig").RandomSecureError;
 pub const beginShield = runtime.beginShield;
 pub const endShield = runtime.endShield;
 pub const checkCancel = runtime.checkCancel;
+pub const recancel = runtime.recancel;
 
 pub const AutoCancel = @import("autocancel.zig").AutoCancel;
 pub const withTimeout = @import("autocancel.zig").withTimeout;
@@ -43,6 +45,7 @@ pub const time = @import("time.zig"); // TODO: make non-pub
 pub const Duration = time.Duration;
 pub const Timestamp = time.Timestamp;
 pub const Timeout = time.Timeout;
+pub const Clock = time.Clock;
 pub const Stopwatch = time.Stopwatch;
 
 const fs = @import("fs.zig");
@@ -67,7 +70,6 @@ pub const net = @import("net.zig");
 pub const Mutex = @import("sync/Mutex.zig");
 pub const Condition = @import("sync/Condition.zig");
 pub const ResetEvent = @import("sync/ResetEvent.zig");
-pub const Notify = @import("sync/Notify.zig");
 pub const RwLock = @import("sync/RwLock.zig");
 pub const Semaphore = @import("sync/Semaphore.zig");
 pub const Barrier = @import("sync/Barrier.zig");
@@ -94,6 +96,10 @@ pub const ev = @import("ev/root.zig");
 
 /// Low-level OS APIs.
 pub const os = @import("os/root.zig");
+
+/// Deterministic simulation (DST). Production builds compile this module
+/// with `sim=false`; `begin` panics unless the harness built `-Dsim=true`.
+pub const sim = @import("sim.zig");
 
 test {
     std.testing.refAllDecls(@This());

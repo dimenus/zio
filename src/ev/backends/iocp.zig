@@ -166,7 +166,10 @@ const Support = @import("../completion.zig").Support;
 
 // Boot/real deadlines are armed via per-loop waitable timers whose
 // completion-routine APC fires during the alertable poll wait.
-pub const native_wall_timers = true;
+const zio_options = @import("zio_options");
+const sim = @import("../../sim.zig");
+
+pub const native_wall_timers = !zio_options.sim;
 pub const supports_nonblocking_file_io = true;
 
 pub fn capability(comptime op: Op) Support {
@@ -418,6 +421,7 @@ real_armed: ?u64 = null,
 real_fired: bool = false,
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
+    if (comptime zio_options.sim) return;
     // Acquire reference to shared state (creates IOCP handle if first loop)
     try shared_state.acquire();
     errdefer shared_state.release();
@@ -459,6 +463,7 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_s
 }
 
 pub fn deinit(self: *Self) void {
+    if (comptime zio_options.sim) return;
     // Cancel and close the real-clock waitable timer. Closing an armed timer
     // implicitly cancels it; CancelWaitableTimer first keeps it explicit.
     if (self.real_timer != windows.INVALID_HANDLE_VALUE) {
@@ -2203,6 +2208,7 @@ fn consumeWallFired(self: *Self) bool {
 }
 
 pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
+    if (comptime zio_options.sim) sim.forbidBackendPoll();
     const timeout_ms: u32 = std.math.cast(u32, timeout.toMilliseconds()) orelse std.math.maxInt(u32);
 
     var num_entries: u32 = 0;

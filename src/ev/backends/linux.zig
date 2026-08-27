@@ -9,6 +9,8 @@ const LoopState = @import("../loop.zig").LoopState;
 const Duration = @import("../../time.zig").Duration;
 const Clock = @import("../../time.zig").Clock;
 const os = @import("../../os/root.zig");
+const zio_options = @import("zio_options");
+const sim = @import("../../sim.zig");
 
 /// Compile-time Linux backend policy. `auto` prefers io_uring and falls back to
 /// epoll only when ring setup itself is unavailable; explicit engine selections
@@ -35,7 +37,7 @@ pub fn Backend(comptime mode: Mode) type {
         };
 
         pub const NetHandle = IoUring.NetHandle;
-        pub const native_wall_timers = true;
+        pub const native_wall_timers = !zio_options.sim;
         // In auto mode a delegated open means epoll was selected; probePollable
         // applies O_NONBLOCK after opening, matching the old epoll behavior.
         pub const supports_nonblocking_file_io = mode == .io_uring;
@@ -129,6 +131,12 @@ pub fn Backend(comptime mode: Mode) type {
             queue_size: u16,
             shared_state: *SharedState,
         ) !void {
+            if (comptime zio_options.sim) {
+                // Do not open io_uring or epoll. poll() panics if reached.
+                self.* = .{ .engine = .{ .epoll = undefined } };
+                shared_state.selection = .epoll;
+                return;
+            }
             // The decision belongs to the LoopGroup. Holding this mutex through
             // initialization prevents two first loops from selecting different
             // engines and also serializes publication of io_uring's master WQ.
@@ -158,6 +166,7 @@ pub fn Backend(comptime mode: Mode) type {
         }
 
         pub fn deinit(self: *Self) void {
+            if (comptime zio_options.sim) return;
             switch (mode) {
                 .io_uring => self.engine.io_uring.deinit(),
                 .epoll => self.engine.epoll.deinit(),
@@ -263,6 +272,7 @@ pub fn Backend(comptime mode: Mode) type {
         }
 
         pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
+            if (comptime zio_options.sim) sim.forbidBackendPoll();
             return switch (mode) {
                 .io_uring => self.engine.io_uring.poll(state, timeout),
                 .epoll => self.engine.epoll.poll(state, timeout),

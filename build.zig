@@ -26,6 +26,9 @@ pub fn build(b: *std.Build) void {
 
     const scheduler_metrics = b.option(bool, "scheduler_metrics", "Count scheduler events (parks, steals, wake batches) in per-executor counters readable via Runtime.schedulerMetrics (default true; the counters sit on executor-local paths and cost one plain increment per event)") orelse true;
 
+    const sim = b.option(bool, "sim", "Deterministic simulation mode for DST. Default false. Production and the pin-gate leave this off.") orelse false;
+    const sim_mutant = b.option([]const u8, "sim-mutant", "DST mutant: none | omit_timeout_recheck | arm_timer_stale") orelse "none";
+
     // Create options for backend selection
     var options = b.addOptions();
     options.addOption(?[]const u8, "backend", backend);
@@ -33,6 +36,8 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "no_hacks", no_hacks);
     options.addOption(bool, "task_migration", task_migration);
     options.addOption(bool, "scheduler_metrics", scheduler_metrics);
+    options.addOption(bool, "sim", sim);
+    options.addOption([]const u8, "sim_mutant", sim_mutant);
 
     const zio = b.addModule("zio", .{
         .root_source_file = b.path("src/zio.zig"),

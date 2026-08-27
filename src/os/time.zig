@@ -50,7 +50,16 @@ fn posixClockId(clock: Clock) ?posix.system.clockid_t {
     };
 }
 
+const zio_options = @import("zio_options");
+
 pub fn now(clock: Clock) Timestamp {
+    if (comptime zio_options.sim) {
+        return Timestamp.fromNanoseconds(@import("../sim.zig").nowNsFor(@intFromEnum(clock)));
+    }
+    return nowHost(clock);
+}
+
+fn nowHost(clock: Clock) Timestamp {
     switch (builtin.os.tag) {
         .windows => {
             switch (clock) {

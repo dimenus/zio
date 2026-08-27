@@ -4,7 +4,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const log = @import("common.zig").log;
-const Waiter = @import("common.zig").Waiter;
+const common = @import("common.zig");
+const Waiter = common.Waiter;
 const meta = @import("meta.zig");
 const Runtime = @import("runtime.zig").Runtime;
 const getCurrentExecutor = @import("runtime.zig").getCurrentExecutor;
@@ -15,7 +16,8 @@ const JoinHandle = @import("runtime.zig").JoinHandle;
 const WaitQueue = @import("utils/wait_queue.zig").WaitQueue;
 const Awaitable = @import("awaitable.zig").Awaitable;
 const spawnTask = @import("task.zig").spawnTask;
-const spawnBlockingTask = @import("blocking_task.zig").spawnBlockingTask;
+const spawnBlockingTask_mod = @import("blocking_task.zig");
+const spawnBlockingTask = spawnBlockingTask_mod.spawnBlockingTask;
 const Futex = @import("sync/Futex.zig");
 
 pub const Group = struct {
@@ -146,7 +148,7 @@ pub const Group = struct {
         const ReturnType = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
         const Context = struct { group: *Group, args: Args };
         const Wrapper = struct {
-            fn start(ctx: *const anyopaque, _: *anyopaque) void {
+            fn start(ctx: *const anyopaque) void {
                 const context: *const Context = @ptrCast(@alignCast(ctx));
                 const group = context.group;
                 if (@typeInfo(ReturnType) == .error_union) {
@@ -165,7 +167,7 @@ pub const Group = struct {
         };
 
         const context: Context = .{ .group = self, .args = args };
-        return groupSpawnBlockingTask(self, rt, std.mem.asBytes(&context), .fromByteUnits(@alignOf(Context)), &Wrapper.start);
+        return groupSpawnBlockingTask(self, rt, std.mem.asBytes(&context), .fromByteUnits(@alignOf(Context)), &Wrapper.start, .{});
     }
 
     /// Wait for every task currently in the group to finish.
@@ -237,38 +239,81 @@ pub const Group = struct {
 
     pub const Result = void;
 
-    pub const WaitContext = Futex.FutexWaiter;
+    pub const WaitContext = struct {
+        fw: Futex.FutexWaiter = .{},
+        registered: bool = false,
+        /// A wake was dispatched for a dequeued registration but never
+        /// reported to the caller (the arm's claim lost before it could be):
+        /// asyncCancelWait must keep reporting it as an in-flight signal so
+        /// the caller's cleanup outwaits it.
+        pending_signal: bool = false,
+
+        pub fn holdsDeposit(_: *const WaitContext) bool {
+            return false;
+        }
+    };
 
     pub fn getResult(self: *Group, ctx: *WaitContext) void {
         _ = self;
         _ = ctx;
     }
 
-    pub fn asyncWait(self: *Group, waiter: *Waiter, ctx: *WaitContext) bool {
+    pub fn asyncWait(self: *Group, waiter: *Waiter, ctx: *WaitContext) common.AsyncWaitState {
         const state_ptr = self.getState();
 
+        // Unhook any previous registration so a re-poll never
+        // double-registers; one that is already gone was dequeued and
+        // signaled by a completion without a claim. The signal stays owed
+        // (pending_signal) until a return value reports it to the caller.
+        const had_signal = ctx.pending_signal or (ctx.registered and !Futex.cancelWait(&ctx.fw));
+        ctx.registered = false;
+        ctx.pending_signal = had_signal;
+
         // Fast path: no pending tasks means the group is already "complete".
-        if (@atomicLoad(u32, state_ptr, .acquire) & counter_mask == 0) return false;
+        if (@atomicLoad(u32, state_ptr, .acquire) & counter_mask == 0) {
+            return switch (waiter.tryClaim()) {
+                .won => blk: {
+                    ctx.pending_signal = false;
+                    break :blk if (had_signal) .ready_signaled else .ready;
+                },
+                .busy => unreachable,
+                .lost => .decided,
+            };
+        }
 
         // Park on the completion futex address.
-        Futex.prepareWait(state_ptr, ctx, waiter);
+        Futex.prepareWait(state_ptr, &ctx.fw, waiter);
+        ctx.registered = true;
 
         // Double-check: the last task may have completed (and issued its wake)
         // between the fast-path check and our registration above.
         if (@atomicLoad(u32, state_ptr, .acquire) & counter_mask == 0) {
             // We removed ourselves before any wake -> already complete.
-            if (Futex.cancelWait(ctx)) return false;
-            // A concurrent completion already dequeued us; the wake is in-flight.
-            return true;
+            if (Futex.cancelWait(&ctx.fw)) {
+                ctx.registered = false;
+                return switch (waiter.tryClaim()) {
+                    .won => blk: {
+                        ctx.pending_signal = false;
+                        break :blk if (had_signal) .ready_signaled else .ready;
+                    },
+                    .busy => unreachable,
+                    .lost => .decided,
+                };
+            }
+            // A concurrent completion already dequeued us; the wake (and its
+            // claim attempt) is in-flight.
         }
 
-        return true;
+        ctx.pending_signal = false;
+        return if (had_signal) .requeued else .queued;
     }
 
     pub fn asyncCancelWait(self: *Group, waiter: *Waiter, ctx: *WaitContext) bool {
         _ = self;
         _ = waiter;
-        return Futex.cancelWait(ctx);
+        if (ctx.pending_signal) return false;
+        if (!ctx.registered) return true;
+        return Futex.cancelWait(&ctx.fw);
     }
 };
 
@@ -285,15 +330,16 @@ pub fn groupSpawnTask(
 }
 
 /// Spawn a blocking task in the group with raw context bytes and start function.
-/// Used by Group.spawnBlocking.
+/// Used by Group.spawnBlocking and std.Io vtable implementations.
 pub fn groupSpawnBlockingTask(
     group: *Group,
     rt: *Runtime,
     context: []const u8,
     context_alignment: std.mem.Alignment,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    start: *const fn (context: *const anyopaque) void,
+    options: spawnBlockingTask_mod.SpawnOptions,
 ) !void {
-    _ = try spawnBlockingTask(rt, 0, .@"1", context, context_alignment, .{ .regular = start }, group);
+    _ = try spawnBlockingTask(rt, 0, .@"1", context, context_alignment, .{ .group = start }, group, options);
 }
 
 /// Register an awaitable with a group.

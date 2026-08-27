@@ -28,12 +28,14 @@ const fs = @import("../../../os/fs.zig");
 const linux = std.os.linux;
 const os_linux = @import("../../../os/linux.zig");
 const sockreg = @import("../../sockreg.zig");
+const zio_options = @import("zio_options");
+const sim = @import("../../../sim.zig");
 
 pub const NetHandle = net.fd_t;
 
 const Support = @import("../../completion.zig").Support;
 
-pub const native_wall_timers = true;
+pub const native_wall_timers = !zio_options.sim;
 pub const supports_nonblocking_file_io = false;
 
 pub fn capability(comptime op: Op) Support {
@@ -200,6 +202,7 @@ pending_changes: usize = 0,
 epoll_pwait2_supported: bool = true,
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
+    if (comptime zio_options.sim) return;
     shared_state.sock_table.acquire(allocator);
     errdefer shared_state.sock_table.release();
     const rc = std.os.linux.epoll_create1(std.os.linux.EPOLL.CLOEXEC);
@@ -266,6 +269,7 @@ fn closeWallTimerfd(epoll_fd: i32, fd: i32) void {
 }
 
 pub fn deinit(self: *Self) void {
+    if (comptime zio_options.sim) return;
     if (self.waker_eventfd != -1) {
         _ = std.os.linux.epoll_ctl(self.epoll_fd, std.os.linux.EPOLL.CTL_DEL, self.waker_eventfd, null);
         _ = std.os.linux.close(self.waker_eventfd);
@@ -740,6 +744,7 @@ fn waitEvents(self: *Self, timeout: Duration) !usize {
 }
 
 pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
+    if (comptime zio_options.sim) sim.forbidBackendPoll();
     // Reset pending changes counter before poll (less aggressive)
     self.pending_changes = 0;
 

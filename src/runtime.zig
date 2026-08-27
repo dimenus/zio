@@ -35,7 +35,8 @@ const Group = @import("group.zig").Group;
 const dns = @import("dns/root.zig");
 
 const select = @import("select.zig");
-const Waiter = @import("common.zig").Waiter;
+const common = @import("common.zig");
+const Waiter = common.Waiter;
 const random_mod = @import("random.zig");
 
 const ExecutorId = switch (@sizeOf(usize)) {
@@ -219,14 +220,19 @@ pub fn JoinHandle(comptime T: type) type {
             return self.result;
         }
 
-        /// Registers a waiter to be notified when the task completes.
+        /// Registers a waiter to be notified when the task completes, or
+        /// claims the select if it already did.
         /// This is part of the Future protocol for select().
-        /// Returns false if the task is already complete (no wait needed), true if added to queue.
-        pub fn asyncWait(self: Self, waiter: *Waiter) bool {
+        pub fn asyncWait(self: Self, waiter: *Waiter) common.AsyncWaitState {
             if (self.awaitable) |awaitable| {
                 return awaitable.asyncWait(waiter);
             }
-            return false; // Already complete
+            // Already complete: claim before reporting ready.
+            return switch (waiter.tryClaim()) {
+                .won => .ready,
+                .busy => unreachable,
+                .lost => .decided,
+            };
         }
 
         /// Cancels a pending wait operation by removing the waiter.
@@ -386,6 +392,8 @@ const MetricsStorage = if (metrics_enabled) SchedulerMetrics else void;
 const metrics_storage_init: MetricsStorage = if (metrics_enabled) .{} else {};
 const IdleMask = if (zio_options.task_migration) std.atomic.Value(usize) else void;
 const idle_mask_init: IdleMask = if (zio_options.task_migration) .init(0) else {};
+
+var sim_coop_depth: u8 = 0;
 
 // Executor - per-thread execution unit for running coroutines
 pub const Executor = struct {
@@ -552,8 +560,19 @@ pub const Executor = struct {
         errdefer cleanupStackGrowth();
 
         // Initialize this executor's random state from OS entropy.
-        try random_mod.setup(&self.random_state);
-        self.steal_prng = std.Random.DefaultPrng.init(self.random_state.csprng.random().int(u64));
+        // Sim mode seeds from the DST seed so the CSPRNG is not a hidden
+        // source of nondeterminism.
+        if (comptime zio_options.sim) {
+            const sim = @import("sim.zig");
+            var seed_bytes: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+            var seed_prng = std.Random.DefaultPrng.init(sim.seed());
+            seed_prng.fill(&seed_bytes);
+            self.random_state.csprng = .init(seed_bytes);
+            self.steal_prng = .init(sim.seed() ^ 0x9E3779B97F4A7C15);
+        } else {
+            try random_mod.setup(&self.random_state);
+            self.steal_prng = std.Random.DefaultPrng.init(self.random_state.csprng.random().int(u64));
+        }
 
         try self.loop.init(.{
             .allocator = self.runtime.allocator,
@@ -692,6 +711,183 @@ pub const Executor = struct {
         }
     }
 
+    fn simHasReady(exec: *Executor) bool {
+        _ = exec.checkLocalWork(false);
+        return !exec.run_queue.isEmpty();
+    }
+
+    fn simRunOneTask(exec: *Executor) void {
+        exec.tick_task_count = 0;
+        exec.tick_expired = false;
+        exec.tick_checkpoint_countdown = checkpoint_interval;
+        exec.loop.bindThread();
+        setCurrentExecutor(exec);
+        // Coop yield runs inside another loop's poll, after that loop
+        // advanced the sim clock. Refresh this loop so a duration timer
+        // armed here is not backdated. After poll returns, do not refresh:
+        // the post-wait `updateNow` in `poll` is the #711 site, and a
+        // revert of it must stay visible to the next task batch.
+        if (sim_coop_depth != 0) {
+            exec.loop.state.updateNow();
+        }
+        exec.processCleanup();
+        const next_task = exec.getNextTask() orelse return;
+        updateParentContext(next_task, &exec.main_task.coro.context);
+        exec.current_task = next_task;
+        next_task.coro.step();
+        exec.current_task = null;
+        exec.processCleanup();
+    }
+
+    fn simCoopHarvest(self: *Executor, execs: []*Executor) void {
+        for (execs) |e| {
+            e.loop.bindThread();
+            setCurrentExecutor(e);
+            e.loop.poll(.zero) catch {};
+            e.drainDispatched();
+        }
+        self.loop.bindThread();
+        setCurrentExecutor(self);
+    }
+
+    pub fn simCoopYield(self: *Executor) void {
+        if (sim_coop_depth != 0) return;
+        sim_coop_depth = 1;
+        defer sim_coop_depth = 0;
+
+        const execs = self.runtime.executors.items;
+        const sim = @import("sim.zig");
+        // From a task (select settle/sweep): seed whether to harvest due
+        // claims now. Always-on harvest made wait prefer a landed signal,
+        // so canceled=true never ran. pickIndex(2) keeps both early-claim
+        // and late-claim (pending cancel) in the explored space.
+        // From poll (current_task is null): skip, nested poll on this loop
+        // is unsafe.
+        const from_task = self.current_task != null;
+        if (from_task and sim.pickIndex(2) == 0) {
+            simCoopHarvest(self, execs);
+        }
+
+        if (execs.len >= 2) {
+            var ready: [2]*Executor = undefined;
+            var n: usize = 0;
+            for (execs) |e| {
+                if (e == self) continue;
+                if (simHasReady(e)) {
+                    ready[n] = e;
+                    n += 1;
+                }
+            }
+            if (n > 0) {
+                const pick = if (n == 1) 0 else sim.pickIndex(n);
+                simRunOneTask(ready[pick]);
+                self.loop.bindThread();
+                setCurrentExecutor(self);
+            }
+        }
+
+        // After the task runs, a producer that just submitted still needs a
+        // poll for the CQ claim to land in this settle. Seeded again so
+        // some schedules leave the claim for later.
+        if (from_task and sim.pickIndex(2) == 0) {
+            simCoopHarvest(self, execs);
+        }
+    }
+
+    fn simMuxStep(rt: *Runtime, home: *Executor) !void {
+        const sim = @import("sim.zig");
+        const execs = rt.executors.items;
+        var ready: [2]*Executor = undefined;
+        var ready_n: usize = 0;
+        for (execs) |e| {
+            if (simHasReady(e)) {
+                ready[ready_n] = e;
+                ready_n += 1;
+            }
+        }
+        if (ready_n > 0) {
+            // Half the time, harvest due I/O/timers before the ready batch.
+            // Without that, a canceled select always runs (deregisters)
+            // before poll can fire a claim into it.
+            if (sim.pickIndex(2) == 0) {
+                for (execs) |e| {
+                    e.loop.bindThread();
+                    setCurrentExecutor(e);
+                    try e.loop.poll(.zero);
+                    e.drainDispatched();
+                }
+                home.loop.bindThread();
+                setCurrentExecutor(home);
+                ready_n = 0;
+                for (execs) |e| {
+                    if (simHasReady(e)) {
+                        ready[ready_n] = e;
+                        ready_n += 1;
+                    }
+                }
+                if (ready_n == 0) return;
+            }
+            const pick = if (ready_n == 1) 0 else sim.pickIndex(ready_n);
+            simRunOneTask(ready[pick]);
+            home.loop.bindThread();
+            setCurrentExecutor(home);
+            return;
+        }
+
+        for (execs) |e| {
+            e.loop.bindThread();
+            setCurrentExecutor(e);
+            try e.loop.poll(.zero);
+            e.drainDispatched();
+        }
+        home.loop.bindThread();
+        setCurrentExecutor(home);
+
+        if (home.main_task.state.load(.acquire).tag == .ready) return;
+        for (execs) |e| {
+            if (simHasReady(e)) return;
+        }
+
+        var min_t: ?Duration = null;
+        var owner: *Executor = home;
+        for (execs) |e| {
+            if (e.loop.peekNextTimeout()) |t| {
+                if (min_t == null or t.value < min_t.?.value) {
+                    min_t = t;
+                    owner = e;
+                }
+            }
+        }
+        if (sim.hasDueIo()) return;
+        if (sim.nextDueIoRemaining()) |io| {
+            const t = Duration.fromNanoseconds(io);
+            if (min_t == null or t.value < min_t.?.value) {
+                min_t = t;
+                owner = home;
+            }
+        }
+        if (min_t) |t| {
+            // Drive the wait through Loop.poll so the post-wait snapshot
+            // refresh is the same statement production uses after backend.poll.
+            owner.loop.bindThread();
+            setCurrentExecutor(owner);
+            try owner.loop.poll(t);
+            owner.drainDispatched();
+            for (execs) |e| {
+                if (e == owner) continue;
+                e.loop.bindThread();
+                setCurrentExecutor(e);
+                try e.loop.poll(.zero);
+                e.drainDispatched();
+            }
+            home.loop.bindThread();
+            setCurrentExecutor(home);
+            if (home.main_task.state.load(.acquire).tag == .ready) return;
+            return;
+        }
+        sim.deadlock();
+    }
+
     pub const RunMode = enum {
         /// Run until main_task.state becomes .ready.
         /// Caller must set up the state before calling (e.g., .waiting for I/O).
@@ -733,6 +929,21 @@ pub const Executor = struct {
         // run() calls must not count toward the per-quantum estimate.
         self.tick_started_at = Timestamp.now(.monotonic);
 
+        if (comptime zio_options.sim) {
+            if (self.runtime.executors.items.len > 1) {
+                while (true) {
+                    if (self.loop.stopped()) {
+                        if (mode == .until_stopped) return;
+                        @panic("event loop stopped while the main task was yielding");
+                    }
+                    if (check_ready and self.main_task.state.load(.acquire).tag == .ready) {
+                        return;
+                    }
+                    try simMuxStep(self.runtime, self);
+                }
+            }
+        }
+
         while (true) {
             // Process ready coroutines
             while (self.getNextTask()) |next_task| {
@@ -767,7 +978,9 @@ pub const Executor = struct {
 
             // Retune the tick budget from this batch. Skipped when we may have
             // slept in parkAndSearch — sleep time would poison the estimate.
-            const tick_now = Timestamp.now(.monotonic);
+            // The cached snapshot: every path above ends in a `loop.poll`,
+            // which refreshes it on return.
+            const tick_now = self.loop.now();
             // Skip the retune on the fresh-drain entry pass: tick_task_count
             // still holds quanta spent before run() was entered, while
             // tick_started_at was just reset, so the pair would yield a bogus
@@ -995,6 +1208,28 @@ pub const Executor = struct {
         // can't starve timers or I/O.
         if (!self.tickBudgetLeft()) {
             return null;
+        }
+
+        if (comptime zio_options.sim) {
+            const sim = @import("sim.zig");
+            const cap = LocalRunQueue(WaitNode, zio_options.task_migration).capacity;
+            var buf: [cap]*WaitNode = undefined;
+            var n: usize = 0;
+            while (n < cap) {
+                buf[n] = self.run_queue.pop() orelse break;
+                n += 1;
+            }
+            if (n == 0) return null;
+            const pick: usize = if (n == 1) 0 else sim.pickIndex(n);
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                if (i == pick) continue;
+                _ = self.run_queue.push(buf[i]);
+            }
+            self.spendQuantum();
+            const task = AnyTask.fromWaitNode(buf[pick]);
+            sim.emit(.task_switch, sim.taskId(@intFromPtr(task)), self.id);
+            return task;
         }
 
         const node = self.run_queue.pop() orelse return null;
@@ -1381,11 +1616,26 @@ pub fn endShield() void {
     }
 }
 
+/// Re-arm a cancellation that a previous cancellation point already reported, so
+/// that the next one returns error.Canceled again. Use it when a canceled
+/// operation still has a result to hand back before the cancellation is acted on.
+///
+/// Asserts the task is under a cancellation (an explicit cancel or a live
+/// auto-cancel). If not in a task context, this is a no-op: a blocking task's
+/// cancellation is never consumed, so there is nothing to put back.
+pub fn recancel() void {
+    if (getCurrentTaskOrNull()) |task| {
+        task.recancel();
+    }
+}
+
 /// Check if the current task has been cancelled and return an error if so.
 /// If not in a task context, this is a no-op.
 pub fn checkCancel() Cancelable!void {
     if (getCurrentTaskOrNull()) |task| {
         try task.checkCancel();
+    } else {
+        try os.syscall_cancel.checkCanceled();
     }
 }
 
@@ -1465,6 +1715,14 @@ pub const Runtime = struct {
         const num_executors = options.executors.resolve();
         const num_workers = if (options.enable_main_executor) num_executors - 1 else num_executors;
 
+        if (comptime zio_options.sim) {
+            const sim = @import("sim.zig");
+            if (!sim.isBegun()) @panic("sim: begin() before Runtime.init");
+            if (num_executors < 1 or num_executors > 2 or !options.enable_main_executor) {
+                @panic("sim: M3 allows executors=1 or 2 with the main executor");
+            }
+        }
+
         self.* = .{
             .allocator = allocator,
             .options = options,
@@ -1504,7 +1762,20 @@ pub const Runtime = struct {
 
         errdefer self.shutdownWorkers();
 
-        if (!builtin.single_threaded) {
+        if (comptime zio_options.sim) {
+            const worker_id_start: ExecutorId = 1;
+            for (0..num_workers) |i| {
+                const worker = self.workers.addOneAssumeCapacity();
+                worker.* = .{};
+                try worker.executor.init(self, @intCast(i + worker_id_start));
+                worker.ready.set();
+                self.executors.appendAssumeCapacity(&worker.executor);
+            }
+            self.main_executor.main_task.coro.setCurrent();
+            self.main_executor.loop.bindThread();
+            setCurrentExecutor(&self.main_executor);
+            self.main_executor.current_task = &self.main_executor.main_task;
+        } else if (!builtin.single_threaded) {
             const worker_id_start: ExecutorId = if (options.enable_main_executor) 1 else 0;
             for (0..num_workers) |i| {
                 log.debug("Spawning worker thread {}", .{i + worker_id_start});
@@ -1569,6 +1840,18 @@ pub const Runtime = struct {
     /// Stop worker executors and join threads. Used by deinit() and init() error path.
     fn shutdownWorkers(self: *Runtime) void {
         self.executors_stealable.store(false, .release);
+        if (comptime zio_options.sim) {
+            for (self.workers.items) |*worker| {
+                worker.executor.loop.bindThread();
+                worker.executor.deinit();
+            }
+            self.workers.deinit(self.allocator);
+            if (self.options.enable_main_executor) {
+                self.main_executor.loop.bindThread();
+                setCurrentExecutor(&self.main_executor);
+            }
+            return;
+        }
         // Wait for all workers to finish initialization, then stop their event loops.
         // Workers that failed to initialize (err != null) don't have valid executors.
         for (self.workers.items) |*worker| {
@@ -1694,6 +1977,7 @@ pub const Runtime = struct {
             .fromByteUnits(@alignOf(Args)),
             .{ .regular = &Wrapper.start },
             null,
+            .{},
         );
 
         return JoinHandle(Result){
@@ -1878,19 +2162,22 @@ pub const Runtime = struct {
 
     /// Construct a `std.Io` instance backed by this runtime.
     pub fn io(self: *Runtime) std.Io {
-        return @import("io.zig").fromRuntime(self);
+        return @import("io.zig").fromRuntime(self, .regular);
     }
 
-    /// Recover the `*Runtime` from a `std.Io` produced by `Runtime.io()`,
-    /// or null when it is backed by some other implementation. The vtable
-    /// pointer is the discriminator: every zio-backed `std.Io` shares the
-    /// one static vtable, and no other backend can carry its address. This
-    /// is how a library taking `std.Io` detects zio and unlocks zio-native
-    /// paths.
+    /// Construct a `std.Io` whose `concurrent`/`async` dispatch to
+    /// `spawnBlocking` instead of coroutine tasks. The returned handle
+    /// shares the same vtable and runtime; only the scheduling path for
+    /// new work differs.
+    pub fn blockingIo(self: *Runtime) std.Io {
+        return @import("io.zig").fromRuntime(self, .blocking);
+    }
+
+    /// Recover the `*Runtime` from a `std.Io` produced by `Runtime.io()`
+    /// or `Runtime.blockingIo()`, or null when it is backed by some other
+    /// implementation.
     pub fn fromIo(value: std.Io) ?*Runtime {
         const io_impl = @import("io.zig");
-        // The vtable alone is not enough: `debug_io` carries zio's vtable
-        // with no runtime behind it.
         if (value.vtable != &io_impl.vtable or value.userdata == null) return null;
         return io_impl.toRuntime(value);
     }
@@ -1956,6 +2243,51 @@ test "runtime: spawnBlocking smoke test" {
 
     const result = handle.join();
     try std.testing.expectEqual(42, result);
+}
+
+test "runtime: spawnBlocking cancel interrupts a blocking syscall on the worker" {
+    if (!os.syscall_cancel.enabled) return error.SkipZigTest;
+
+    const runtime = try Runtime.init(std.testing.allocator, .{ .thread_pool = .{} });
+    defer runtime.deinit();
+
+    // The blocking function parks in a cancelable read on an empty pipe. When the
+    // task is canceled, SIGURG (first signal + loop-driven resend) must interrupt
+    // the read and surface as error.Canceled.
+    const worker = struct {
+        fn cancelableRead(fd: std.c.fd_t, ready: *std.atomic.Value(bool)) error{ Canceled, Unexpected }!void {
+            const sc = try os.syscall_cancel.Syscall.begin();
+            defer sc.finish();
+            ready.store(true, .release);
+            var buf: [1]u8 = undefined;
+            while (true) {
+                const rc = std.c.read(fd, &buf, buf.len);
+                if (rc >= 0) return error.Unexpected;
+                switch (std.posix.errno(rc)) {
+                    .INTR => {
+                        try sc.checkCancel();
+                        continue;
+                    },
+                    else => return error.Unexpected,
+                }
+            }
+        }
+    };
+
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    var ready = std.atomic.Value(bool).init(false);
+    var handle = try runtime.spawnBlocking(worker.cancelableRead, .{ fds[0], &ready });
+
+    // Wait until the worker is inside the cancelable read (the pool has bound the
+    // task's token), then cancel the blocking task directly.
+    while (!ready.load(.acquire)) try runtime.sleep(.fromMicroseconds(100));
+
+    handle.cancel(); // requests cancellation and waits for completion
+    try std.testing.expectError(error.Canceled, handle.getResult());
 }
 
 test "Runtime: implicit run" {
@@ -2087,6 +2419,34 @@ test "runtime: shielded sleep is not cancelable" {
 
     // Ensure the sleep completed (took at least 50ms)
     try std.testing.expect(timer.read().toMilliseconds() >= 40);
+}
+
+test "runtime: recancel re-arms a delivered cancellation" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const recancelingTask = struct {
+        fn call() !void {
+            sleep(.fromMilliseconds(60_000)) catch |err| {
+                std.debug.assert(err == error.Canceled);
+                // The cancellation was consumed by the sleep; putting it back
+                // means the next cancellation point has to report it again.
+                recancel();
+                try checkCancel();
+                return error.TestUnexpectedResult;
+            };
+            return error.TestUnexpectedResult;
+        }
+    }.call;
+
+    var handle = try runtime.spawn(recancelingTask, .{});
+    defer handle.cancel();
+
+    // Let the task reach the sleep before canceling it.
+    try runtime.sleep(.fromMilliseconds(10));
+    handle.cancel();
+
+    try std.testing.expectError(error.Canceled, handle.join());
 }
 
 test "runtime: yield from main allows tasks to run" {

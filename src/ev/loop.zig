@@ -15,6 +15,8 @@ const Work = @import("completion.zig").Work;
 const DelegatedWork = @import("completion.zig").DelegatedWork;
 const FileRead = @import("completion.zig").FileRead;
 const NetSend = @import("completion.zig").NetSend;
+const NetRecv = @import("completion.zig").NetRecv;
+const NetClose = @import("completion.zig").NetClose;
 const NetSendFile = @import("completion.zig").NetSendFile;
 const ReadBuf = @import("buf.zig").ReadBuf;
 const WriteBuf = @import("buf.zig").WriteBuf;
@@ -25,6 +27,8 @@ const net = @import("../os/net.zig");
 const common = @import("backends/common.zig");
 
 const log = @import("../common.zig").log;
+const zio_options = @import("zio_options");
+const sim = @import("../sim.zig");
 
 const in_safe_mode = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
 const in_debug_mode = builtin.mode == .Debug;
@@ -234,7 +238,7 @@ pub const LoopState = struct {
     wake_requested: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// Cached "now" per wall clock, indexed by `clockIndex`. `awake` is
-    /// refreshed eagerly once per scan (`updateNow`); `boot`/`real` are
+    /// refreshed eagerly at the start of each scan (`updateNow`); `boot`/`real` are
     /// refreshed lazily on first use within a scan and cached for the rest of
     /// it. `tick` is a monotonically increasing scan counter; `now_tick[i]`
     /// records the scan that `now[i]` was last filled, so a mismatch refreshes.
@@ -382,6 +386,8 @@ pub const LoopState = struct {
 
     /// Advance the scan counter and refresh the awake snapshot. Bumping `tick`
     /// invalidates the lazily-cached boot/real values for the new scan.
+    /// Owner-thread only, so no timer lock: the cross-thread `clearTimer`
+    /// never reads `now`/`tick`.
     pub fn updateNow(self: *LoopState) void {
         self.tick +%= 1;
         self.now[0] = time.now(.monotonic);
@@ -415,7 +421,26 @@ pub const LoopState = struct {
     pub fn armTimer(self: *LoopState, timer: *Timer) void {
         switch (timer.timeout) {
             .none => timer.deadline = .{ .value = std.math.maxInt(time.TimeInt) },
-            .duration => |d| timer.deadline = self.nowFor(timer.clock).addDuration(d),
+            .duration => |d| {
+                var now = self.nowFor(timer.clock);
+                if (comptime zio_options.sim) {
+                    if (sim.mutantArmTimerStale()) {
+                        now = .fromNanoseconds(sim.epochNs(@intFromEnum(timer.clock)));
+                    }
+                }
+                timer.deadline = now.addDuration(d);
+                if (comptime zio_options.sim) {
+                    if (d.value > 0) {
+                        const dl = timer.deadline.toNanoseconds();
+                        const true_now = sim.nowNsFor(@intFromEnum(timer.clock));
+                        const dur = d.toNanoseconds();
+                        const expected = true_now +| dur;
+                        if (dl +| 1 < expected) {
+                            sim.panic("armTimer backdated: deadline behind true now + duration", .{});
+                        }
+                    }
+                }
+            },
             .deadline => |ts| timer.deadline = ts,
         }
         self.timers[clockIndex(timer.clock)].insert(timer);
@@ -470,6 +495,12 @@ pub const LoopState = struct {
                 slot.* = node.resend_next;
                 node.resend_next = null;
                 node.resend_key = null;
+                // Fire the release hook (drops the blocking task's keep-alive
+                // ref) now that the entry is unlinked. Cleared so it runs once.
+                if (node.resend_release) |release| {
+                    node.resend_release = null;
+                    release(node);
+                }
             }
         }
     }
@@ -562,6 +593,31 @@ pub const Loop = struct {
         if (in_debug_mode) std.debug.assert(current_loop == self);
     }
 
+    /// Sim multiplex: this thread runs more than one logical loop. Bind
+    /// before any add/poll/cancel on this loop.
+    pub fn bindThread(self: *Loop) void {
+        if (in_debug_mode) current_loop = self;
+    }
+
+    /// Earliest pending timer remaining, or null. Does not fire.
+    pub fn peekNextTimeout(self: *Loop) ?Duration {
+        var next: ?Duration = null;
+        for (0..wall_clock_count) |idx| {
+            if (self.state.timers[idx].isEmpty()) continue;
+            self.state.lockTimers();
+            defer self.state.unlockTimers();
+            const timer = self.state.timers[idx].peek() orelse continue;
+            const clock = indexClock(idx);
+            const now_clock = self.state.nowFor(clock);
+            if (timer.deadline.value <= now_clock.value) {
+                return .zero;
+            }
+            const remaining = now_clock.durationTo(timer.deadline);
+            if (next == null or remaining.value < next.?.value) next = remaining;
+        }
+        return next;
+    }
+
     pub fn stop(self: *Loop) void {
         self.state.stopped = true;
     }
@@ -599,6 +655,7 @@ pub const Loop = struct {
         // If we're the first to request a wake since the last poll, do the syscall.
         // Subsequent wakers see true and skip - the syscall is already pending.
         if (self.state.wake_requested.fetchOr(LoopState.wake_loop, .acq_rel) == 0) {
+            if (comptime zio_options.sim) return;
             self.backend.wake(&self.state);
         }
     }
@@ -606,6 +663,7 @@ pub const Loop = struct {
     /// Wake up the loop to process async handles (thread-safe)
     pub fn wakeAsync(self: *Loop) void {
         if (self.state.wake_requested.fetchOr(LoopState.wake_async, .acq_rel) == 0) {
+            if (comptime zio_options.sim) return;
             self.backend.wake(&self.state);
         }
     }
@@ -697,7 +755,9 @@ pub const Loop = struct {
             }
 
             if (target.state.wake_requested.fetchOr(LoopState.wake_cancel, .acq_rel) == 0) {
-                target.backend.wake(&target.state);
+                if (comptime !zio_options.sim) {
+                    target.backend.wake(&target.state);
+                }
             }
         }
     }
@@ -776,6 +836,10 @@ pub const Loop = struct {
             },
 
             inline else => |op| {
+                if (comptime zio_options.sim) {
+                    self.cancelSimIo(completion);
+                    return;
+                }
                 const op_data = completion.cast(op.toType());
                 switch (comptime Backend.capability(op)) {
                     .yes => self.backend.cancel(&self.state, completion),
@@ -793,15 +857,34 @@ pub const Loop = struct {
     fn cancelLinkedWork(self: *Loop, completion: *Completion, linked_work: *DelegatedWork) void {
         const thread_pool = self.thread_pool orelse unreachable;
         thread_pool.cancel(&linked_work.work);
-        // A worker can enter its blocking syscall just after the first SIGURG.
-        // Keep re-sending until it acknowledges or the completion finalizes.
         if (linked_work.token.isCanceling()) {
             self.state.addResend(&linked_work.work, completion);
         }
     }
 
-    /// Run the loop until every completion it owns has finished (or the loop
-    /// is stopped).
+    /// Cancel a thread-pool `work` that was submitted directly to the pool (not
+    /// through this loop), e.g. a blocking task. Loop-thread only.
+    pub fn cancelWork(self: *Loop, work: *Work) void {
+        const thread_pool = self.thread_pool orelse {
+            if (work.resend_release) |release| {
+                work.resend_release = null;
+                release(work);
+            }
+            return;
+        };
+        thread_pool.cancel(work);
+        if (work.cancel_token) |token| {
+            if (token.isCanceling()) {
+                self.state.addResend(work, &work.c);
+                return;
+            }
+        }
+        if (work.resend_release) |release| {
+            work.resend_release = null;
+            release(work);
+        }
+    }
+
     pub fn run(self: *Loop) !void {
         std.debug.assert(self.state.initialized);
         while (!self.done()) {
@@ -895,6 +978,9 @@ pub const Loop = struct {
                 return;
             },
             .net_send_file => {
+                if (comptime zio_options.sim) {
+                    sim.panic("sim: unsimulated I/O op net_send_file", .{});
+                }
                 const op = completion.cast(NetSendFile);
                 switch (comptime Backend.capability(.net_send_file)) {
                     .yes => self.backend.submit(&self.state, completion),
@@ -912,6 +998,10 @@ pub const Loop = struct {
                 return;
             },
             else => {
+                if (comptime zio_options.sim) {
+                    self.submitSimIo(completion);
+                    return;
+                }
                 switch (completion.op) {
                     inline else => |op| {
                         const op_data = completion.cast(op.toType());
@@ -938,6 +1028,8 @@ pub const Loop = struct {
         fired: bool,
     };
 
+    /// Fire every timer whose deadline has passed and report the earliest one
+    /// still pending. Scans against the current snapshot; `poll` owns the tick.
     fn checkTimers(self: *Loop) TimerCheckResult {
         const native_wall = Backend.native_wall_timers;
 
@@ -948,13 +1040,6 @@ pub const Loop = struct {
         // under the lock) to fold into the poll timeout if the backend can't arm.
         var wall_deadline: [wall_clock_count]?u64 = .{ null, null, null };
         var wall_remaining: [wall_clock_count]Duration = .{ .zero, .zero, .zero };
-
-        // Advance the scan once and refresh the awake snapshot; this also
-        // invalidates the lazily-cached boot/real values for this scan.
-        // `now`/`tick` are only ever touched by the owning executor thread
-        // (`updateNow` is called here and in `setTimer`, both owner-thread; the
-        // cross-thread `clearTimer` never reads them), so no timer lock is needed.
-        self.state.updateNow();
 
         // Each wall-clock domain has its own heap, compared against `now` in
         // that clock. The earliest remaining across all domains becomes the
@@ -1014,7 +1099,22 @@ pub const Loop = struct {
                 self.state.unlockTimers();
 
                 // Mark completions outside the lock
+                if (comptime zio_options.sim) {
+                    // Same-deadline fire order is a real source of
+                    // nondeterminism. Shuffle the batch with the sim RNG.
+                    var i: usize = batch_count;
+                    while (i > 1) {
+                        i -= 1;
+                        const j = sim.pickIndex(i + 1);
+                        const tmp = batch[i];
+                        batch[i] = batch[j];
+                        batch[j] = tmp;
+                    }
+                }
                 for (batch[0..batch_count]) |timer| {
+                    if (comptime zio_options.sim) {
+                        sim.emit(.timer_fire, @intFromEnum(clock), @truncate(timer.deadline.value));
+                    }
                     self.state.markCompleted(&timer.c);
                     fired = true;
                 }
@@ -1361,11 +1461,18 @@ pub const Loop = struct {
     /// in between caps the wait at that duration (the executor's idle doze).
     /// Timer deadlines, pending completions, and the loop's `max_wait` option
     /// can all shorten the wait; they never lengthen it.
+    ///
+    /// Sim does not call the kernel backend. `waitForEvents` advances the
+    /// logical clock by the timeout the real poll would have slept. The
+    /// snapshot refresh after that wait is this function's `updateNow`, the
+    /// same statement production uses after `backend.poll` (#711).
     pub fn poll(self: *Loop, wait_cap: Duration) !void {
         std.debug.assert(self.state.initialized);
         if (self.done()) return;
 
         const wait = wait_cap.value != 0;
+
+        self.state.updateNow();
         const timer_result = self.checkTimers();
 
         // Re-send SIGURG to any worker still blocked in a canceled syscall.
@@ -1373,8 +1480,9 @@ pub const Loop = struct {
 
         var timeout: Duration = .zero;
         if (wait) {
+            const has_due_io = if (comptime zio_options.sim) sim.hasDueIo() else false;
             // Don't block if we have completions waiting to be processed or timers fired
-            if (!self.state.completions.empty() or !self.state.work_completions.empty() or timer_result.fired) {
+            if (!self.state.completions.empty() or !self.state.work_completions.empty() or timer_result.fired or has_due_io) {
                 timeout = .zero;
             } else if (timer_result.next_timeout) |t| {
                 // Use timer timeout, capped at max_wait
@@ -1393,11 +1501,21 @@ pub const Loop = struct {
             }
         }
 
-        // Skip the backend poll when not waiting and there's nothing to retrieve.
-        // This avoids syscall overhead for pure CPU-bound workloads.
-        const should_poll = wait or self.backend.hasInflight();
         const wake_flags = self.state.wake_requested.swap(0, .acq_rel);
-        const timed_out = if (should_poll) try self.backend.poll(&self.state, if (wake_flags != 0) .zero else timeout) else false;
+        if (comptime zio_options.sim) {
+            const future_io = sim.nextDueIoRemaining() != null;
+            if (timeout.value != 0 and timer_result.next_timeout == null and timeout.value >= self.max_wait.value and !future_io) {
+                sim.deadlock();
+            }
+        }
+        const timed_out = try self.waitForEvents(timeout, wait, wake_flags);
+
+        // The wait (`backend.poll` or sim `advanceNs`) is the only place the
+        // loop sleeps, so the snapshot is stale by the whole sleep here.
+        // Refresh before anything that can arm a timer: the callbacks below,
+        // and the caller's task batch. Sim must not have its own copy of this
+        // statement: a production regression here has to be a sim regression.
+        self.state.updateNow();
 
         // Process async handles if the async bit was set
         if (wake_flags & LoopState.wake_async != 0) {
@@ -1409,14 +1527,156 @@ pub const Loop = struct {
             self.processCancelQueue();
         }
 
+        if (comptime zio_options.sim) {
+            self.harvestSimIo();
+        }
+
         // Process any work completions from thread pool
         self.processCompletions();
 
-        // Only check timers again if we timed out (avoids syscall when woken by I/O)
+        // Only if we timed out: the timeout was the earliest deadline, so
+        // waking ahead of it means nothing has expired.
         if (timed_out) {
             _ = self.checkTimers();
+            if (comptime zio_options.sim) {
+                self.harvestSimIo();
+                self.processCompletions();
+            }
         }
     }
+
+    /// Block until the next event, or return immediately for a zero timeout.
+    /// Production calls `backend.poll`. Sim advances the logical clock by
+    /// the same timeout and never enters the kernel. A full park with no
+    /// timer and no completion is a deadlock.
+    fn waitForEvents(
+        self: *Loop,
+        timeout: Duration,
+        wait: bool,
+        wake_flags: u32,
+    ) !bool {
+        if (comptime zio_options.sim) {
+            const timer_ns = timeout.toNanoseconds();
+            if (sim.nextDueIoRemaining()) |io_ns| {
+                if (timer_ns == 0) return false;
+                if (io_ns <= timer_ns) {
+                    if (io_ns != 0) sim.advanceNs(io_ns);
+                    return false;
+                }
+            }
+            if (timer_ns != 0) {
+                sim.advanceNs(timer_ns);
+                return true;
+            }
+            return false;
+        }
+        // Skip the backend poll when not waiting and there's nothing to retrieve.
+        // This avoids syscall overhead for pure CPU-bound workloads.
+        const should_poll = wait or self.backend.hasInflight();
+        if (!should_poll) return false;
+        return try self.backend.poll(&self.state, if (wake_flags != 0) .zero else timeout);
+    }
+
+    fn firstReadSlice(buf: ReadBuf) []u8 {
+        if (buf.iovecs.len == 0) return &.{};
+        const v = buf.iovecs[0];
+        return v.base[0..v.len];
+    }
+
+    fn firstWriteSlice(buf: WriteBuf) []const u8 {
+        if (buf.iovecs.len == 0) return &.{};
+        const v = buf.iovecs[0];
+        return v.base[0..v.len];
+    }
+
+    fn submitSimIo(self: *Loop, c: *Completion) void {
+        switch (c.op) {
+            .net_recv => {
+                const op = c.cast(NetRecv);
+                const dst = firstReadSlice(op.buffers);
+                switch (sim.recvInto(op.handle, dst, c, op.flags.dont_wait)) {
+                    .due => |n| c.setResult(.net_recv, n),
+                    .eof => c.setResult(.net_recv, 0),
+                    .parked => {},
+                    .would_block => {
+                        c.setError(error.WouldBlock);
+                        if (sim.takeOpId(c)) |id| sim.emit(.io_complete, @intFromEnum(c.op), id);
+                        self.state.markCompleted(c);
+                    },
+                    .bad_fd => c.setError(error.FileDescriptorNotASocket),
+                }
+            },
+            .net_send => {
+                const op = c.cast(NetSend);
+                const src = firstWriteSlice(op.buffer);
+                switch (sim.sendBytes(op.handle, src, c)) {
+                    .due => |n| c.setResult(.net_send, n),
+                    .eof => c.setError(error.BrokenPipe),
+                    .parked => {},
+                    .would_block => unreachable,
+                    .bad_fd => c.setError(error.FileDescriptorNotASocket),
+                }
+            },
+            .net_close => {
+                const op = c.cast(NetClose);
+                switch (sim.closeFd(op.handle, c)) {
+                    .due => c.setResult(.net_close, {}),
+                    .bad_fd => c.setError(error.FileDescriptorNotASocket),
+                }
+            },
+            else => sim.panic("sim: unsimulated I/O op {s}", .{@tagName(c.op)}),
+        }
+    }
+
+    fn cancelSimIo(self: *Loop, c: *Completion) void {
+        const id = sim.cancelIo(c);
+        if (!c.has_result) c.setError(error.Canceled);
+        if (id) |op_id| sim.emit(.io_complete, @intFromEnum(c.op), op_id);
+        self.state.markCompleted(c);
+    }
+
+    fn harvestSimIo(self: *Loop) void {
+        var buf: [32]sim.TakenDue = undefined;
+        const n = sim.takeDue(&buf);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const c: *Completion = @ptrCast(@alignCast(buf[i].c));
+            if (!c.has_result) {
+                switch (c.op) {
+                    .net_recv => {
+                        const op = c.cast(NetRecv);
+                        const dst = firstReadSlice(op.buffers);
+                        if (sim.recvIsEof(op.handle)) {
+                            c.setResult(.net_recv, 0);
+                        } else {
+                            c.setResult(.net_recv, sim.drainBuf(op.handle, dst));
+                        }
+                    },
+                    .net_send => {
+                        // Capacity-woken send: copy into the peer buffer.
+                        // Do not re-queue this completion. BrokenPipe is
+                        // only for a closed peer.
+                        const op = c.cast(NetSend);
+                        const src = firstWriteSlice(op.buffer);
+                        switch (sim.harvestSend(op.handle, src, c, buf[i].id)) {
+                            .due => |sent| c.setResult(.net_send, sent),
+                            .eof => c.setError(error.BrokenPipe),
+                            .parked => continue,
+                            .would_block => unreachable,
+                            .bad_fd => c.setError(error.FileDescriptorNotASocket),
+                        }
+                    },
+                    .net_close => c.setResult(.net_close, {}),
+                    else => {},
+                }
+            }
+            if (!c.has_result) continue;
+            const id = sim.takeOpId(c) orelse buf[i].id;
+            sim.emit(.io_complete, @intFromEnum(c.op), id);
+            self.state.markCompleted(c);
+        }
+    }
+
 };
 
 test {

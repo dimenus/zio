@@ -28,6 +28,8 @@ const MachPort = @import("../completion.zig").MachPort;
 const ProcessWait = @import("../completion.zig").ProcessWait;
 const fs = @import("../../os/fs.zig");
 const sockreg = @import("../sockreg.zig");
+const zio_options = @import("zio_options");
+const sim = @import("../../sim.zig");
 
 pub const NetHandle = net.fd_t;
 
@@ -38,7 +40,7 @@ const Support = @import("../completion.zig").Support;
 // (NOTE_ABSOLUTE = gettimeofday, NOTE_MACH_CONTINUOUS_TIME = suspend-aware).
 // The BSDs' EVFILT_TIMER absolute clock is monotonic-only and underspecified
 // with no CLOCK_REALTIME timer, so they keep the capped poll-timeout fallback.
-pub const native_wall_timers = builtin.os.tag.isDarwin();
+pub const native_wall_timers = builtin.os.tag.isDarwin() and !zio_options.sim;
 pub const supports_nonblocking_file_io = false;
 
 pub fn capability(comptime op: Op) Support {
@@ -215,6 +217,19 @@ fn makeKey(ident: usize, filter: i32) u64 {
 }
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
+    if (comptime zio_options.sim) {
+        if (queue_size == 0) return error.InvalidQueueSize;
+        shared_state.sock_table.acquire(allocator);
+        self.* = .{
+            .allocator = allocator,
+            .shared = shared_state,
+            .kqueue_fd = -1,
+            .waker_ident = 0,
+            .events = &.{},
+            .change_buffer = .empty,
+        };
+        return;
+    }
     shared_state.sock_table.acquire(allocator);
     errdefer shared_state.sock_table.release();
     const kq = std.c.kqueue();
@@ -263,7 +278,9 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_s
 pub fn deinit(self: *Self) void {
     self.poll_queue.deinit(self.allocator);
     self.change_buffer.deinit(self.allocator);
-    self.allocator.free(self.events);
+    if (self.events.len != 0) {
+        self.allocator.free(self.events);
+    }
     if (self.kqueue_fd != -1) {
         _ = std.c.close(self.kqueue_fd);
     }
@@ -697,6 +714,7 @@ pub fn cancel(self: *Self, state: *LoopState, target: *Completion) void {
 }
 
 pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
+    if (comptime zio_options.sim) sim.forbidBackendPoll();
     var timeout_spec: std.c.timespec = undefined;
     const timeout_ptr: ?*const std.c.timespec = if (timeout.value < std.math.maxInt(time.TimeInt)) blk: {
         const timeout_ns = timeout.toNanoseconds();
