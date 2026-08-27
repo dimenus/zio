@@ -1502,7 +1502,8 @@ pub const Loop = struct {
 
         const wake_flags = self.state.wake_requested.swap(0, .acq_rel);
         if (comptime zio_options.sim) {
-            if (timeout.value != 0 and timer_result.next_timeout == null and timeout.value >= self.max_wait.value) {
+            const future_io = sim.nextDueIoRemaining() != null;
+            if (timeout.value != 0 and timer_result.next_timeout == null and timeout.value >= self.max_wait.value and !future_io) {
                 sim.deadlock();
             }
         }
@@ -1554,8 +1555,16 @@ pub const Loop = struct {
         wake_flags: u32,
     ) !bool {
         if (comptime zio_options.sim) {
-            if (timeout.value != 0) {
-                sim.advanceNs(timeout.toNanoseconds());
+            const timer_ns = timeout.toNanoseconds();
+            if (sim.nextDueIoRemaining()) |io_ns| {
+                if (timer_ns == 0) return false;
+                if (io_ns <= timer_ns) {
+                    if (io_ns != 0) sim.advanceNs(io_ns);
+                    return false;
+                }
+            }
+            if (timer_ns != 0) {
+                sim.advanceNs(timer_ns);
                 return true;
             }
             return false;

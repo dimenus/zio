@@ -722,6 +722,9 @@ pub const Executor = struct {
         exec.tick_checkpoint_countdown = checkpoint_interval;
         exec.loop.bindThread();
         setCurrentExecutor(exec);
+        // Another loop may have advanced the sim clock while this one
+        // slept. Refresh before user code arms a duration timer.
+        exec.loop.state.updateNow();
         exec.processCleanup();
         const next_task = exec.getNextTask() orelse return;
         updateParentContext(next_task, &exec.main_task.coro.context);
@@ -797,6 +800,13 @@ pub const Executor = struct {
             }
         }
         if (sim.hasDueIo()) return;
+        if (sim.nextDueIoRemaining()) |io| {
+            const t = Duration.fromNanoseconds(io);
+            if (min_t == null or t.value < min_t.?.value) {
+                min_t = t;
+                owner = home;
+            }
+        }
         if (min_t) |t| {
             // Drive the wait through Loop.poll so the post-wait snapshot
             // refresh is the same statement production uses after backend.poll.

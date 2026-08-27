@@ -6,7 +6,9 @@ const builtin = @import("builtin");
 const Runtime = @import("runtime.zig").Runtime;
 const getCurrentTask = @import("runtime.zig").getCurrentTask;
 const getCurrentTaskOrNull = @import("runtime.zig").getCurrentTaskOrNull;
+const getCurrentExecutor = @import("runtime.zig").getCurrentExecutor;
 const yield = @import("runtime.zig").yield;
+const zio_options = @import("zio_options");
 const common = @import("common.zig");
 const Cancelable = common.Cancelable;
 const Waiter = common.Waiter;
@@ -331,7 +333,14 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
                 decided = true;
                 break :sweep;
             },
-            .queued, .requeued => registered[i] = true,
+            .queued, .requeued => {
+                registered[i] = true;
+                // After this arm is on its queue, a producer on the other
+                // logical executor can claim it before the next arm registers.
+                if (comptime zio_options.sim) {
+                    getCurrentExecutor().simCoopYield();
+                }
+            },
             .decided => {
                 decided = true;
                 break :sweep;

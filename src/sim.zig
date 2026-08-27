@@ -47,7 +47,12 @@ const End = struct {
 };
 
 var ends: [max_ends]End = @splat(.{});
-var due: [max_due]*anyopaque = undefined;
+const Due = struct {
+    c: *anyopaque,
+    due_at: u64,
+};
+
+var due: [max_due]Due = undefined;
 var due_len: usize = 0;
 
 pub fn isBegun() bool {
@@ -231,14 +236,34 @@ pub fn pipePair() [2]i32 {
     return .{ fd_base + a, fd_base + b };
 }
 
+fn ioDelayNs() u64 {
+    // Never zero: immediate due is harvested with timeout=0, which is not
+    // the mid-sleep I/O window (kevent returns timed_out=false).
+    return if (pickIndex(2) == 0) 1_000_000 else 5_000_000;
+}
+
 fn pushDue(c: *anyopaque) void {
     if (due_len >= max_due) @panic("sim: I/O due list full");
-    due[due_len] = c;
+    due[due_len] = .{ .c = c, .due_at = clock_ns + ioDelayNs() };
     due_len += 1;
 }
 
 pub fn hasDueIo() bool {
-    return due_len > 0;
+    for (due[0..due_len]) |d| {
+        if (d.due_at <= clock_ns) return true;
+    }
+    return false;
+}
+
+/// Remaining ns until the next not-yet-due I/O, or null.
+pub fn nextDueIoRemaining() ?u64 {
+    var min_at: ?u64 = null;
+    for (due[0..due_len]) |d| {
+        if (d.due_at <= clock_ns) continue;
+        if (min_at == null or d.due_at < min_at.?) min_at = d.due_at;
+    }
+    if (min_at) |at| return at - clock_ns;
+    return null;
 }
 
 pub fn hasParkedIo() bool {
@@ -351,7 +376,7 @@ pub fn cancelIo(c: *anyopaque) bool {
     }
     var i: usize = 0;
     while (i < due_len) : (i += 1) {
-        if (due[i] == c) {
+        if (due[i].c == c) {
             due[i] = due[due_len - 1];
             due_len -= 1;
             return true;
@@ -360,14 +385,23 @@ pub fn cancelIo(c: *anyopaque) bool {
     return false;
 }
 
-/// Pop every due completion, shuffled when n>1. Caller harvests.
+/// Pop completions whose due_at is now, shuffled when n>1. Caller harvests.
+/// Future entries stay on the list.
 pub fn takeDue(out: []*anyopaque) usize {
-    const n = due_len;
-    if (n == 0) return 0;
-    if (n > out.len) @panic("sim: takeDue buffer too small");
+    var n: usize = 0;
+    var w: usize = 0;
     var i: usize = 0;
-    while (i < n) : (i += 1) out[i] = due[i];
-    due_len = 0;
+    while (i < due_len) : (i += 1) {
+        if (due[i].due_at <= clock_ns) {
+            if (n >= out.len) @panic("sim: takeDue buffer too small");
+            out[n] = due[i].c;
+            n += 1;
+        } else {
+            due[w] = due[i];
+            w += 1;
+        }
+    }
+    due_len = w;
     if (n > 1) {
         var k = n;
         while (k > 1) {
