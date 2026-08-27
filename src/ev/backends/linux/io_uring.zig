@@ -83,7 +83,10 @@ pub const NetHandle = net.fd_t;
 const Op = @import("../../completion.zig").Op;
 const Support = @import("../../completion.zig").Support;
 
-pub const native_wall_timers = true;
+const zio_options = @import("zio_options");
+const sim = @import("../../../sim.zig");
+
+pub const native_wall_timers = !zio_options.sim;
 pub const supports_nonblocking_file_io = true;
 
 pub fn capability(comptime op: Op) Support {
@@ -321,6 +324,7 @@ shared_state: *SharedState,
 inflight: usize = 0,
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
+    if (comptime zio_options.sim) return;
     var flags: u32 = 0;
     flags |= linux.IORING_SETUP_SINGLE_ISSUER;
     flags |= linux.IORING_SETUP_DEFER_TASKRUN;
@@ -403,6 +407,7 @@ fn ringFromMasterFd(master_fd: i32, flags: u32, queue_size: u16) !linux.IoUring 
 }
 
 pub fn deinit(self: *Self) void {
+    if (comptime zio_options.sim) return;
     _ = linux.close(self.waker_eventfd);
     const master_fd = self.shared_state.master_fd.load(.seq_cst);
     if (self.ring.fd == master_fd) {
@@ -1215,6 +1220,7 @@ pub fn syncWallTimer(self: *Self, clock: Clock, deadline: ?u64) bool {
 }
 
 pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
+    if (comptime zio_options.sim) sim.forbidBackendPoll();
     const linux_os = @import("../../../os/linux.zig");
 
     // The waker poll is normally already armed (a no-op here). It only needs

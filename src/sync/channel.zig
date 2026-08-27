@@ -358,6 +358,10 @@ const AsyncSendImpl = struct {
     pub const WaitContext = struct {
         item_ptr: [*]const u8,
         succeeded: bool = false,
+
+        pub fn holdsDeposit(self: *const WaitContext) bool {
+            return self.succeeded;
+        }
     };
 
     pub fn asyncWait(self: *const SendSelf, waiter: *Waiter, ctx: *WaitContext, item_ptr: [*]const u8) AsyncWaitState {
@@ -483,6 +487,10 @@ const AsyncReceiveImpl = struct {
     pub const WaitContext = struct {
         result_ptr: [*]u8,
         result_set: bool = false,
+
+        pub fn holdsDeposit(self: *const WaitContext) bool {
+            return self.result_set;
+        }
     };
 
     pub fn asyncWait(self: *const RecvSelf, waiter: *Waiter, ctx: *WaitContext, result_ptr: [*]u8) AsyncWaitState {
@@ -776,6 +784,10 @@ pub fn AsyncReceive(comptime T: type) type {
         pub const WaitContext = struct {
             impl_ctx: AsyncReceiveImpl.WaitContext = .{ .result_ptr = undefined },
             result: T = undefined,
+
+            pub fn holdsDeposit(self: *const WaitContext) bool {
+                return self.impl_ctx.holdsDeposit();
+            }
         };
 
         fn init(channel: *ChannelImpl) Self {
@@ -828,6 +840,10 @@ pub fn AsyncSend(comptime T: type) type {
 
         pub const WaitContext = struct {
             impl_ctx: AsyncSendImpl.WaitContext = .{ .item_ptr = undefined },
+
+            pub fn holdsDeposit(self: *const WaitContext) bool {
+                return self.impl_ctx.holdsDeposit();
+            }
         };
 
         fn init(channel: *ChannelImpl, item: T) Self {

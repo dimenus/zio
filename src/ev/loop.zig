@@ -434,8 +434,9 @@ pub const LoopState = struct {
                         const dl = timer.deadline.toNanoseconds();
                         const true_now = sim.nowNsFor(@intFromEnum(timer.clock));
                         const dur = d.toNanoseconds();
-                        if (dl + 1 < true_now + dur) {
-                            @panic("armTimer backdated: deadline behind true now + duration");
+                        const expected = true_now +| dur;
+                        if (dl +| 1 < expected) {
+                            sim.panic("armTimer backdated: deadline behind true now + duration", .{});
                         }
                     }
                 }
@@ -1589,15 +1590,18 @@ pub const Loop = struct {
     }
 
     fn submitSimIo(self: *Loop, c: *Completion) void {
-        _ = self;
         switch (c.op) {
             .net_recv => {
                 const op = c.cast(NetRecv);
                 const dst = firstReadSlice(op.buffers);
-                switch (sim.recvInto(op.handle, dst, c)) {
+                switch (sim.recvInto(op.handle, dst, c, op.flags.dont_wait)) {
                     .due => |n| c.setResult(.net_recv, n),
                     .eof => c.setResult(.net_recv, 0),
                     .parked => {},
+                    .would_block => {
+                        c.setError(error.WouldBlock);
+                        self.state.markCompleted(c);
+                    },
                     .bad_fd => c.setError(error.FileDescriptorNotASocket),
                 }
             },
@@ -1608,6 +1612,7 @@ pub const Loop = struct {
                     .due => |n| c.setResult(.net_send, n),
                     .eof => c.setError(error.BrokenPipe),
                     .parked => {},
+                    .would_block => unreachable,
                     .bad_fd => c.setError(error.FileDescriptorNotASocket),
                 }
             },

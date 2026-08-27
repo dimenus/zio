@@ -108,6 +108,14 @@ const meta = @import("meta.zig");
 //     Guarantees:
 //       - All side effects from the operation that produced the result are visible
 //       - Thread-safe: can be called from any thread after completion
+//
+//   Deposit conservation (WaitContext):
+//     A consuming claim stores a deposit in ctx. getResult consumes it so
+//     holdsDeposit() is false afterwards. A select loser that still holds a
+//     deposit at asyncCancelWait, or a frame exit that still holds one, is a
+//     protocol violation and panics.
+//     WaitContext that can hold a deposit implements:
+//       pub fn holdsDeposit(self: *const WaitContext) bool
 
 /// Extract the Future type from a pointer or value type
 fn FutureType(comptime T: type) type {
@@ -151,19 +159,9 @@ fn assertNoAbandonedDeposit(contexts: anytype) void {
 
 fn assertDepositField(ctx: anytype) void {
     const T = @TypeOf(ctx);
-    if (comptime @hasField(T, "claimed")) {
-        if (ctx.claimed != null) {
+    if (comptime @hasDecl(T, "holdsDeposit")) {
+        if (ctx.holdsDeposit()) {
             @panic("select: frame exit abandons a claimed deposit");
-        }
-    }
-    if (comptime @hasField(T, "result_set")) {
-        if (ctx.result_set) {
-            @panic("select: frame exit abandons a channel deposit");
-        }
-    }
-    if (comptime @hasField(T, "succeeded")) {
-        if (ctx.succeeded) {
-            @panic("select: frame exit abandons a channel deposit");
         }
     }
     if (comptime @hasField(T, "impl_ctx")) {

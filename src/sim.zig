@@ -170,40 +170,66 @@ pub fn clockNs() u64 {
     return clock_ns;
 }
 
-/// Final-state digest: clock, event count, assigned task ids. Does not
-/// include the RNG stream.
+/// Final-state digest: clock, event count, task ids, the trace hash, and
+/// sim I/O (pipe ends and due list). Does not include the RNG stream.
 pub fn stateDigest() u64 {
     var h = std.hash.Wyhash.init(1);
-    var buf: [24]u8 = undefined;
+    var buf: [32]u8 = undefined;
     std.mem.writeInt(u64, buf[0..8], clock_ns, .little);
     std.mem.writeInt(u64, buf[8..16], event_count, .little);
     std.mem.writeInt(u32, buf[16..20], next_task_id, .little);
     std.mem.writeInt(u32, buf[20..24], task_id_len, .little);
+    std.mem.writeInt(u64, buf[24..32], hasher.final(), .little);
     h.update(&buf);
+    var i: u8 = 0;
+    while (i < max_ends) : (i += 1) {
+        const e = ends[i];
+        var eb: [8]u8 = undefined;
+        eb[0] = @intFromBool(e.used);
+        eb[1] = @intFromBool(e.closed);
+        eb[2] = e.peer;
+        eb[3] = @intFromBool(e.pending_recv != null);
+        eb[4] = @intFromBool(e.pending_send != null);
+        std.mem.writeInt(u16, eb[5..7], @truncate(e.buf_len), .little);
+        eb[7] = 0;
+        h.update(&eb);
+    }
+    std.mem.writeInt(u64, buf[0..8], due_len, .little);
+    h.update(buf[0..8]);
+    var d: usize = 0;
+    while (d < due_len) : (d += 1) {
+        std.mem.writeInt(u64, buf[0..8], due[d].due_at, .little);
+        h.update(buf[0..8]);
+    }
     return h.final();
 }
 
-pub fn deadlock() noreturn {
-    std.debug.panic(
-        "sim: deadlock SEED={d} clock_ns={d} events={d}",
-        .{ current_seed, clock_ns, event_count },
+pub fn panic(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print(
+        "TRACE_HASH={x:0>16} SEED={d} events={d}\n",
+        .{ hasher.final(), current_seed, event_count },
     );
+    std.debug.panic(fmt, args);
+}
+
+pub fn deadlock() noreturn {
+    panic("sim: deadlock clock_ns={d} events={d}", .{ clock_ns, event_count });
 }
 
 pub fn forbidKernelFutex() void {
     if (comptime !compiled_in) return;
     if (!begun) return;
-    std.debug.panic("sim: real kernel futex SEED={d}", .{current_seed});
+    panic("sim: real kernel futex", .{});
 }
 
 pub fn forbidBackendPoll() noreturn {
-    std.debug.panic("sim: real backend.poll SEED={d}", .{current_seed});
+    panic("sim: real backend.poll", .{});
 }
 
 pub fn printScope() void {
-    std.debug.print("SCOPE simulated: clock, futex_park, task_pick, timer_heap, cq, executor_csprng, real_epoch, net_pipe, extra_logical_executors\n", .{});
+    std.debug.print("SCOPE simulated: clock, futex_park, task_pick, timer_heap, cq, executor_csprng, real_epoch, net_pipe, extra_logical_executors, backend_init_skip\n", .{});
     std.debug.print("SCOPE real: allocator, libc\n", .{});
-    std.debug.print("SCOPE unsimulated: file_io, connect_accept, extra_os_threads, dns, boot_vs_awake (boot==awake), io_uring (never entered)\n", .{});
+    std.debug.print("SCOPE unsimulated: file_io, connect_accept, extra_os_threads, dns, boot_vs_awake (boot==awake), spawn_blocking (panics)\n", .{});
 }
 
 fn endIndex(fd: i32) ?u8 {
@@ -276,6 +302,7 @@ pub fn hasParkedIo() bool {
 pub const IoSubmit = union(enum) {
     due: usize,
     parked,
+    would_block,
     eof,
     bad_fd,
 };
@@ -307,21 +334,25 @@ pub fn sendBytes(fd: i32, src: []const u8, send_c: *anyopaque) IoSubmit {
     return .{ .due = n };
 }
 
-pub fn recvInto(fd: i32, dst: []u8, recv_c: *anyopaque) IoSubmit {
+pub fn recvInto(fd: i32, dst: []u8, recv_c: *anyopaque, dont_wait: bool) IoSubmit {
     const i = endIndex(fd) orelse return .bad_fd;
     if (ends[i].buf_len == 0) {
         if (ends[i].closed or ends[ends[i].peer].closed) {
             pushDue(recv_c);
             return .eof;
         }
+        if (dont_wait) return .would_block;
         if (ends[i].pending_recv != null) @panic("sim: two recvs parked on one fd");
         ends[i].pending_recv = recv_c;
         return .parked;
     }
     const n = drainBuf(fd, dst);
     pushDue(recv_c);
-    if (ends[i].pending_send) |sc| {
-        ends[i].pending_send = null;
+    // A send parks on the sender end when this (recv) buffer is full.
+    // Draining it must wake the peer's pending_send, not ours.
+    const p = ends[i].peer;
+    if (ends[p].pending_send) |sc| {
+        ends[p].pending_send = null;
         pushDue(sc);
     }
     return .{ .due = n };
@@ -358,6 +389,10 @@ pub fn closeFd(fd: i32, close_c: *anyopaque) enum { due, bad_fd } {
     if (ends[p].pending_recv) |rc| {
         ends[p].pending_recv = null;
         pushDue(rc);
+    }
+    if (ends[p].pending_send) |sc| {
+        ends[p].pending_send = null;
+        pushDue(sc);
     }
     pushDue(close_c);
     return .due;

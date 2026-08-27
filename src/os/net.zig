@@ -1031,6 +1031,10 @@ pub const RecvFlags = packed struct {
     /// truncation). Silently ignored on platforms without MSG_TRUNC input
     /// semantics (e.g. Windows).
     trunc: bool = false,
+    /// Complete immediately with `error.WouldBlock` when nothing is queued.
+    /// Never parks; see `zio.net.tryRead` on main. Sim honors this so a
+    /// merge onto that API does not deadlock an empty pipe.
+    dont_wait: bool = false,
 };
 
 fn recvFlagsToSys(flags: RecvFlags) c_int {
@@ -1039,6 +1043,7 @@ fn recvFlagsToSys(flags: RecvFlags) c_int {
     if (flags.peek and @hasDecl(MSG, "PEEK")) sys_flags |= MSG.PEEK;
     if (flags.waitall and @hasDecl(MSG, "WAITALL")) sys_flags |= MSG.WAITALL;
     if (flags.oob and @hasDecl(MSG, "OOB")) sys_flags |= MSG.OOB;
+    if (flags.dont_wait and @hasDecl(MSG, "DONTWAIT")) sys_flags |= MSG.DONTWAIT;
     // MSG_TRUNC as an *input* flag is Linux-specific; on other POSIX systems
     // the constant exists only as an output flag. Restrict it to Linux to
     // avoid corrupting platforms that repurpose the bit.

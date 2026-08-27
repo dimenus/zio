@@ -16,6 +16,8 @@ const registerGroupTask = @import("group.zig").registerGroupTask;
 const unregisterGroupTask = @import("group.zig").unregisterGroupTask;
 
 const assert = std.debug.assert;
+const zio_options = @import("zio_options");
+const sim = @import("sim.zig");
 
 pub const AnyBlockingTask = struct {
     awaitable: Awaitable,
@@ -196,6 +198,9 @@ pub fn spawnBlockingTask(
     group: ?*Group,
     options: SpawnOptions,
 ) !*AnyBlockingTask {
+    if (comptime zio_options.sim) {
+        sim.panic("sim: spawnBlocking would escape onto a real thread", .{});
+    }
     const task = try AnyBlockingTask.create(
         rt,
         result_len,

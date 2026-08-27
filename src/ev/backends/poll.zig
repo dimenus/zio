@@ -26,6 +26,9 @@ pub const NetHandle = net.fd_t;
 const Support = @import("../completion.zig").Support;
 const fs = @import("../../os/fs.zig");
 
+const zio_options = @import("zio_options");
+const sim = @import("../../sim.zig");
+
 pub const native_wall_timers = false;
 pub const supports_nonblocking_file_io = false;
 
@@ -144,6 +147,7 @@ pending_changes: usize = 0,
 inflight: usize = 0,
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
+    if (comptime zio_options.sim) return;
     _ = shared_state;
 
     const waker_fds = switch (builtin.os.tag) {
@@ -177,6 +181,7 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_s
 }
 
 pub fn deinit(self: *Self) void {
+    if (comptime zio_options.sim) return;
     net.close(self.waker_read_fd);
     net.close(self.waker_write_fd);
     self.poll_queue.deinit(self.allocator);
@@ -544,6 +549,7 @@ pub fn cancel(self: *Self, state: *LoopState, target: *Completion) void {
 }
 
 pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
+    if (comptime zio_options.sim) sim.forbidBackendPoll();
     const timeout_ms: i32 = std.math.cast(i32, timeout.toMilliseconds()) orelse std.math.maxInt(i32);
 
     // Reset pending changes counter before poll (less aggressive)

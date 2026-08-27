@@ -40,7 +40,7 @@ const Support = @import("../completion.zig").Support;
 // (NOTE_ABSOLUTE = gettimeofday, NOTE_MACH_CONTINUOUS_TIME = suspend-aware).
 // The BSDs' EVFILT_TIMER absolute clock is monotonic-only and underspecified
 // with no CLOCK_REALTIME timer, so they keep the capped poll-timeout fallback.
-pub const native_wall_timers = builtin.os.tag.isDarwin();
+pub const native_wall_timers = builtin.os.tag.isDarwin() and !zio_options.sim;
 pub const supports_nonblocking_file_io = false;
 
 pub fn capability(comptime op: Op) Support {

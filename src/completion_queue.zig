@@ -260,10 +260,11 @@ pub const CompletionQueue = struct {
                     }
                     if (comptime zio_options.sim) {
                         self.mutex.lock();
-                        const leaked = !self.completed.isEmpty();
+                        const ready = !self.completed.isEmpty();
+                        const drained = self.closed and self.pending.isEmpty();
                         self.mutex.unlock();
-                        if (leaked) {
-                            @panic("CompletionQueue: timedWait Timeout with a ready completion");
+                        if (ready or drained) {
+                            sim.panic("CompletionQueue: timedWait Timeout with a ready completion", .{});
                         }
                     }
                     return error.Timeout;
@@ -424,6 +425,10 @@ pub const CompletionQueue = struct {
         /// The winning claim found the queue drained: `getResult` reports
         /// `error.Closed`.
         drained: bool = false,
+
+        pub fn holdsDeposit(self: *const WaitContext) bool {
+            return self.claimed != null;
+        }
     };
 
     pub fn getResult(self: *CompletionQueue, ctx: *WaitContext) Closeable!*Completion {
