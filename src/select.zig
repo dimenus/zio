@@ -141,6 +141,18 @@ fn checkSelfWait(task: *AnyTask, future: anytype) void {
     }
 }
 
+/// A CQ WaitContext deposit that is still in `claimed` at select return
+/// was not consumed by getResult and was not restored. Panic.
+fn assertNoAbandonedDeposit(contexts: anytype) void {
+    inline for (@typeInfo(@TypeOf(contexts)).@"struct".fields) |cf| {
+        if (comptime @hasField(cf.type, "claimed")) {
+            if (@field(contexts, cf.name).claimed != null) {
+                @panic("select: frame exit abandons a claimed deposit");
+            }
+        }
+    }
+}
+
 /// Extract the WaitContext type from a future pointer type
 fn FutureWaitContext(comptime future_type: type) type {
     const Future = FutureType(future_type);
@@ -298,6 +310,10 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
     // Allocate WaitContext struct on stack for futures that need per-wait state
     const ContextsType = WaitContextsType(S);
     var contexts: ContextsType = .{};
+    // getResult consumes a winning CQ deposit. A return that still holds
+    // ctx.claimed (canceled with no winner, or a winner that skipped
+    // getResult) abandons it.
+    defer assertNoAbandonedDeposit(contexts);
 
     // Create waiter structures on the stack
     var waiters: [fields.len]Waiter = undefined;

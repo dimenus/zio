@@ -503,6 +503,12 @@ pub const CompletionQueue = struct {
             return true;
         }
         const was_claimed = ctx.claimed != null or ctx.drained;
+        if (!waiter.isDirect() and was_claimed and !waiter.didWin()) {
+            // A select waiter with a deposit whose winner word holds
+            // another arm (or none) would drop the completion on frame
+            // exit. That is a protocol violation, not a restore site.
+            @panic("CompletionQueue: select cancel abandons a claimed deposit");
+        }
         if (was_claimed and waiter.isDirect()) {
             // A canceled generic wait abandons its deposit: put the
             // completion back so it stays takeable (the drained state is

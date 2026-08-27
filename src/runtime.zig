@@ -722,9 +722,14 @@ pub const Executor = struct {
         exec.tick_checkpoint_countdown = checkpoint_interval;
         exec.loop.bindThread();
         setCurrentExecutor(exec);
-        // Another loop may have advanced the sim clock while this one
-        // slept. Refresh before user code arms a duration timer.
-        exec.loop.state.updateNow();
+        // Coop yield runs inside another loop's poll, after that loop
+        // advanced the sim clock. Refresh this loop so a duration timer
+        // armed here is not backdated. After poll returns, do not refresh:
+        // the post-wait `updateNow` in `poll` is the #711 site, and a
+        // revert of it must stay visible to the next task batch.
+        if (sim_coop_depth != 0) {
+            exec.loop.state.updateNow();
+        }
         exec.processCleanup();
         const next_task = exec.getNextTask() orelse return;
         updateParentContext(next_task, &exec.main_task.coro.context);
