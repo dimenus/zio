@@ -465,6 +465,16 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
     // this frame. A claim can land during the cancel loop, so the final
     // winner decision comes after it (#700: a claimed result is delivered,
     // never dropped, even on the cancellation path).
+    //
+    // `wait` checks the signal before the cancellable yield, so
+    // canceled=true with a claimed winner needs the producer to commit
+    // BETWEEN the Canceled raise and the deregistration below. Yield so
+    // the other logical executor can run that claim.
+    if (comptime zio_options.sim) {
+        if (canceled) {
+            getCurrentExecutor().simCoopYield();
+        }
+    }
     const hint = winner.load(.acquire);
     // A promoted winner goes through the cancel loop like a loser, because
     // only its source can say whether its bounced signal is still owed: a
@@ -569,6 +579,11 @@ pub fn selectAwaitables(awaitables: []const *Awaitable) Cancelable!usize {
     // claim can land during the cancel loop, so the final winner decision
     // comes after it; a canceled select with a claimed winner reports the
     // winner (#700), and result extraction belongs to the caller.
+    if (comptime zio_options.sim) {
+        if (canceled) {
+            getCurrentExecutor().simCoopYield();
+        }
+    }
     const hint = winner.load(.acquire);
     var expected: u32 = 0;
     for (awaitables, waiters[0..awaitables.len], 0..) |awaitable, *w, i| {
