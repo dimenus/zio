@@ -47,6 +47,36 @@ pub fn readBuf(handle: Handle, buf: ev.ReadBuf, timeout: Timeout) (ev.NetRecv.Er
     return try op.getResult();
 }
 
+/// Receive without parking. Returns bytes copied, 0 at EOF, or
+/// `error.WouldBlock` if the kernel has nothing now.
+///
+/// Must run through the loop: a raw recv beside zio consumes the kqueue
+/// EV_CLEAR edge so a later blocking read never wakes. kqueue/epoll retry
+/// the sockreg readiness latch; io_uring does a stack recv (no SQE).
+pub fn tryReadBuf(handle: Handle, buf: ev.ReadBuf) ev.NetRecv.Error!usize {
+    var op = ev.NetRecv.init(handle, buf, .{ .dont_wait = true });
+    try waitForIo(&op.c);
+    return try op.getResult();
+}
+
+/// See `tryReadBuf`.
+pub fn tryRead(handle: Handle, buf: []u8) ev.NetRecv.Error!usize {
+    var storage: [1]os.iovec = undefined;
+    return tryReadBuf(handle, .fromSlice(buf, &storage));
+}
+
+/// Append already-available bytes into `reader`'s unused buffer without
+/// parking. Returns bytes appended, 0 if the buffer has no unused space,
+/// `error.WouldBlock` if the kernel has nothing now, `error.EndOfStream` on EOF.
+pub fn tryFillReader(handle: Handle, reader: *std.Io.Reader) (ev.NetRecv.Error || error{EndOfStream})!usize {
+    const unused = reader.buffer[reader.end..];
+    if (unused.len == 0) return 0;
+    const n = try tryRead(handle, unused);
+    if (n == 0) return error.EndOfStream;
+    reader.end += n;
+    return n;
+}
+
 pub fn writeBuf(handle: Handle, buf: ev.WriteBuf, timeout: Timeout) (ev.NetSend.Error || common.Timeoutable)!usize {
     var op = ev.NetSend.init(handle, buf, .{});
     try timedWaitForIo(&op.c, timeout);
@@ -1166,6 +1196,12 @@ pub const Stream = struct {
         return readBuf(self.socket.handle, .fromSlice(buf, &storage), timeout);
     }
 
+    /// See `tryReadBuf`.
+    pub fn tryRead(self: Stream, buf: []u8) ev.NetRecv.Error!usize {
+        var storage: [1]os.iovec = undefined;
+        return tryReadBuf(self.socket.handle, .fromSlice(buf, &storage));
+    }
+
     /// Reads data from the stream into multiple buffers using vectored I/O.
     /// Returns the number of bytes read across all buffers, which may be less than the total capacity.
     /// A return value of 0 indicates end-of-stream.
@@ -1268,6 +1304,11 @@ pub const Stream = struct {
                 return data_size;
             }
             return n;
+        }
+
+        /// See `tryFillReader`.
+        pub fn tryFill(self: *Reader) (ev.NetRecv.Error || error{EndOfStream})!usize {
+            return tryFillReader(self.handle, &self.interface);
         }
     };
 
@@ -1464,6 +1505,71 @@ test "tcpConnectToAddress: basic" {
 
     try group.spawn(ServerTask.run, .{&server_port_ch});
     try group.spawn(ClientTask.run, .{&server_port_ch});
+
+    try group.wait();
+}
+
+test "Stream.tryRead to empty then blocking read wakes on new data" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const ServerTask = struct {
+        fn run(server_port: *Channel(u16), phase: *Channel(u8)) !void {
+            const addr = try IpAddress.parseIp4("127.0.0.1", 0);
+            const server = try addr.listen(.{});
+            defer server.close();
+            try server_port.send(server.socket.address.ip.getPort());
+
+            var stream = try server.accept(.{});
+            defer stream.close();
+
+            // Drain the first two bytes with a blocking read so the backend
+            // registers persistent edge interest (kqueue EV_CLEAR / epoll ET).
+            var priming: [2]u8 = undefined;
+            const primed = try stream.read(&priming, .fromMilliseconds(2000));
+            try std.testing.expectEqualStrings("go", priming[0..primed]);
+
+            // Leftover from the same write ("now") must be visible without parking.
+            var leftover: [8]u8 = undefined;
+            const got = try stream.tryRead(&leftover);
+            try std.testing.expectEqualStrings("now", leftover[0..got]);
+
+            try std.testing.expectError(error.WouldBlock, stream.tryRead(&leftover));
+
+            try phase.send(1);
+
+            var payload: [16]u8 = undefined;
+            const n = try stream.read(&payload, .fromMilliseconds(2000));
+            try std.testing.expectEqualStrings("payload", payload[0..n]);
+        }
+    };
+
+    const ClientTask = struct {
+        fn run(server_port: *Channel(u16), phase: *Channel(u8)) !void {
+            const port = try server_port.receive();
+            const addr = try IpAddress.parseIp4("127.0.0.1", port);
+            var stream = try tcpConnectToAddress(addr, .{});
+            defer stream.close();
+
+            try stream.writeAll("gonow", .none);
+            _ = try phase.receive();
+            // Let the server park on the blocking read before the next write,
+            // so this is a wake on a fresh edge rather than an inline recv.
+            try runtime_mod.sleep(.fromMilliseconds(50));
+            try stream.writeAll("payload", .none);
+        }
+    };
+
+    var server_port_buf: [1]u16 = undefined;
+    var server_port_ch = Channel(u16).init(&server_port_buf);
+    var phase_buf: [1]u8 = undefined;
+    var phase_ch = Channel(u8).init(&phase_buf);
+
+    var group: Group = .init;
+    defer group.cancel();
+
+    try group.spawn(ServerTask.run, .{ &server_port_ch, &phase_ch });
+    try group.spawn(ClientTask.run, .{ &server_port_ch, &phase_ch });
 
     try group.wait();
 }

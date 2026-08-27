@@ -4,6 +4,7 @@ const Completion = @import("../completion.zig").Completion;
 const Work = @import("../completion.zig").Work;
 const DelegatedWork = @import("../completion.zig").DelegatedWork;
 const NetOpen = @import("../completion.zig").NetOpen;
+const NetRecv = @import("../completion.zig").NetRecv;
 const NetBind = @import("../completion.zig").NetBind;
 const NetListen = @import("../completion.zig").NetListen;
 const NetShutdown = @import("../completion.zig").NetShutdown;
@@ -54,6 +55,19 @@ fn delegated(work: *Work) *DelegatedWork {
 
 fn opFromWork(work: *Work, comptime T: type) *T {
     return delegated(work).linked_context.linked.cast(T);
+}
+
+/// One non-parking recv: bytes, EOF (0), or `error.WouldBlock`. Used by
+/// backends that do not go through `sockreg.tryIo` (io_uring SQE path,
+/// poll, IOCP, blocking). Sockets are already O_NONBLOCK in zio; `dont_wait`
+/// also sets MSG_DONTWAIT where the platform has it.
+pub fn handleNetRecvTry(c: *Completion) void {
+    const data = c.cast(NetRecv);
+    if (net.recv(data.handle, data.buffers.iovecs, data.flags)) |n| {
+        c.setResult(.net_recv, n);
+    } else |err| {
+        c.setError(err);
+    }
 }
 
 /// Helper to handle socket open operation
