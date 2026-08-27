@@ -34,6 +34,7 @@ var task_id_len: u32 = 0;
 
 const max_ends = 32;
 const max_due = 32;
+const max_live = 128;
 pub const pipe_buf_cap = 4096;
 const fd_base: i32 = 100000;
 
@@ -76,6 +77,14 @@ var due: [max_due]Due = undefined;
 var due_len: usize = 0;
 var next_io_id: u32 = 0;
 
+const LiveOp = struct {
+    c: *anyopaque,
+    id: u32,
+};
+
+var live: [max_live]LiveOp = undefined;
+var live_len: usize = 0;
+
 pub fn isBegun() bool {
     return begun;
 }
@@ -105,6 +114,7 @@ fn resetIo() void {
     ends = @splat(.{});
     due_len = 0;
     next_io_id = 0;
+    live_len = 0;
 }
 
 pub fn end() void {
@@ -224,8 +234,14 @@ pub fn stateDigest() u64 {
         }
     }
     std.mem.writeInt(u32, buf[0..4], next_io_id, .little);
-    std.mem.writeInt(u64, buf[4..12], due_len, .little);
-    h.update(buf[0..12]);
+    std.mem.writeInt(u32, buf[4..8], @intCast(live_len), .little);
+    std.mem.writeInt(u64, buf[8..16], due_len, .little);
+    h.update(buf[0..16]);
+    var li: usize = 0;
+    while (li < live_len) : (li += 1) {
+        std.mem.writeInt(u32, buf[0..4], live[li].id, .little);
+        h.update(buf[0..4]);
+    }
     var d: usize = 0;
     while (d < due_len) : (d += 1) {
         std.mem.writeInt(u64, buf[0..8], due[d].due_at, .little);
@@ -311,9 +327,25 @@ fn ioDelayNs() u64 {
     return if (pickIndex(2) == 0) 1_000_000 else 5_000_000;
 }
 
-fn allocOpId() u32 {
+fn allocOpId(c: *anyopaque) u32 {
     next_io_id += 1;
+    if (live_len >= max_live) panic("sim: live I/O table full", .{});
+    live[live_len] = .{ .c = c, .id = next_io_id };
+    live_len += 1;
     return next_io_id;
+}
+
+pub fn takeOpId(c: *anyopaque) ?u32 {
+    var i: usize = 0;
+    while (i < live_len) : (i += 1) {
+        if (live[i].c == c) {
+            const id = live[i].id;
+            live[i] = live[live_len - 1];
+            live_len -= 1;
+            return id;
+        }
+    }
+    return null;
 }
 
 fn pushDueKind(c: *anyopaque, kind: DueKind, id: u32) void {
@@ -362,8 +394,7 @@ pub const IoSubmit = union(enum) {
 
 /// Copy `src` into the peer's recv buffer.
 pub fn sendBytes(fd: i32, src: []const u8, send_c: *anyopaque) IoSubmit {
-    if (endIndex(fd) == null) return .bad_fd;
-    return copySend(fd, src, send_c, allocOpId(), true);
+    return copySend(fd, src, send_c, allocOpId(send_c), true);
 }
 
 /// Harvest a capacity-woken send: copy without re-queueing this completion.
@@ -373,10 +404,15 @@ pub fn harvestSend(fd: i32, src: []const u8, send_c: *anyopaque, id: u32) IoSubm
 }
 
 fn copySend(fd: i32, src: []const u8, send_c: *anyopaque, id: u32, schedule: bool) IoSubmit {
-    const i = endIndex(fd) orelse return .bad_fd;
-    if (ends[i].closed) return .eof;
+    const i = endIndex(fd) orelse {
+        if (schedule) pushDueKind(send_c, .send, id);
+        return .bad_fd;
+    };
+    if (ends[i].closed or ends[ends[i].peer].closed) {
+        if (schedule) pushDueKind(send_c, .send, id);
+        return .eof;
+    }
     const p = ends[i].peer;
-    if (ends[p].closed) return .eof;
     if (src.len == 0) {
         if (schedule) pushDueKind(send_c, .send, id);
         return .{ .due = 0 };
@@ -399,8 +435,11 @@ fn copySend(fd: i32, src: []const u8, send_c: *anyopaque, id: u32, schedule: boo
 }
 
 pub fn recvInto(fd: i32, dst: []u8, recv_c: *anyopaque, dont_wait: bool) IoSubmit {
-    const i = endIndex(fd) orelse return .bad_fd;
-    const id = allocOpId();
+    const id = allocOpId(recv_c);
+    const i = endIndex(fd) orelse {
+        pushDueKind(recv_c, .recv, id);
+        return .bad_fd;
+    };
     if (ends[i].buf_len == 0) {
         if (ends[i].closed or ends[ends[i].peer].closed) {
             pushDueKind(recv_c, .recv, id);
@@ -440,8 +479,11 @@ pub fn recvIsEof(fd: i32) bool {
 }
 
 pub fn closeFd(fd: i32, close_c: *anyopaque) enum { due, bad_fd } {
-    const i = endIndex(fd) orelse return .bad_fd;
-    const id = allocOpId();
+    const id = allocOpId(close_c);
+    const i = endIndex(fd) orelse {
+        pushDueKind(close_c, .close, id);
+        return .bad_fd;
+    };
     ends[i].closed = true;
     if (ends[i].pending_recv) |rc| {
         ends[i].pending_recv = null;
@@ -464,19 +506,13 @@ pub fn closeFd(fd: i32, close_c: *anyopaque) enum { due, bad_fd } {
     return .due;
 }
 
-pub fn cancelIo(c: *anyopaque) bool {
+pub fn cancelIo(c: *anyopaque) ?u32 {
     for (&ends) |*e| {
         if (e.pending_recv) |p| {
-            if (p.c == c) {
-                e.pending_recv = null;
-                return true;
-            }
+            if (p.c == c) e.pending_recv = null;
         }
         if (e.pending_send) |p| {
-            if (p.c == c) {
-                e.pending_send = null;
-                return true;
-            }
+            if (p.c == c) e.pending_send = null;
         }
     }
     var i: usize = 0;
@@ -484,10 +520,10 @@ pub fn cancelIo(c: *anyopaque) bool {
         if (due[i].c == c) {
             due[i] = due[due_len - 1];
             due_len -= 1;
-            return true;
+            break;
         }
     }
-    return false;
+    return takeOpId(c);
 }
 
 /// Pop completions whose due_at is now, shuffled when n>1. Caller harvests.
@@ -590,8 +626,47 @@ pub fn runWakeOrderProbe(seed_value: u64, first: WakeFirst) ProbeOut {
     const n = takeDue(&buf);
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        emit(.io_complete, 0, buf[i].id);
+        const id = takeOpId(buf[i].c) orelse buf[i].id;
+        emit(.io_complete, 0, id);
     }
+
+    return .{
+        .trace = traceHash(),
+        .state = stateDigest(),
+        .events = event_count,
+        .clock = clock_ns,
+    };
+}
+
+/// Two parked recvs submitted A then B. Cancel order is `first`. Submit ids
+/// must make the two orders hash differently.
+pub fn runCancelOrderProbe(seed_value: u64, first: WakeFirst) ProbeOut {
+    if (comptime !compiled_in) unreachable;
+    begin(seed_value);
+    defer end();
+
+    const pa = pipePair();
+    const pb = pipePair();
+    var ca: u8 = 1;
+    var cb: u8 = 2;
+    var da: [1]u8 = undefined;
+    var db: [1]u8 = undefined;
+
+    switch (recvInto(pa[0], &da, &ca, false)) {
+        .parked => {},
+        else => panic("probe: recv A should park", .{}),
+    }
+    switch (recvInto(pb[0], &db, &cb, false)) {
+        .parked => {},
+        else => panic("probe: recv B should park", .{}),
+    }
+
+    const first_c: *anyopaque = if (first == .a) &ca else &cb;
+    const second_c: *anyopaque = if (first == .a) &cb else &ca;
+    const id1 = cancelIo(first_c) orelse panic("probe: missing cancel id 1", .{});
+    emit(.io_complete, 1, id1);
+    const id2 = cancelIo(second_c) orelse panic("probe: missing cancel id 2", .{});
+    emit(.io_complete, 1, id2);
 
     return .{
         .trace = traceHash(),
@@ -605,6 +680,14 @@ test "submit I/O id is stable across wake order" {
     if (comptime !compiled_in) return error.SkipZigTest;
     const ab = runWakeOrderProbe(1, .a);
     const ba = runWakeOrderProbe(1, .b);
+    try std.testing.expect(ab.state != ba.state);
+    try std.testing.expect(ab.trace != ba.trace);
+}
+
+test "submit I/O id is stable across cancel order" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    const ab = runCancelOrderProbe(1, .a);
+    const ba = runCancelOrderProbe(1, .b);
     try std.testing.expect(ab.state != ba.state);
     try std.testing.expect(ab.trace != ba.trace);
 }

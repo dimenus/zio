@@ -1600,6 +1600,7 @@ pub const Loop = struct {
                     .parked => {},
                     .would_block => {
                         c.setError(error.WouldBlock);
+                        if (sim.takeOpId(c)) |id| sim.emit(.io_complete, @intFromEnum(c.op), id);
                         self.state.markCompleted(c);
                     },
                     .bad_fd => c.setError(error.FileDescriptorNotASocket),
@@ -1628,8 +1629,9 @@ pub const Loop = struct {
     }
 
     fn cancelSimIo(self: *Loop, c: *Completion) void {
-        _ = sim.cancelIo(c);
+        const id = sim.cancelIo(c);
         if (!c.has_result) c.setError(error.Canceled);
+        if (id) |op_id| sim.emit(.io_complete, @intFromEnum(c.op), op_id);
         self.state.markCompleted(c);
     }
 
@@ -1669,7 +1671,8 @@ pub const Loop = struct {
                 }
             }
             if (!c.has_result) continue;
-            sim.emit(.io_complete, @intFromEnum(c.op), buf[i].id);
+            const id = sim.takeOpId(c) orelse buf[i].id;
+            sim.emit(.io_complete, @intFromEnum(c.op), id);
             self.state.markCompleted(c);
         }
     }
