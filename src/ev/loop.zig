@@ -592,6 +592,31 @@ pub const Loop = struct {
         if (in_debug_mode) std.debug.assert(current_loop == self);
     }
 
+    /// Sim multiplex: this thread runs more than one logical loop. Bind
+    /// before any add/poll/cancel on this loop.
+    pub fn bindThread(self: *Loop) void {
+        if (in_debug_mode) current_loop = self;
+    }
+
+    /// Earliest pending timer remaining, or null. Does not fire.
+    pub fn peekNextTimeout(self: *Loop) ?Duration {
+        var next: ?Duration = null;
+        for (0..wall_clock_count) |idx| {
+            if (self.state.timers[idx].isEmpty()) continue;
+            self.state.lockTimers();
+            defer self.state.unlockTimers();
+            const timer = self.state.timers[idx].peek() orelse continue;
+            const clock = indexClock(idx);
+            const now_clock = self.state.nowFor(clock);
+            if (timer.deadline.value <= now_clock.value) {
+                return .zero;
+            }
+            const remaining = now_clock.durationTo(timer.deadline);
+            if (next == null or remaining.value < next.?.value) next = remaining;
+        }
+        return next;
+    }
+
     pub fn stop(self: *Loop) void {
         self.state.stopped = true;
     }

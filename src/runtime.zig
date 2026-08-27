@@ -393,6 +393,8 @@ const metrics_storage_init: MetricsStorage = if (metrics_enabled) .{} else {};
 const IdleMask = if (zio_options.task_migration) std.atomic.Value(usize) else void;
 const idle_mask_init: IdleMask = if (zio_options.task_migration) .init(0) else {};
 
+var sim_coop_depth: u8 = 0;
+
 // Executor - per-thread execution unit for running coroutines
 pub const Executor = struct {
     pub const max_executors = std.math.maxInt(ExecutorId) + 1;
@@ -709,6 +711,104 @@ pub const Executor = struct {
         }
     }
 
+    fn simHasReady(exec: *Executor) bool {
+        _ = exec.checkLocalWork(false);
+        return !exec.run_queue.isEmpty();
+    }
+
+    fn simRunOneTask(exec: *Executor) void {
+        exec.tick_task_count = 0;
+        exec.tick_expired = false;
+        exec.tick_checkpoint_countdown = checkpoint_interval;
+        exec.loop.bindThread();
+        setCurrentExecutor(exec);
+        exec.processCleanup();
+        const next_task = exec.getNextTask() orelse return;
+        updateParentContext(next_task, &exec.main_task.coro.context);
+        exec.current_task = next_task;
+        next_task.coro.step();
+        exec.current_task = null;
+        exec.processCleanup();
+    }
+
+    pub fn simCoopYield(self: *Executor) void {
+        if (sim_coop_depth != 0) return;
+        if (self.runtime.executors.items.len < 2) return;
+        sim_coop_depth = 1;
+        defer sim_coop_depth = 0;
+        var ready: [2]*Executor = undefined;
+        var n: usize = 0;
+        for (self.runtime.executors.items) |e| {
+            if (e == self) continue;
+            if (simHasReady(e)) {
+                ready[n] = e;
+                n += 1;
+            }
+        }
+        if (n == 0) return;
+        const sim = @import("sim.zig");
+        const pick = sim.pickIndex(n);
+        simRunOneTask(ready[pick]);
+        self.loop.bindThread();
+        setCurrentExecutor(self);
+    }
+
+    fn simMuxStep(rt: *Runtime, home: *Executor) !void {
+        const sim = @import("sim.zig");
+        const execs = rt.executors.items;
+        var ready: [2]*Executor = undefined;
+        var ready_n: usize = 0;
+        for (execs) |e| {
+            if (simHasReady(e)) {
+                ready[ready_n] = e;
+                ready_n += 1;
+            }
+        }
+        if (ready_n > 0) {
+            const pick = if (ready_n == 1) 0 else sim.pickIndex(ready_n);
+            simRunOneTask(ready[pick]);
+            home.loop.bindThread();
+            setCurrentExecutor(home);
+            return;
+        }
+
+        for (execs) |e| {
+            e.loop.bindThread();
+            setCurrentExecutor(e);
+            try e.loop.poll(.zero);
+            e.drainDispatched();
+        }
+        home.loop.bindThread();
+        setCurrentExecutor(home);
+
+        if (home.main_task.state.load(.acquire).tag == .ready) return;
+        for (execs) |e| {
+            if (simHasReady(e)) return;
+        }
+
+        var min_t: ?Duration = null;
+        for (execs) |e| {
+            if (e.loop.peekNextTimeout()) |t| {
+                if (min_t == null or t.value < min_t.?.value) min_t = t;
+            }
+        }
+        if (sim.hasDueIo()) return;
+        if (min_t) |t| {
+            if (t.value > 0) sim.advanceNs(t.toNanoseconds());
+            for (execs) |e| {
+                e.loop.bindThread();
+                setCurrentExecutor(e);
+                try e.loop.poll(.zero);
+                e.drainDispatched();
+            }
+            home.loop.bindThread();
+            setCurrentExecutor(home);
+            if (home.main_task.state.load(.acquire).tag == .ready) return;
+            return;
+        }
+        sim.deadlock();
+    }
+
     pub const RunMode = enum {
         /// Run until main_task.state becomes .ready.
         /// Caller must set up the state before calling (e.g., .waiting for I/O).
@@ -749,6 +849,21 @@ pub const Executor = struct {
         // Start the batch window here: time spent in the main task between
         // run() calls must not count toward the per-quantum estimate.
         self.tick_started_at = Timestamp.now(.monotonic);
+
+        if (comptime zio_options.sim) {
+            if (self.runtime.executors.items.len > 1) {
+                while (true) {
+                    if (self.loop.stopped()) {
+                        if (mode == .until_stopped) return;
+                        @panic("event loop stopped while the main task was yielding");
+                    }
+                    if (check_ready and self.main_task.state.load(.acquire).tag == .ready) {
+                        return;
+                    }
+                    try simMuxStep(self.runtime, self);
+                }
+            }
+        }
 
         while (true) {
             // Process ready coroutines
@@ -1524,8 +1639,8 @@ pub const Runtime = struct {
         if (comptime zio_options.sim) {
             const sim = @import("sim.zig");
             if (!sim.isBegun()) @panic("sim: begin() before Runtime.init");
-            if (num_executors != 1 or !options.enable_main_executor) {
-                @panic("sim: M1 requires executors=1 with the main executor");
+            if (num_executors < 1 or num_executors > 2 or !options.enable_main_executor) {
+                @panic("sim: M3 allows executors=1 or 2 with the main executor");
             }
         }
 
@@ -1568,7 +1683,20 @@ pub const Runtime = struct {
 
         errdefer self.shutdownWorkers();
 
-        if (!builtin.single_threaded) {
+        if (comptime zio_options.sim) {
+            const worker_id_start: ExecutorId = 1;
+            for (0..num_workers) |i| {
+                const worker = self.workers.addOneAssumeCapacity();
+                worker.* = .{};
+                try worker.executor.init(self, @intCast(i + worker_id_start));
+                worker.ready.set();
+                self.executors.appendAssumeCapacity(&worker.executor);
+            }
+            self.main_executor.main_task.coro.setCurrent();
+            self.main_executor.loop.bindThread();
+            setCurrentExecutor(&self.main_executor);
+            self.main_executor.current_task = &self.main_executor.main_task;
+        } else if (!builtin.single_threaded) {
             const worker_id_start: ExecutorId = if (options.enable_main_executor) 1 else 0;
             for (0..num_workers) |i| {
                 log.debug("Spawning worker thread {}", .{i + worker_id_start});
@@ -1633,6 +1761,18 @@ pub const Runtime = struct {
     /// Stop worker executors and join threads. Used by deinit() and init() error path.
     fn shutdownWorkers(self: *Runtime) void {
         self.executors_stealable.store(false, .release);
+        if (comptime zio_options.sim) {
+            for (self.workers.items) |*worker| {
+                worker.executor.loop.bindThread();
+                worker.executor.deinit();
+            }
+            self.workers.deinit(self.allocator);
+            if (self.options.enable_main_executor) {
+                self.main_executor.loop.bindThread();
+                setCurrentExecutor(&self.main_executor);
+            }
+            return;
+        }
         // Wait for all workers to finish initialization, then stop their event loops.
         // Workers that failed to initialize (err != null) don't have valid executors.
         for (self.workers.items) |*worker| {

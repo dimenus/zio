@@ -722,6 +722,12 @@ pub const CompletionQueue = struct {
         // nothing.
         _ = self.signal.fetchAdd(1, .release);
         self.mutex.unlock();
+        // M3: a second logical executor can run the driver's timeout
+        // path after the push and before this wake. Two OS threads hit
+        // the same window; the coop point makes it sayable on one thread.
+        if (comptime zio_options.sim) {
+            getCurrentExecutor().simCoopYield();
+        }
         Futex.wake(&self.signal.raw, 1);
     }
 };

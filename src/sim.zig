@@ -196,7 +196,7 @@ pub fn forbidBackendPoll() noreturn {
 }
 
 pub fn printScope() void {
-    std.debug.print("SCOPE simulated: clock, futex_park, task_pick, timer_heap, cq, executor_csprng, real_epoch, net_pipe\n", .{});
+    std.debug.print("SCOPE simulated: clock, futex_park, task_pick, timer_heap, cq, executor_csprng, real_epoch, net_pipe, extra_logical_executors\n", .{});
     std.debug.print("SCOPE real: allocator, libc\n", .{});
     std.debug.print("SCOPE unsimulated: file_io, connect_accept, extra_os_threads, dns, boot_vs_awake (boot==awake), io_uring (never entered)\n", .{});
 }
