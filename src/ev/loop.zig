@@ -1460,10 +1460,12 @@ pub const Loop = struct {
     /// in between caps the wait at that duration (the executor's idle doze).
     /// Timer deadlines, pending completions, and the loop's `max_wait` option
     /// can all shorten the wait; they never lengthen it.
+    ///
+    /// Sim does not call the kernel backend. `waitForEvents` advances the
+    /// logical clock by the timeout the real poll would have slept. The
+    /// snapshot refresh after that wait is this function's `updateNow`, the
+    /// same statement production uses after `backend.poll` (#711).
     pub fn poll(self: *Loop, wait_cap: Duration) !void {
-        if (comptime zio_options.sim) {
-            return self.pollSim(wait_cap);
-        }
         std.debug.assert(self.state.initialized);
         if (self.done()) return;
 
@@ -1477,8 +1479,9 @@ pub const Loop = struct {
 
         var timeout: Duration = .zero;
         if (wait) {
+            const has_due_io = if (comptime zio_options.sim) sim.hasDueIo() else false;
             // Don't block if we have completions waiting to be processed or timers fired
-            if (!self.state.completions.empty() or !self.state.work_completions.empty() or timer_result.fired) {
+            if (!self.state.completions.empty() or !self.state.work_completions.empty() or timer_result.fired or has_due_io) {
                 timeout = .zero;
             } else if (timer_result.next_timeout) |t| {
                 // Use timer timeout, capped at max_wait
@@ -1497,15 +1500,19 @@ pub const Loop = struct {
             }
         }
 
-        // Skip the backend poll when not waiting and there's nothing to retrieve.
-        // This avoids syscall overhead for pure CPU-bound workloads.
-        const should_poll = wait or self.backend.hasInflight();
         const wake_flags = self.state.wake_requested.swap(0, .acq_rel);
-        const timed_out = if (should_poll) try self.backend.poll(&self.state, if (wake_flags != 0) .zero else timeout) else false;
+        if (comptime zio_options.sim) {
+            if (timeout.value != 0 and timer_result.next_timeout == null and timeout.value >= self.max_wait.value) {
+                sim.deadlock();
+            }
+        }
+        const timed_out = try self.waitForEvents(timeout, wait, wake_flags);
 
-        // The backend poll is the only place the loop sleeps, so the snapshot
-        // is stale by the whole sleep here. Refresh before anything that can
-        // arm a timer: the callbacks below, and the caller's task batch.
+        // The wait (`backend.poll` or sim `advanceNs`) is the only place the
+        // loop sleeps, so the snapshot is stale by the whole sleep here.
+        // Refresh before anything that can arm a timer: the callbacks below,
+        // and the caller's task batch. Sim must not have its own copy of this
+        // statement: a production regression here has to be a sim regression.
         self.state.updateNow();
 
         // Process async handles if the async bit was set
@@ -1518,6 +1525,10 @@ pub const Loop = struct {
             self.processCancelQueue();
         }
 
+        if (comptime zio_options.sim) {
+            self.harvestSimIo();
+        }
+
         // Process any work completions from thread pool
         self.processCompletions();
 
@@ -1525,7 +1536,35 @@ pub const Loop = struct {
         // waking ahead of it means nothing has expired.
         if (timed_out) {
             _ = self.checkTimers();
+            if (comptime zio_options.sim) {
+                self.harvestSimIo();
+                self.processCompletions();
+            }
         }
+    }
+
+    /// Block until the next event, or return immediately for a zero timeout.
+    /// Production calls `backend.poll`. Sim advances the logical clock by
+    /// the same timeout and never enters the kernel. A full park with no
+    /// timer and no completion is a deadlock.
+    fn waitForEvents(
+        self: *Loop,
+        timeout: Duration,
+        wait: bool,
+        wake_flags: u32,
+    ) !bool {
+        if (comptime zio_options.sim) {
+            if (timeout.value != 0) {
+                sim.advanceNs(timeout.toNanoseconds());
+                return true;
+            }
+            return false;
+        }
+        // Skip the backend poll when not waiting and there's nothing to retrieve.
+        // This avoids syscall overhead for pure CPU-bound workloads.
+        const should_poll = wait or self.backend.hasInflight();
+        if (!should_poll) return false;
+        return try self.backend.poll(&self.state, if (wake_flags != 0) .zero else timeout);
     }
 
     fn firstReadSlice(buf: ReadBuf) []u8 {
@@ -1607,59 +1646,6 @@ pub const Loop = struct {
         }
     }
 
-    /// Sim poll: never call the kernel backend. Advance the logical clock
-    /// by the timeout the real poll would have slept, then fire timers.
-    /// A full park with no timer and no completion is a deadlock.
-    fn pollSim(self: *Loop, wait_cap: Duration) !void {
-        std.debug.assert(self.state.initialized);
-        if (self.done()) return;
-
-        const wait = wait_cap.value != 0;
-
-        self.state.updateNow();
-        const timer_result = self.checkTimers();
-        self.state.sweepResend();
-
-        var timeout: Duration = .zero;
-        if (wait) {
-            if (!self.state.completions.empty() or !self.state.work_completions.empty() or timer_result.fired or sim.hasDueIo()) {
-                timeout = .zero;
-            } else if (timer_result.next_timeout) |t| {
-                timeout = if (t.value < self.max_wait.value) t else self.max_wait;
-            } else {
-                timeout = self.max_wait;
-            }
-            if (wait_cap.value < timeout.value) {
-                timeout = wait_cap;
-            }
-        }
-
-        const wake_flags = self.state.wake_requested.swap(0, .acq_rel);
-
-        if (timeout.value != 0) {
-            if (timer_result.next_timeout == null and timeout.value >= self.max_wait.value) {
-                sim.deadlock();
-            }
-            sim.advanceNs(timeout.toNanoseconds());
-        }
-
-        self.state.updateNow();
-
-        if (wake_flags & LoopState.wake_async != 0) {
-            self.processAsyncHandles();
-        }
-        if (wake_flags & LoopState.wake_cancel != 0) {
-            self.processCancelQueue();
-        }
-        self.harvestSimIo();
-        self.processCompletions();
-
-        if (timeout.value != 0) {
-            _ = self.checkTimers();
-            self.harvestSimIo();
-            self.processCompletions();
-        }
-    }
 };
 
 test {

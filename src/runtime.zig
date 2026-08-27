@@ -787,15 +787,25 @@ pub const Executor = struct {
         }
 
         var min_t: ?Duration = null;
+        var owner: *Executor = home;
         for (execs) |e| {
             if (e.loop.peekNextTimeout()) |t| {
-                if (min_t == null or t.value < min_t.?.value) min_t = t;
+                if (min_t == null or t.value < min_t.?.value) {
+                    min_t = t;
+                    owner = e;
+                }
             }
         }
         if (sim.hasDueIo()) return;
         if (min_t) |t| {
-            if (t.value > 0) sim.advanceNs(t.toNanoseconds());
+            // Drive the wait through Loop.poll so the post-wait snapshot
+            // refresh is the same statement production uses after backend.poll.
+            owner.loop.bindThread();
+            setCurrentExecutor(owner);
+            try owner.loop.poll(t);
+            owner.drainDispatched();
             for (execs) |e| {
+                if (e == owner) continue;
                 e.loop.bindThread();
                 setCurrentExecutor(e);
                 try e.loop.poll(.zero);
