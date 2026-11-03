@@ -2464,6 +2464,12 @@ fn consumeWallFired(self: *Self) bool {
 }
 
 pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
+
+    // Sim never opens this backend (`Loop.init`), and must never wait in a
+
+    // kernel: reaching here is the D4 trip.
+
+    if (comptime @import("../../options.zig").options.sim) @import("../../sim.zig").forbidBackendPoll();
     const timeout_ms: u32 = std.math.cast(u32, timeout.toMilliseconds()) orelse std.math.maxInt(u32);
 
     var num_entries: u32 = 0;

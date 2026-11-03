@@ -517,6 +517,11 @@ pub const SchedulerMetrics = struct {
 const MetricsStorage = if (metrics_enabled) SchedulerMetrics else void;
 const metrics_storage_init: MetricsStorage = if (metrics_enabled) .{} else {};
 
+/// Sim only: 1 while a `simCoopYield` is running, so a cooperative point
+/// reached from inside it does not recurse. One thread runs every logical
+/// executor, so a plain global is exact.
+var sim_coop_depth: u8 = 0;
+
 // Executor - per-thread execution unit for running coroutines
 pub const Executor = struct {
     pub const max_executors = std.math.maxInt(ExecutorId) + 1;
@@ -685,8 +690,18 @@ pub const Executor = struct {
         try setupStackGrowth();
         errdefer cleanupStackGrowth();
 
-        // Initialize this executor's random state from OS entropy.
-        try random_mod.setup(&self.random_state);
+        // Initialize this executor's random state from OS entropy. Sim seeds
+        // it from the DST seed instead, so `zio.random` is not a hidden source
+        // of nondeterminism. (Sim never migrates, so there is no steal PRNG.)
+        if (comptime zio_options.sim) {
+            const sim = @import("sim.zig");
+            var seed_bytes: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+            var seed_prng = std.Random.DefaultPrng.init(sim.seed() ^ id);
+            seed_prng.fill(&seed_bytes);
+            self.random_state.csprng = .init(seed_bytes);
+        } else {
+            try random_mod.setup(&self.random_state);
+        }
         if (migrates) self.stealing.prng = .init(self.random_state.csprng.random().int(u64));
 
         try self.loop.init(.{
@@ -834,6 +849,194 @@ pub const Executor = struct {
         }
     }
 
+    // ---- Sim (DST) logical executors -------------------------------------
+    //
+    // With `Options.sim`, every executor of the runtime runs on the thread
+    // that called `Runtime.init`. Worker executors have no thread; they are
+    // stepped from the main executor's `run` (`simMuxStep`) and from the
+    // cooperative points inside zio (`simCoopYield`). Each step binds the
+    // stepped executor as the thread's current executor and loop, so code
+    // inside a task sees exactly what it would on its own thread.
+    //
+    // A worker executor is modelled as permanently inside
+    // `run(.until_stopped)`: its `current_task` is null between task steps,
+    // as the pin's run loop leaves it, so loop callbacks take the blocking
+    // path instead of parking a task that is not running.
+
+    fn simHasReady(exec: *Executor) bool {
+        _ = exec.checkLocalWork(false);
+        return !exec.run_queue.isEmpty();
+    }
+
+    fn simBind(exec: *Executor) void {
+        exec.loop.bindThread();
+        setCurrentExecutor(exec);
+    }
+
+    fn simRunOneTask(exec: *Executor) void {
+        exec.tick_task_count = 0;
+        exec.tick_expired = false;
+        exec.tick_checkpoint_countdown = checkpoint_interval;
+        simBind(exec);
+        // Coop yield runs inside another loop's poll, after that loop
+        // advanced the sim clock. Refresh this loop so a duration timer
+        // armed here is not backdated. After poll returns, do not refresh:
+        // the post-wait `updateNow` in `poll` is the #711 site, and a
+        // revert of it must stay visible to the next task batch.
+        if (sim_coop_depth != 0) {
+            exec.loop.state.updateNow();
+        }
+        exec.processCleanup();
+        const next_task = exec.getNextTask() orelse return;
+        updateParentContext(next_task, &exec.main_task.coro.context);
+        const prev_task = exec.current_task;
+        exec.current_task = next_task;
+        next_task.coro.step();
+        exec.current_task = prev_task;
+        exec.processCleanup();
+    }
+
+    fn simPollAll(execs: []*Executor) void {
+        for (execs) |e| {
+            simBind(e);
+            e.loop.poll(.zero) catch |err| std.debug.panic("sim: poll(.zero) failed: {}", .{err});
+            e.drainDispatched();
+        }
+    }
+
+    /// A cooperative point inside zio: a place where, on real threads,
+    /// another executor could run between two statements. Sim makes that
+    /// window reachable on one thread by running at most one ready task of
+    /// another executor here, and (from a task) by harvesting due claims,
+    /// each choice seeded. No-op outside sim, and never nested.
+    pub fn simCoopYield(self: *Executor) void {
+        if (comptime !zio_options.sim) return;
+        if (sim_coop_depth != 0) return;
+        sim_coop_depth = 1;
+        defer sim_coop_depth = 0;
+
+        const execs = self.runtime.executors.items;
+        const sim = @import("sim.zig");
+        // From a task (select settle/sweep): seed whether to harvest due
+        // claims now. Always-on harvest made wait prefer a landed signal,
+        // so canceled=true never ran. pickIndex(2) keeps both early-claim
+        // and late-claim (pending cancel) in the explored space.
+        // From poll (current_task is null): skip, nested poll on this loop
+        // is unsafe.
+        const from_task = self.current_task != null;
+        if (from_task and sim.pickIndex(2) == 0) {
+            simPollAll(execs);
+            simBind(self);
+        }
+
+        if (execs.len >= 2) {
+            var ready: [2]*Executor = undefined;
+            var n: usize = 0;
+            for (execs) |e| {
+                if (e == self) continue;
+                if (simHasReady(e)) {
+                    ready[n] = e;
+                    n += 1;
+                }
+            }
+            if (n > 0) {
+                const pick = if (n == 1) 0 else sim.pickIndex(n);
+                simRunOneTask(ready[pick]);
+                simBind(self);
+            }
+        }
+
+        // After the task runs, a producer that just submitted still needs a
+        // poll for the CQ claim to land in this settle. Seeded again so
+        // some schedules leave the claim for later.
+        if (from_task and sim.pickIndex(2) == 0) {
+            simPollAll(execs);
+            simBind(self);
+        }
+    }
+
+    /// One scheduling step of every logical executor, driven from the main
+    /// executor's `run`. Runs one seeded ready task; with none ready, polls
+    /// every loop without waiting; with nothing due either, advances the
+    /// logical clock to the earliest timer or simulated I/O through that
+    /// loop's `poll`. Nothing pending at all is a deadlock.
+    fn simMuxStep(rt: *Runtime, home: *Executor) !void {
+        const sim = @import("sim.zig");
+        const execs = rt.executors.items;
+        var ready: [2]*Executor = undefined;
+        var ready_n: usize = 0;
+        for (execs) |e| {
+            if (simHasReady(e)) {
+                ready[ready_n] = e;
+                ready_n += 1;
+            }
+        }
+        if (ready_n > 0) {
+            // Half the time, harvest due I/O/timers before the ready batch.
+            // Without that, a canceled select always runs (deregisters)
+            // before poll can fire a claim into it.
+            if (sim.pickIndex(2) == 0) {
+                simPollAll(execs);
+                simBind(home);
+                ready_n = 0;
+                for (execs) |e| {
+                    if (simHasReady(e)) {
+                        ready[ready_n] = e;
+                        ready_n += 1;
+                    }
+                }
+                if (ready_n == 0) return;
+            }
+            const pick = if (ready_n == 1) 0 else sim.pickIndex(ready_n);
+            simRunOneTask(ready[pick]);
+            simBind(home);
+            return;
+        }
+
+        simPollAll(execs);
+        simBind(home);
+
+        if (home.main_task.state.load(.acquire).tag == .ready) return;
+        for (execs) |e| {
+            if (simHasReady(e)) return;
+        }
+
+        var min_t: ?Duration = null;
+        var owner: *Executor = home;
+        for (execs) |e| {
+            if (e.loop.peekNextTimeout()) |t| {
+                if (min_t == null or t.value < min_t.?.value) {
+                    min_t = t;
+                    owner = e;
+                }
+            }
+        }
+        if (sim.hasDueIo()) return;
+        if (sim.nextDueIoRemaining()) |io| {
+            const t = Duration.fromNanoseconds(io);
+            if (min_t == null or t.value < min_t.?.value) {
+                min_t = t;
+                owner = home;
+            }
+        }
+        if (min_t) |t| {
+            // Drive the wait through Loop.poll so the post-wait snapshot
+            // refresh is the same statement production uses after backend.poll.
+            simBind(owner);
+            try owner.loop.poll(t);
+            owner.drainDispatched();
+            for (execs) |e| {
+                if (e == owner) continue;
+                simBind(e);
+                try e.loop.poll(.zero);
+                e.drainDispatched();
+            }
+            simBind(home);
+            return;
+        }
+        sim.deadlock();
+    }
+
     pub const RunMode = enum {
         /// Run until main_task.state becomes .ready.
         /// Caller must set up the state before calling (e.g., .waiting for I/O).
@@ -871,6 +1074,25 @@ pub const Executor = struct {
         // Start the batch window here: time spent in the main task between
         // run() calls must not count toward the per-quantum estimate.
         self.tick_started_at = Timestamp.now(.monotonic);
+
+        // Sim with more than one logical executor: the main executor's run
+        // loop steps every executor (see simMuxStep). With one executor the
+        // ordinary loop below runs unchanged; its park is a `loop.poll` that
+        // advances the logical clock.
+        if (comptime zio_options.sim) {
+            if (self.runtime.executors.items.len > 1) {
+                while (true) {
+                    if (self.loop.stopped()) {
+                        if (mode == .until_stopped) return;
+                        @panic("event loop stopped while the main task was yielding");
+                    }
+                    if (check_ready and self.main_task.state.load(.acquire).tag == .ready) {
+                        return;
+                    }
+                    try simMuxStep(self.runtime, self);
+                }
+            }
+        }
 
         while (true) {
             // Process ready coroutines
@@ -1256,8 +1478,34 @@ pub const Executor = struct {
             if (self.run_queue.fillFromOverflow() == 0) return null;
             break :blk self.run_queue.pop() orelse return null;
         };
+        if (comptime zio_options.sim) return self.simPick(node);
         self.spendQuantum();
         return AnyTask.fromWaitNode(node);
+    }
+
+    /// Sim: the seed picks which ready task runs, among `first` (the ring's
+    /// head, already popped by the ordinary path) and everything still in
+    /// the ring. The others go back in their order. The ring is not refilled
+    /// here: the pinned refill above already ran if the ring was empty.
+    fn simPick(self: *Executor, first: *WaitNode) *AnyTask {
+        const sim = @import("sim.zig");
+        const cap = LocalRunQueue(WaitNode, migrates).capacity;
+        var buf: [cap]*WaitNode = undefined;
+        buf[0] = first;
+        var n: usize = 1;
+        while (n < cap) {
+            buf[n] = self.run_queue.pop() orelse break;
+            n += 1;
+        }
+        const pick: usize = if (n == 1) 0 else sim.pickIndex(n);
+        for (buf[0..n], 0..) |node, i| {
+            if (i == pick) continue;
+            _ = self.run_queue.push(node);
+        }
+        self.spendQuantum();
+        const task = AnyTask.fromWaitNode(buf[pick]);
+        sim.emit(.task_switch, sim.taskId(@intFromPtr(task)), self.id);
+        return task;
     }
 
     /// Schedule a task on this executor's local run queue. MUST run on the owning
@@ -1797,6 +2045,19 @@ pub const Runtime = struct {
         const num_executors = options.executors.resolve();
         const num_workers = if (options.enable_main_executor) num_executors - 1 else num_executors;
 
+        if (comptime zio_options.sim) {
+            const sim = @import("sim.zig");
+            if (!sim.isBegun()) @panic("sim: begin() before Runtime.init");
+            // The step functions hold ready executors in a [2] array, and
+            // logical workers are stepped from the main executor's run.
+            if (num_executors < 1 or num_executors > 2 or !options.enable_main_executor) {
+                @panic("sim: allows executors=1 or 2 with the main executor");
+            }
+            if (options.metrics_log_interval.value > 0) {
+                @panic("sim: metrics_log_interval would start a real monitor thread");
+            }
+        }
+
         self.* = .{
             .allocator = allocator,
             .options = options,
@@ -1836,7 +2097,34 @@ pub const Runtime = struct {
 
         errdefer self.shutdownWorkers();
 
-        if (!builtin.single_threaded) {
+        if (comptime zio_options.sim) {
+            // Logical workers, no threads. Each one goes through the same
+            // states runWorker() gives a thread: executor init, `ready` set
+            // (with `err` on failure), registration in the executor list,
+            // and the start barrier released with `.run` once every executor
+            // is registered. Then it is inside run(.until_stopped), stepped
+            // from the main executor (see Executor.simMuxStep).
+            const worker_id_start: ExecutorId = 1;
+            for (0..num_workers) |i| {
+                const worker = self.workers.addOneAssumeCapacity();
+                worker.* = .{};
+                worker.executor.init(self, @intCast(i + worker_id_start)) catch |e| {
+                    worker.err = e;
+                    worker.ready.set();
+                    return e;
+                };
+                worker.executor.current_task = null;
+                worker.ready.set();
+            }
+            for (self.workers.items) |*worker| {
+                self.executors.appendAssumeCapacity(&worker.executor);
+            }
+            self.startWorkers(.run);
+            // Executor.init bound each worker as this thread's current
+            // executor; the thread belongs to the main executor.
+            self.main_executor.main_task.coro.setCurrent();
+            Executor.simBind(&self.main_executor);
+        } else if (!builtin.single_threaded) {
             const worker_id_start: ExecutorId = if (options.enable_main_executor) 1 else 0;
             for (0..num_workers) |i| {
                 log.debug("Spawning worker thread {}", .{i + worker_id_start});
@@ -1913,6 +2201,11 @@ pub const Runtime = struct {
         // A worker whose run() fails retries until this is set.
         self.shutting_down.store(true, .release);
 
+        if (comptime zio_options.sim) {
+            self.simShutdownWorkers();
+            return;
+        }
+
         // Wait for all workers to finish initialization. Workers that failed
         // to initialize (err != null) don't have valid executors; the rest
         // all pass through the stop barrier below.
@@ -1951,6 +2244,59 @@ pub const Runtime = struct {
             worker.thread.join();
         }
         self.workers.deinit(self.allocator);
+    }
+
+    /// Sim version of shutdownWorkers, in the same order and through the
+    /// same barrier fields, for logical workers that have no thread:
+    /// every worker is past `ready`; the start barrier is closed; each
+    /// worker's shutdown handle is notified and its loop polled until the
+    /// handle stops it, which is where a real worker's run() returns; it is
+    /// then counted in `workers_stopped`. Only when all have stopped is
+    /// `teardown` set and any worker executor deinited. A worker loop that
+    /// a delivered shutdown notify did not stop is a protocol violation.
+    fn simShutdownWorkers(self: *Runtime) void {
+        const sim = @import("sim.zig");
+        var running: usize = 0;
+        for (self.workers.items) |*worker| {
+            if (!worker.ready.isSet()) sim.protocolPanic("sim: worker not ready at shutdown");
+            if (worker.err == null) running += 1;
+        }
+
+        self.startWorkers(.abort);
+
+        for (self.workers.items) |*worker| {
+            if (worker.err == null) worker.executor.shutdown.notify();
+        }
+        for (self.workers.items) |*worker| {
+            if (worker.err != null) continue;
+            Executor.simBind(&worker.executor);
+            worker.executor.loop.poll(.zero) catch |err| std.debug.panic("sim: worker shutdown poll failed: {}", .{err});
+            if (!worker.executor.loop.stopped()) {
+                sim.protocolPanic("sim: worker loop not stopped by its shutdown notify");
+            }
+            self.worker_mutex.lock();
+            self.workers_stopped += 1;
+            self.worker_mutex.unlock();
+        }
+
+        {
+            self.worker_mutex.lock();
+            defer self.worker_mutex.unlock();
+            if (self.workers_stopped != running) sim.protocolPanic("sim: stop barrier count mismatch");
+            self.teardown = true;
+        }
+
+        for (self.workers.items) |*worker| {
+            if (worker.err != null) continue;
+            Executor.simBind(&worker.executor);
+            worker.executor.deinit();
+        }
+        self.workers.deinit(self.allocator);
+
+        if (self.options.enable_main_executor) {
+            self.main_executor.main_task.coro.setCurrent();
+            Executor.simBind(&self.main_executor);
+        }
     }
 
     pub fn deinit(self: *Runtime) void {

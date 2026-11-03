@@ -15,6 +15,8 @@ pub fn build(b: *std.Build) void {
     const no_hacks = b.option(bool, "no-hacks", "Avoid unsafe performance tricks (bool smuggling, etc.)");
     const scheduler_metrics = b.option(bool, "scheduler_metrics", "Count scheduler events (parks, steals, wake batches) in per-executor counters readable via Runtime.schedulerMetrics (default true)");
     const debug_cancel = b.option(bool, "debug_cancel", "Report tasks that keep running after swallowing error.Canceled, with stack traces (default false)");
+    const sim = b.option(bool, "sim", "Deterministic simulation (DST): logical clock, simulated net pipes, seeded task picks. Never on in production (default false)");
+    const sim_mutant = b.option(BuildOptions.SimMutant, "sim-mutant", "DST validity mutant compiled into a sim build: none, omit_timeout_recheck or arm_timer_stale (default none)");
 
     const build_options: BuildOptions = .{
         .backend = backend,
@@ -23,6 +25,8 @@ pub fn build(b: *std.Build) void {
         .no_hacks = no_hacks orelse false,
         .scheduler_metrics = scheduler_metrics orelse true,
         .debug_cancel = debug_cancel orelse false,
+        .sim = sim orelse false,
+        .sim_mutant = sim_mutant orelse .none,
     };
 
     const zio = b.addModule("zio", .{
@@ -131,6 +135,7 @@ const BuildOptions = struct {
     const Backend = enum { poll, linux, epoll, kqueue, io_uring, iocp };
     const Scheduling = enum { single_executor, pinned, work_stealing };
     const ResolveBeneathMode = enum { strict, best_effort };
+    const SimMutant = enum { none, omit_timeout_recheck, arm_timer_stale };
 
     backend: ?Backend,
     scheduling: Scheduling,
@@ -138,6 +143,8 @@ const BuildOptions = struct {
     no_hacks: bool,
     scheduler_metrics: bool,
     debug_cancel: bool,
+    sim: bool,
+    sim_mutant: SimMutant,
 
     // Enums are passed as tag names and mapped back to zio's own types in
     // src/options.zig.
@@ -149,6 +156,8 @@ const BuildOptions = struct {
         options.addOption(bool, "no_hacks", self.no_hacks);
         options.addOption(bool, "scheduler_metrics", self.scheduler_metrics);
         options.addOption(bool, "debug_cancel", self.debug_cancel);
+        options.addOption(bool, "sim", self.sim);
+        options.addOption([]const u8, "sim_mutant", @tagName(self.sim_mutant));
         return options;
     }
 };
