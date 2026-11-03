@@ -372,10 +372,18 @@ pub const Waiter = struct {
     pub fn signal(self: *Waiter) void {
         switch (self.mode) {
             .direct => |*d| switch (d.*) {
-                .task => |*t| switch (t.kind) {
-                    .ordinary => Executor.scheduleTask(t.task, .done),
-                    .lock => Executor.scheduleTask(t.task, .lock),
-                    .select => Executor.scheduleTask(t.task, .select),
+                .task => |*t| {
+                    // Before the wake: once scheduled, the waiter may return
+                    // and its task be freed.
+                    if (comptime @import("options.zig").options.sim) {
+                        const sim = @import("sim.zig");
+                        sim.emit(.wake, sim.taskId(@intFromPtr(t.task)), 0);
+                    }
+                    switch (t.kind) {
+                        .ordinary => Executor.scheduleTask(t.task, .done),
+                        .lock => Executor.scheduleTask(t.task, .lock),
+                        .select => Executor.scheduleTask(t.task, .select),
+                    }
                 },
                 .thread => |*n| n.signal(),
             },

@@ -14,6 +14,8 @@ const finishTask = @import("task.zig").finishTask;
 const Group = @import("group.zig").Group;
 const registerGroupTask = @import("group.zig").registerGroupTask;
 const unregisterGroupTask = @import("group.zig").unregisterGroupTask;
+const zio_options = @import("options.zig").options;
+const sim = @import("sim.zig");
 
 const assert = std.debug.assert;
 
@@ -195,6 +197,9 @@ pub fn spawnBlockingTask(
     group: ?*Group,
     options: SpawnOptions,
 ) !*AnyBlockingTask {
+    if (comptime zio_options.sim) {
+        sim.panic("sim: spawnBlocking would escape onto a real thread", .{});
+    }
     const task = try AnyBlockingTask.create(
         rt,
         result_len,

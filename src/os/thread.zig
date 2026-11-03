@@ -13,6 +13,8 @@ const posix = @import("posix.zig");
 const Duration = @import("../time.zig").Duration;
 const Timeout = @import("../time.zig").Timeout;
 const os_time = @import("time.zig");
+const zio_options = @import("../options.zig").options;
+const sim = @import("../sim.zig");
 const WaitNode = @import("../utils/wait_queue.zig").WaitNode;
 const WaitQueue = @import("../utils/wait_queue.zig").WaitQueue;
 
@@ -56,7 +58,7 @@ pub const WakeCount = enum {
 /// - `wake(ptr, count)`: Wake waiting threads (one or all)
 ///
 /// The implementation is selected at compile time based on the target OS.
-pub const Futex = switch (builtin.os.tag) {
+const FutexImpl = switch (builtin.os.tag) {
     .linux => FutexLinux,
     .windows => FutexWindows,
     .freebsd => FutexFreeBSD,
@@ -64,6 +66,28 @@ pub const Futex = switch (builtin.os.tag) {
     .openbsd => FutexOpenBSD,
     .dragonfly => FutexDragonFly,
     else => |t| if (t.isDarwin()) FutexDarwin else void,
+};
+
+/// In sim mode every kernel futex wait or wake panics once `sim.begin` has
+/// run (the D4 trip). Coroutine parks go through `zio.Futex` → `Waiter` →
+/// task yield, never here, so a call here means a real OS thread would block.
+pub const Futex = if (zio_options.sim) SimFutex else FutexImpl;
+
+const SimFutex = struct {
+    pub fn wait(ptr: *const std.atomic.Value(u32), expected: u32) void {
+        sim.forbidKernelFutex();
+        FutexImpl.wait(ptr, expected);
+    }
+
+    pub fn timedWait(ptr: *const std.atomic.Value(u32), expected: u32, timeout: Duration) error{Timeout}!void {
+        sim.forbidKernelFutex();
+        return FutexImpl.timedWait(ptr, expected, timeout);
+    }
+
+    pub fn wake(ptr: *const std.atomic.Value(u32), count: WakeCount) void {
+        sim.forbidKernelFutex();
+        FutexImpl.wake(ptr, count);
+    }
 };
 
 /// Thread notification primitive.
@@ -106,7 +130,10 @@ pub const Notify = NotifyFutex;
 /// defer mutex.unlock();
 /// // critical section
 /// ```
-pub const Mutex = if (builtin.single_threaded) MutexNoop else switch (builtin.os.tag) {
+// Sim runs every executor on one OS thread, so a lock is never contended
+// and the no-op shapes are exact; a real lock could only hide a missed
+// unlock as a self-deadlock in the kernel.
+pub const Mutex = if (zio_options.sim or builtin.single_threaded) MutexNoop else switch (builtin.os.tag) {
     .windows => MutexWindows,
     else => |t| if (t.isDarwin()) MutexDarwin else MutexFutex,
 };
@@ -140,7 +167,7 @@ pub const Mutex = if (builtin.single_threaded) MutexNoop else switch (builtin.os
 /// mutex.unlock();
 /// cond.signal();
 /// ```
-pub const Condition = if (builtin.single_threaded) ConditionNoop else switch (builtin.os.tag) {
+pub const Condition = if (zio_options.sim or builtin.single_threaded) ConditionNoop else switch (builtin.os.tag) {
     .windows => ConditionWindows,
     else => if (Futex == void) ConditionNotify else ConditionFutex,
 };

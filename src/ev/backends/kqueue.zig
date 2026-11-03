@@ -745,6 +745,12 @@ pub fn cancel(self: *Self, state: *LoopState, target: *Completion) void {
 }
 
 pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
+
+    // Sim never opens this backend (`Loop.init`), and must never wait in a
+
+    // kernel: reaching here is the D4 trip.
+
+    if (comptime @import("../../options.zig").options.sim) @import("../../sim.zig").forbidBackendPoll();
     var timeout_spec: std.c.timespec = undefined;
     const timeout_ptr: ?*const std.c.timespec = if (timeout.value < std.math.maxInt(time.TimeInt)) blk: {
         const timeout_ns = timeout.toNanoseconds();

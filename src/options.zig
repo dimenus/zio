@@ -53,6 +53,19 @@ pub const ResolveBeneathMode = enum {
     best_effort,
 };
 
+/// A deliberately broken build of a protocol rule, compiled in only with
+/// `sim`. The DST harness requires each one to be found by some seed: a
+/// clean sweep means the simulator cannot see the class of bug it encodes.
+pub const SimMutant = enum {
+    none,
+    /// `CompletionQueue.waitTimeout` skips its post-timeout re-check, so a
+    /// completion that landed with the timeout is reported as a timeout.
+    omit_timeout_recheck,
+    /// `LoopState.armTimer` measures a duration from the start of the
+    /// logical clock instead of from now (the backdated-timer class, #711).
+    arm_timer_stale,
+};
+
 pub const Options = struct {
     /// Defaults to `.work_stealing`.
     scheduling: Scheduling = buildEnum(Scheduling, build_options.scheduling),
@@ -69,6 +82,17 @@ pub const Options = struct {
     /// it, the signature of a swallowed cancellation. The report prints the
     /// stack trace of the delivery and of the park, once per task.
     debug_cancel: bool = build_options.debug_cancel,
+    /// Deterministic simulation for DST (see `sim.zig`). Every executor of
+    /// the runtime runs on the calling thread, the clock is logical,
+    /// `ev.NetRecv`/`NetSend`/`NetClose` run on in-memory pipes from
+    /// `sim.pipePair`, and one seed decides every task pick, same-deadline
+    /// timer order and I/O delay. Any kernel wait (backend poll, futex) or
+    /// real clock read panics. Requires `scheduling` other than
+    /// `.work_stealing`: task migration is not simulated. Never set this in a
+    /// production build.
+    sim: bool = build_options.sim,
+    /// Mutant compiled into a sim build. Ignored unless `sim` is set.
+    sim_mutant: SimMutant = buildEnum(SimMutant, build_options.sim_mutant),
 };
 
 /// The resolved configuration. A `-fsingle-threaded` build has only one
@@ -76,6 +100,9 @@ pub const Options = struct {
 pub const options: Options = blk: {
     var resolved: Options = if (@hasDecl(root, "zio_options")) root.zio_options else .{};
     if (builtin.single_threaded) resolved.scheduling = .single_executor;
+    if (resolved.sim and resolved.scheduling == .work_stealing) {
+        @compileError("zio: sim does not simulate task migration; declare zio_options.scheduling = .pinned or .single_executor");
+    }
     break :blk resolved;
 };
 
