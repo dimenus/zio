@@ -43,14 +43,55 @@ const Parked = struct {
     id: u32,
 };
 
+/// Faults a harness arms on one end's sends (`setSendFaults`). Both are
+/// seeded and recorded in the trace, so a replay hits them at the same byte.
+pub const SendFaults = struct {
+    /// 0: off. Otherwise each send copies at most `1 + pick(short_max)` bytes
+    /// when more were offered: a short write, as a kernel may return.
+    short_max: u32 = 0,
+    /// The send that would carry this end's sent-byte count past this value
+    /// copies only up to it; the next send fails with ConnectionResetByPeer
+    /// and resets the pipe (both ends). Null: no write error.
+    fail_at_byte: ?u64 = null,
+};
+
+pub const FaultStats = struct {
+    short_writes: u32 = 0,
+    write_errors: u32 = 0,
+    /// Logical time of the first injected write error, or null.
+    first_error_ns: ?u64 = null,
+    sent_bytes: u64 = 0,
+    /// Sends on this end that failed for any reason (the injected error, a
+    /// reset pipe, a closed peer or a shut send side), and when the first
+    /// did. What a harness needs to say a write failure hit a batch.
+    send_failures: u32 = 0,
+    first_send_failure_ns: ?u64 = null,
+};
+
+fn noteSendFailure(i: u8) void {
+    ends[i].stats.send_failures += 1;
+    if (ends[i].stats.first_send_failure_ns == null) ends[i].stats.first_send_failure_ns = clock_ns;
+}
+
+/// One end of a `pipePair`. `buf` holds the bytes sent TO this end.
 const End = struct {
     used: bool = false,
     peer: u8 = 0,
     closed: bool = false,
+    /// `shutdown(.receive)` on this end: its reads see end of stream.
+    rd_shut: bool = false,
+    /// `shutdown(.send)` on this end: the peer reads end of stream once the
+    /// buffer drains; this end's sends fail with BrokenPipe.
+    wr_shut: bool = false,
+    /// The pipe was reset (an injected write error): every op on either end
+    /// fails with ConnectionResetByPeer, and unread bytes are dropped.
+    reset: bool = false,
     buf: [pipe_buf_cap]u8 = undefined,
     buf_len: usize = 0,
     pending_recv: ?Parked = null,
     pending_send: ?Parked = null,
+    faults: SendFaults = .{},
+    stats: FaultStats = .{},
 };
 
 var ends: [max_ends]End = @splat(.{});
@@ -59,6 +100,7 @@ pub const DueKind = enum(u8) {
     recv = 1,
     send = 2,
     close = 3,
+    shutdown = 4,
 };
 
 const Due = struct {
@@ -223,8 +265,11 @@ pub fn stateDigest() u64 {
         eb[3] = @intFromBool(e.pending_recv != null);
         eb[4] = @intFromBool(e.pending_send != null);
         std.mem.writeInt(u16, eb[5..7], @truncate(e.buf_len), .little);
-        eb[7] = 0;
+        eb[7] = @as(u8, @intFromBool(e.rd_shut)) | (@as(u8, @intFromBool(e.wr_shut)) << 1) | (@as(u8, @intFromBool(e.reset)) << 2);
         h.update(&eb);
+        var sb: [8]u8 = undefined;
+        std.mem.writeInt(u64, &sb, e.stats.sent_bytes, .little);
+        h.update(&sb);
         var ids: [8]u8 = undefined;
         std.mem.writeInt(u32, ids[0..4], if (e.pending_recv) |p| p.id else 0, .little);
         std.mem.writeInt(u32, ids[4..8], if (e.pending_send) |p| p.id else 0, .little);
@@ -407,32 +452,98 @@ pub const IoSubmit = union(enum) {
     would_block,
     eof,
     bad_fd,
+    /// The pipe is reset: ConnectionResetByPeer.
+    reset,
 };
 
-/// Copy `src` into the peer's recv buffer.
-pub fn sendBytes(fd: i32, src: []const u8, send_c: *anyopaque) IoSubmit {
+/// Arm send faults on `fd`'s sends. Replaces any earlier setting.
+pub fn setSendFaults(fd: i32, faults: SendFaults) void {
+    if (comptime !compiled_in) unreachable;
+    const i = endIndex(fd) orelse panic("sim: setSendFaults on an unknown fd {d}", .{fd});
+    ends[i].faults = faults;
+}
+
+pub fn clearSendFaults(fd: i32) void {
+    setSendFaults(fd, .{});
+}
+
+/// Counts of the faults this end's sends took, and its sent bytes.
+pub fn faultStats(fd: i32) FaultStats {
+    if (comptime !compiled_in) unreachable;
+    const i = endIndex(fd) orelse return .{};
+    return ends[i].stats;
+}
+
+fn totalLen(slices: []const []const u8) usize {
+    var n: usize = 0;
+    for (slices) |sl| n += sl.len;
+    return n;
+}
+
+/// Copy from `src` (gathered across its slices) into the peer's buffer.
+pub fn sendBytes(fd: i32, src: []const []const u8, send_c: *anyopaque) IoSubmit {
     return copySend(fd, src, send_c, allocOpId(send_c), true);
 }
 
 /// Harvest a capacity-woken send: copy without re-queueing this completion.
 /// `id` is the submit-time id from the due entry.
-pub fn harvestSend(fd: i32, src: []const u8, send_c: *anyopaque, id: u32) IoSubmit {
+pub fn harvestSend(fd: i32, src: []const []const u8, send_c: *anyopaque, id: u32) IoSubmit {
     return copySend(fd, src, send_c, id, false);
 }
 
-fn copySend(fd: i32, src: []const u8, send_c: *anyopaque, id: u32, schedule: bool) IoSubmit {
+/// Reset the pipe of end `i`: both ends fail every later op, unread bytes
+/// are dropped, and parked ops on both ends wake to their error.
+fn resetPipe(i: u8) void {
+    const p = ends[i].peer;
+    for ([2]u8{ i, p }) |e| {
+        ends[e].reset = true;
+        ends[e].buf_len = 0;
+        if (ends[e].pending_recv) |rc| {
+            ends[e].pending_recv = null;
+            pushDueKind(rc.c, .recv, rc.id);
+        }
+        if (ends[e].pending_send) |sc| {
+            ends[e].pending_send = null;
+            pushDueKind(sc.c, .send, sc.id);
+        }
+    }
+}
+
+fn copySend(fd: i32, src: []const []const u8, send_c: *anyopaque, id: u32, schedule: bool) IoSubmit {
     const i = endIndex(fd) orelse {
         if (schedule) pushDueKind(send_c, .send, id);
         return .bad_fd;
     };
-    if (ends[i].closed or ends[ends[i].peer].closed) {
+    if (ends[i].reset) {
+        noteSendFailure(i);
+        if (schedule) pushDueKind(send_c, .send, id);
+        return .reset;
+    }
+    if (ends[i].closed or ends[i].wr_shut or ends[ends[i].peer].closed) {
+        noteSendFailure(i);
         if (schedule) pushDueKind(send_c, .send, id);
         return .eof;
     }
     const p = ends[i].peer;
-    if (src.len == 0) {
+    const total = totalLen(src);
+    if (total == 0) {
         if (schedule) pushDueKind(send_c, .send, id);
         return .{ .due = 0 };
+    }
+    var limit: usize = total;
+    if (ends[i].faults.fail_at_byte) |at| {
+        const room = at -| ends[i].stats.sent_bytes;
+        if (room == 0) {
+            ends[i].stats.write_errors += 1;
+            if (ends[i].stats.first_error_ns == null) ends[i].stats.first_error_ns = clock_ns;
+            ends[i].faults.fail_at_byte = null;
+            emit(.io_complete, 0xfe, ends[i].stats.write_errors);
+            noteSendFailure(i);
+            resetPipe(i);
+            if (schedule) pushDueKind(send_c, .send, id);
+            return .reset;
+        }
+        limit = @min(limit, room);
     }
     const space = pipe_buf_cap - ends[p].buf_len;
     if (space == 0) {
@@ -440,25 +551,51 @@ fn copySend(fd: i32, src: []const u8, send_c: *anyopaque, id: u32, schedule: boo
         ends[i].pending_send = .{ .c = send_c, .id = id };
         return .parked;
     }
-    const n = @min(src.len, space);
-    @memcpy(ends[p].buf[ends[p].buf_len..][0..n], src[0..n]);
-    ends[p].buf_len += n;
+    limit = @min(limit, space);
+    if (ends[i].faults.short_max > 0 and limit > 1) {
+        const cap: usize = 1 + pickIndex(@min(limit, ends[i].faults.short_max));
+        if (cap < limit) {
+            limit = cap;
+            ends[i].stats.short_writes += 1;
+            emit(.io_complete, 0xfd, @truncate(cap));
+        }
+    }
+    var copied: usize = 0;
+    for (src) |sl| {
+        if (copied == limit) break;
+        const k = @min(sl.len, limit - copied);
+        @memcpy(ends[p].buf[ends[p].buf_len + copied ..][0..k], sl[0..k]);
+        copied += k;
+    }
+    ends[p].buf_len += copied;
+    ends[i].stats.sent_bytes += copied;
     if (schedule) pushDueKind(send_c, .send, id);
     if (ends[p].pending_recv) |rc| {
         ends[p].pending_recv = null;
         pushDueKind(rc.c, .recv, rc.id);
     }
-    return .{ .due = n };
+    return .{ .due = copied };
 }
 
-pub fn recvInto(fd: i32, dst: []u8, recv_c: *anyopaque, dont_wait: bool) IoSubmit {
+/// End of stream for a read on end `i`: nothing buffered, and either side
+/// closed, this side shut its reads, or the peer shut its writes.
+fn atEof(i: u8) bool {
+    const p = ends[i].peer;
+    return ends[i].buf_len == 0 and (ends[i].closed or ends[i].rd_shut or ends[p].closed or ends[p].wr_shut);
+}
+
+pub fn recvInto(fd: i32, dst: []const []u8, recv_c: *anyopaque, dont_wait: bool) IoSubmit {
     const id = allocOpId(recv_c);
     const i = endIndex(fd) orelse {
         pushDueKind(recv_c, .recv, id);
         return .bad_fd;
     };
+    if (ends[i].reset) {
+        pushDueKind(recv_c, .recv, id);
+        return .reset;
+    }
     if (ends[i].buf_len == 0) {
-        if (ends[i].closed or ends[ends[i].peer].closed) {
+        if (atEof(i)) {
             pushDueKind(recv_c, .recv, id);
             return .eof;
         }
@@ -469,30 +606,54 @@ pub fn recvInto(fd: i32, dst: []u8, recv_c: *anyopaque, dont_wait: bool) IoSubmi
     }
     const n = drainBuf(fd, dst);
     pushDueKind(recv_c, .recv, id);
-    // A send parks on the sender end when this (recv) buffer is full.
-    // Draining it must wake the peer's pending_send, not ours.
+    wakeSender(i);
+    return .{ .due = n };
+}
+
+/// A send parks on the sender end when the receiver's buffer is full.
+/// Draining end `i`'s buffer must wake the peer's pending send.
+fn wakeSender(i: u8) void {
     const p = ends[i].peer;
     if (ends[p].pending_send) |sc| {
         ends[p].pending_send = null;
         pushDueKind(sc.c, .send, sc.id);
     }
-    return .{ .due = n };
 }
 
-pub fn drainBuf(fd: i32, dst: []u8) usize {
+/// Copy buffered bytes into `dst` (scattered across its slices).
+pub fn drainBuf(fd: i32, dst: []const []u8) usize {
     const i = endIndex(fd) orelse return 0;
-    const n = @min(dst.len, ends[i].buf_len);
+    var n: usize = 0;
+    for (dst) |d| {
+        if (n == ends[i].buf_len) break;
+        const k = @min(d.len, ends[i].buf_len - n);
+        @memcpy(d[0..k], ends[i].buf[n..][0..k]);
+        n += k;
+    }
     if (n == 0) return 0;
-    @memcpy(dst[0..n], ends[i].buf[0..n]);
     const rest = ends[i].buf_len - n;
     if (rest > 0) @memmove(ends[i].buf[0..rest], ends[i].buf[n..][0..rest]);
     ends[i].buf_len = rest;
     return n;
 }
 
+/// For a harvested recv: drain, and wake a sender the drain made room for.
+pub fn drainForRecv(fd: i32, dst: []const []u8) usize {
+    const n = drainBuf(fd, dst);
+    if (n > 0) {
+        if (endIndex(fd)) |i| wakeSender(i);
+    }
+    return n;
+}
+
 pub fn recvIsEof(fd: i32) bool {
     const i = endIndex(fd) orelse return true;
-    return ends[i].buf_len == 0 and (ends[i].closed or ends[ends[i].peer].closed);
+    return atEof(i);
+}
+
+pub fn isReset(fd: i32) bool {
+    const i = endIndex(fd) orelse return false;
+    return ends[i].reset;
 }
 
 pub fn closeFd(fd: i32, close_c: *anyopaque) enum { due, bad_fd } {
@@ -520,6 +681,39 @@ pub fn closeFd(fd: i32, close_c: *anyopaque) enum { due, bad_fd } {
         pushDueKind(sc.c, .send, sc.id);
     }
     pushDueKind(close_c, .close, id);
+    return .due;
+}
+
+pub const ShutdownHow = enum { receive, send, both };
+
+/// `shutdown(2)` on a pipe end. Wakes the reads that now see end of stream
+/// and the sends that now fail.
+pub fn shutdownFd(fd: i32, how: ShutdownHow, c: *anyopaque) enum { due, bad_fd } {
+    const id = allocOpId(c);
+    const i = endIndex(fd) orelse {
+        pushDueKind(c, .shutdown, id);
+        return .bad_fd;
+    };
+    const p = ends[i].peer;
+    if (how != .send) {
+        ends[i].rd_shut = true;
+        if (ends[i].pending_recv) |rc| {
+            ends[i].pending_recv = null;
+            pushDueKind(rc.c, .recv, rc.id);
+        }
+    }
+    if (how != .receive) {
+        ends[i].wr_shut = true;
+        if (ends[i].pending_send) |sc| {
+            ends[i].pending_send = null;
+            pushDueKind(sc.c, .send, sc.id);
+        }
+        if (ends[p].pending_recv) |rc| {
+            ends[p].pending_recv = null;
+            pushDueKind(rc.c, .recv, rc.id);
+        }
+    }
+    pushDueKind(c, .shutdown, id);
     return .due;
 }
 
@@ -608,31 +802,31 @@ pub fn runWakeOrderProbe(seed_value: u64, first: WakeFirst) ProbeOut {
     var da: [1]u8 = undefined;
     var db: [1]u8 = undefined;
 
-    switch (recvInto(pa[0], &da, &ca, false)) {
+    switch (recvInto(pa[0], &.{@as([]u8, &da)}, &ca, false)) {
         .parked => {},
         else => panic("probe: recv A should park", .{}),
     }
-    switch (recvInto(pb[0], &db, &cb, false)) {
+    switch (recvInto(pb[0], &.{@as([]u8, &db)}, &cb, false)) {
         .parked => {},
         else => panic("probe: recv B should park", .{}),
     }
 
     const payload = "x";
     if (first == .a) {
-        switch (sendBytes(pa[1], payload, &sa)) {
+        switch (sendBytes(pa[1], &.{@as([]const u8, payload)}, &sa)) {
             .due => {},
             else => panic("probe: send A should complete", .{}),
         }
-        switch (sendBytes(pb[1], payload, &sb)) {
+        switch (sendBytes(pb[1], &.{@as([]const u8, payload)}, &sb)) {
             .due => {},
             else => panic("probe: send B should complete", .{}),
         }
     } else {
-        switch (sendBytes(pb[1], payload, &sb)) {
+        switch (sendBytes(pb[1], &.{@as([]const u8, payload)}, &sb)) {
             .due => {},
             else => panic("probe: send B should complete", .{}),
         }
-        switch (sendBytes(pa[1], payload, &sa)) {
+        switch (sendBytes(pa[1], &.{@as([]const u8, payload)}, &sa)) {
             .due => {},
             else => panic("probe: send A should complete", .{}),
         }
@@ -669,11 +863,11 @@ pub fn runCancelOrderProbe(seed_value: u64, first: WakeFirst) ProbeOut {
     var da: [1]u8 = undefined;
     var db: [1]u8 = undefined;
 
-    switch (recvInto(pa[0], &da, &ca, false)) {
+    switch (recvInto(pa[0], &.{@as([]u8, &da)}, &ca, false)) {
         .parked => {},
         else => panic("probe: recv A should park", .{}),
     }
-    switch (recvInto(pb[0], &db, &cb, false)) {
+    switch (recvInto(pb[0], &.{@as([]u8, &db)}, &cb, false)) {
         .parked => {},
         else => panic("probe: recv B should park", .{}),
     }
