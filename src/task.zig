@@ -781,19 +781,42 @@ const Placement = @import("runtime.zig").Placement;
 /// Ready-queue length past which a spawning task yields to let new tasks start.
 const spawn_yield_threshold = 13;
 
+/// Sim only: a publication window in a spawn. Once a task is reachable by
+/// another executor (in a run queue, or in a group's list where a cancel can
+/// wake it), that executor can run it, finish it and free it before the
+/// spawner's next statement; on real threads that takes one preemption. Here
+/// the other logical executor gets a few seeded steps, so a fixture can make
+/// the spawner's later reads land after the free (t-3818). Compiled out of
+/// every non-sim build.
+fn simSpawnWindow() void {
+    if (comptime !zio_options.sim) return;
+    const exec = runtime.getCurrentExecutorOrNull() orelse return;
+    for (0..3) |_| exec.simCoopYield();
+}
+
 /// Register a task with the runtime and schedule it for execution.
-/// Increments its reference count, adds the task to the runtime's task list,
-/// and schedules it on its executor.
 /// Returns error.RuntimeShutdown if the runtime is shutting down.
+///
+/// Once `scheduleTask` has put the task in a run queue, another executor can
+/// run it to the end and free it, so nothing after that line may read the
+/// task unless the caller holds a reference (t-3818: the backpressure check
+/// read `task.runtime` here and faulted on a freed group task). `rt` is the
+/// task's runtime: `spawnTask` creates it on an executor of `rt`.
 pub fn registerTask(rt: *Runtime, task: *AnyTask) error{RuntimeShutdown}!void {
     if (rt.shutting_down.load(.acquire)) {
         return error.RuntimeShutdown;
     }
 
+    // Sim: the window below is for a task nobody else holds a reference to,
+    // a group task (a JoinHandle spawner holds the caller's +1). Read before
+    // the task is published. A window on every spawn would also serialize
+    // back-to-back spawns, which the D2 exploration fixture relies on.
+    const sim_group_task = if (comptime zio_options.sim) task.awaitable.group_node.group != null else false;
     Executor.scheduleTask(task);
+    if (sim_group_task) simSpawnWindow();
 
     if (runtime.getCurrentExecutorOrNull()) |current_executor| {
-        if (current_executor.runtime == task.runtime) {
+        if (current_executor.runtime == rt) {
             // Backpressure for spawn loops: once the ready queue grows past the
             // threshold, yield so new tasks start running instead of piling up
             // (distinct from maybeYield's time-slice check). Only needed when
@@ -822,6 +845,10 @@ pub fn finishTask(awaitable: *Awaitable) void {
 
 /// Spawn a task with raw context bytes and start function.
 /// Used by Runtime.spawn, Group.spawn, and std.Io vtable implementations.
+///
+/// The returned task is the caller's to use only when `group` is null (the
+/// caller then owns the +1 reference). A group task may already be finished
+/// and freed when this returns; group callers must not touch it.
 pub fn spawnTask(
     rt: *Runtime,
     result_len: usize,
@@ -853,13 +880,24 @@ pub fn spawnTask(
     // a JoinHandle this is the caller's ref; for a group task, which returns no
     // handle, it is the group's, dropped by unregisterGroupTask or by cancel
     // popping the node. Taking it before registerGroupTask matters: once the
-    // node is in the group's list, a concurrent cancel() can pop it and release,
-    // and with no ref of our own that would free the task under us.
+    // node is in the group's list, a concurrent cancel() can pop it and release
+    // this ref. That is why a group task also needs the spawner's ref below.
     task.awaitable.ref_count.incr();
     errdefer _ = task.awaitable.ref_count.decr();
 
+    // A group task's +1 above is the group's, and a concurrent `Group.cancel`
+    // can take it the moment the node is in the group's list: it pops the
+    // node, releases that ref and wakes the task, which can then run to the
+    // end on another executor and be freed before `registerTask` reads it in
+    // `scheduleTask` (t-3818). So the spawner holds a ref of its own across
+    // both publication steps and drops it at the end (it may free the task
+    // there). For a task with a JoinHandle the +1 is already the caller's.
+    if (group != null) task.awaitable.ref_count.incr();
+    defer if (group != null) task.awaitable.release();
+
     if (group) |g| try registerGroupTask(g, &task.awaitable);
     errdefer if (group) |g| unregisterGroupTask(g, &task.awaitable);
+    if (group != null) simSpawnWindow();
 
     try registerTask(rt, task);
 
