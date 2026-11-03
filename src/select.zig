@@ -5,9 +5,12 @@ const std = @import("std");
 const Runtime = @import("runtime.zig").Runtime;
 const getCurrentTask = @import("runtime.zig").getCurrentTask;
 const getCurrentTaskOrNull = @import("runtime.zig").getCurrentTaskOrNull;
+const getCurrentExecutor = @import("runtime.zig").getCurrentExecutor;
 const yield = @import("runtime.zig").yield;
 const recancel = @import("runtime.zig").recancel;
 const rt_mod = @import("runtime.zig");
+const zio_options = @import("options.zig").options;
+const sim = @import("sim.zig");
 const common = @import("common.zig");
 const Cancelable = common.Cancelable;
 const Waiter = common.Waiter;
@@ -108,6 +111,16 @@ const compat = @import("compat.zig");
 //     Guarantees:
 //       - All side effects from the operation that produced the result are visible
 //       - Thread-safe: can be called from any thread after completion
+//
+//   Deposit conservation (WaitContext):
+//     A consuming claim stores a deposit in ctx. getResult consumes it so
+//     holdsDeposit() is false afterwards. A select loser that still holds a
+//     deposit at asyncCancelWait, or a frame exit that still holds one, is a
+//     protocol violation and panics.
+//     Every non-void WaitContext implements:
+//       pub fn holdsDeposit(self: *const WaitContext) bool
+//     Contexts that never own a deposit return false. Missing the method is
+//     a compile error. Do not infer ownership from field names.
 
 /// Extract the Future type from a pointer or value type
 fn FutureType(comptime T: type) type {
@@ -135,9 +148,27 @@ fn checkSelfWait(task: *AnyTask, future: anytype) void {
         if (std.meta.hasMethod(@TypeOf(future), "toAwaitable")) {
             const awaitable_ptr = future.toAwaitable();
             if (awaitable_ptr == &task.awaitable) {
-                std.debug.panic("cannot wait on self (would deadlock)", .{});
+                sim.protocolPanic("cannot wait on self (would deadlock)");
             }
         }
+    }
+}
+
+/// A CQ or channel WaitContext deposit that is still set at select return
+/// was not consumed by getResult and was not restored. Panic.
+fn assertNoAbandonedDeposit(contexts: anytype) void {
+    inline for (comptime compat.fieldNames(@TypeOf(contexts))) |name| {
+        assertDepositField(@field(contexts, name));
+    }
+}
+
+fn assertDepositField(ctx: anytype) void {
+    const T = @TypeOf(ctx);
+    if (comptime !@hasDecl(T, "holdsDeposit")) {
+        @compileError(@typeName(T) ++ " WaitContext must implement holdsDeposit()");
+    }
+    if (ctx.holdsDeposit()) {
+        sim.protocolPanic("select: frame exit abandons a claimed deposit");
     }
 }
 
@@ -145,7 +176,11 @@ fn checkSelfWait(task: *AnyTask, future: anytype) void {
 fn FutureWaitContext(comptime future_type: type) type {
     const Future = FutureType(future_type);
     if (@hasDecl(Future, "WaitContext")) {
-        return Future.WaitContext;
+        const W = Future.WaitContext;
+        if (W != void and !@hasDecl(W, "holdsDeposit")) {
+            @compileError(@typeName(W) ++ " WaitContext must implement holdsDeposit()");
+        }
+        return W;
     }
     return void;
 }
@@ -308,6 +343,10 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
     // Allocate WaitContext struct on stack for futures that need per-wait state
     const ContextsType = WaitContextsType(S);
     var contexts: ContextsType = .{};
+    // getResult consumes a winning CQ deposit. A return that still holds
+    // ctx.claimed (canceled with no winner, or a winner that skipped
+    // getResult) abandons it.
+    defer assertNoAbandonedDeposit(contexts);
 
     // Create waiter structures on the stack
     var waiters: [field_names.len]Waiter = undefined;
@@ -347,7 +386,14 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
                 decided = true;
                 break :sweep;
             },
-            .queued, .requeued => registered[i] = true,
+            .queued, .requeued => {
+                registered[i] = true;
+                // After this arm is on its queue, a producer on the other
+                // logical executor can claim it before the next arm registers.
+                if (comptime zio_options.sim) {
+                    getCurrentExecutor().simCoopYield();
+                }
+            },
             .decided => {
                 decided = true;
                 break :sweep;
@@ -463,6 +509,16 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
     // this frame. A claim can land during the cancel loop, so the final
     // winner decision comes after it (#700: a claimed result is delivered,
     // never dropped, even on the cancellation path).
+    //
+    // `wait` checks the signal before the cancellable yield, so
+    // canceled=true with a claimed winner needs the producer to commit
+    // BETWEEN the Canceled raise and the deregistration below. Yield so
+    // the other logical executor can run that claim.
+    if (comptime zio_options.sim) {
+        if (canceled) {
+            getCurrentExecutor().simCoopYield();
+        }
+    }
     const hint = winner.load(.acquire);
     // A promoted winner goes through the cancel loop like a loser, because
     // only its source can say whether its bounced signal is still owed: a
@@ -494,7 +550,7 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
 
     const winner_index = winner.load(.acquire);
     if (winner_index == NO_WINNER) {
-        std.debug.assert(canceled);
+        if (!canceled) sim.protocolPanic("select: no winner without cancellation");
         return error.Canceled;
     }
 
@@ -527,7 +583,7 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
 pub fn selectAwaitables(awaitables: []const *Awaitable) Cancelable!usize {
     const max_awaitables = max_arms;
     if (awaitables.len > max_awaitables) {
-        @panic("selectAwaitables: too many awaitables (max 64)");
+        sim.protocolPanic("selectAwaitables: too many awaitables (max 64)");
     }
 
     var winner: std.atomic.Value(usize) = .init(NO_WINNER);
@@ -575,6 +631,11 @@ pub fn selectAwaitables(awaitables: []const *Awaitable) Cancelable!usize {
     // claim can land during the cancel loop, so the final winner decision
     // comes after it; a canceled select with a claimed winner reports the
     // winner (#700), and result extraction belongs to the caller.
+    if (comptime zio_options.sim) {
+        if (canceled) {
+            getCurrentExecutor().simCoopYield();
+        }
+    }
     const hint = winner.load(.acquire);
     var expected: u32 = 0;
     for (awaitables, waiters[0..awaitables.len], 0..) |awaitable, *w, i| {
@@ -587,7 +648,7 @@ pub fn selectAwaitables(awaitables: []const *Awaitable) Cancelable!usize {
 
     const winner_index = winner.load(.acquire);
     if (winner_index == NO_WINNER) {
-        std.debug.assert(canceled);
+        if (!canceled) sim.protocolPanic("select: no winner without cancellation");
         return error.Canceled;
     }
     // The cancelable wait consumed the cancellation request but a claimed
@@ -1166,7 +1227,13 @@ test "select: promotes a notification that bounced off the commit fence" {
         event: *Event,
 
         pub const Result = void;
-        pub const WaitContext = struct { fenced: bool = false };
+        pub const WaitContext = struct {
+            fenced: bool = false,
+
+            pub fn holdsDeposit(_: *const WaitContext) bool {
+                return false;
+            }
+        };
 
         pub fn asyncWait(self: *@This(), waiter: *Waiter, ctx: *WaitContext) common.AsyncWaitState {
             if (ctx.fenced) {

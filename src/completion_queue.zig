@@ -453,6 +453,10 @@ pub const CompletionQueue = struct {
         /// The winning claim found the queue drained: `getResult` reports
         /// `error.Closed`.
         drained: bool = false,
+
+        pub fn holdsDeposit(self: *const WaitContext) bool {
+            return self.claimed != null or self.drained;
+        }
     };
 
     pub fn getResult(self: *CompletionQueue, ctx: *WaitContext) Closeable!*Completion {
@@ -461,12 +465,15 @@ pub const CompletionQueue = struct {
             ctx.claimed = null;
             return c;
         }
+        if (ctx.drained) {
+            ctx.drained = false;
+            return error.Closed;
+        }
         // A won CQ arm always carries its deposit: the claim popped the
         // completion, or latched the drained state, in the same critical
         // section that decided the winner word. Reaching here with neither
         // is a protocol violation.
-        std.debug.assert(ctx.drained);
-        return error.Closed;
+        sim.protocolPanic("CompletionQueue: winner without a completion or drained state");
     }
 
     pub fn asyncWait(self: *CompletionQueue, waiter: *Waiter, ctx: *WaitContext) common.AsyncWaitState {
@@ -512,7 +519,7 @@ pub const CompletionQueue = struct {
         if (!ctx.registered) {
             if (self.reg != null) {
                 self.mutex.unlock();
-                @panic("CompletionQueue: selected from two tasks; one task must drive the queue");
+                sim.protocolPanic("CompletionQueue: selected from two tasks; one task must drive the queue");
             }
             self.reg = .{ .waiter = waiter, .ctx = ctx };
             ctx.registered = true;
@@ -532,6 +539,12 @@ pub const CompletionQueue = struct {
             return true;
         }
         const was_claimed = ctx.claimed != null or ctx.drained;
+        if (!waiter.isDirect() and was_claimed and !waiter.didWin()) {
+            // A select waiter with a deposit whose winner word holds
+            // another arm (or none) would drop the completion on frame
+            // exit. That is a protocol violation, not a restore site.
+            sim.protocolPanic("CompletionQueue: select cancel abandons a claimed deposit");
+        }
         if (was_claimed and waiter.isDirect()) {
             // A canceled generic wait abandons its deposit: put the
             // completion back so it stays takeable (the drained state is
@@ -542,6 +555,7 @@ pub const CompletionQueue = struct {
                 self.completed.push(&c.group);
                 ctx.claimed = null;
             }
+            ctx.drained = false;
         }
         self.mutex.unlock();
         // A claim carries exactly one signal; without one, nothing is owed.
@@ -751,6 +765,12 @@ pub const CompletionQueue = struct {
         // nothing.
         _ = self.signal.fetchAdd(1, .release);
         self.mutex.unlock();
+        // M3: a second logical executor can run the driver's timeout
+        // path after the push and before this wake. Two OS threads hit
+        // the same window; the coop point makes it sayable on one thread.
+        if (comptime zio_options.sim) {
+            getCurrentExecutor().simCoopYield();
+        }
         Futex.wake(&self.signal.raw, 1);
     }
 };

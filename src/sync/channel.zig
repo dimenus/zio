@@ -11,6 +11,7 @@ const WaitNode = @import("../utils/wait_queue.zig").WaitNode;
 const select = @import("../select.zig").select;
 const Event = @import("Event.zig");
 const common = @import("../common.zig");
+const sim = @import("../sim.zig");
 const Waiter = common.Waiter;
 const Closeable = common.Closeable;
 const AsyncWaitState = common.AsyncWaitState;
@@ -360,6 +361,10 @@ const AsyncSendImpl = struct {
     pub const WaitContext = struct {
         item_ptr: [*]const u8,
         succeeded: bool = false,
+
+        pub fn holdsDeposit(self: *const WaitContext) bool {
+            return self.succeeded;
+        }
     };
 
     pub fn asyncWait(self: *const SendSelf, waiter: *Waiter, ctx: *WaitContext, item_ptr: [*]const u8) AsyncWaitState {
@@ -451,10 +456,13 @@ const AsyncSendImpl = struct {
     }
 
     pub fn asyncCancelWait(self: *const SendSelf, waiter: *Waiter, ctx: *WaitContext) bool {
-        _ = ctx;
         self.channel.mutex.lockUncancelable();
         const was_in_queue = self.channel.sender_queue.remove(&waiter.node);
         self.channel.mutex.unlock();
+
+        if (!waiter.isDirect() and ctx.succeeded and !waiter.didWin()) {
+            sim.protocolPanic("Channel: select cancel abandons a claimed send");
+        }
 
         if (was_in_queue) {
             return true;
@@ -465,9 +473,12 @@ const AsyncSendImpl = struct {
 
     pub fn getResult(self: *const SendSelf, ctx: *WaitContext) Closeable!void {
         if (ctx.succeeded) {
+            ctx.succeeded = false;
             return {};
         }
-        std.debug.assert(self.channel.closed);
+        if (!self.channel.closed) {
+            sim.protocolPanic("Channel: send winner without a result");
+        }
         return error.Closed;
     }
 };
@@ -481,6 +492,10 @@ const AsyncReceiveImpl = struct {
     pub const WaitContext = struct {
         result_ptr: [*]u8,
         result_set: bool = false,
+
+        pub fn holdsDeposit(self: *const WaitContext) bool {
+            return self.result_set;
+        }
     };
 
     pub fn asyncWait(self: *const RecvSelf, waiter: *Waiter, ctx: *WaitContext, result_ptr: [*]u8) AsyncWaitState {
@@ -548,10 +563,13 @@ const AsyncReceiveImpl = struct {
     }
 
     pub fn asyncCancelWait(self: *const RecvSelf, waiter: *Waiter, ctx: *WaitContext) bool {
-        _ = ctx;
         self.channel.mutex.lockUncancelable();
         const was_in_queue = self.channel.receiver_queue.remove(&waiter.node);
         self.channel.mutex.unlock();
+
+        if (!waiter.isDirect() and ctx.result_set and !waiter.didWin()) {
+            sim.protocolPanic("Channel: select cancel abandons a claimed deposit");
+        }
 
         if (was_in_queue) {
             return true;
@@ -563,6 +581,7 @@ const AsyncReceiveImpl = struct {
     pub fn getResult(self: *const RecvSelf, ctx: *WaitContext) Closeable!void {
         // Result already set by direct transfer or fast path
         if (ctx.result_set) {
+            ctx.result_set = false;
             return;
         }
 
@@ -577,7 +596,10 @@ const AsyncReceiveImpl = struct {
             return;
         }
 
-        std.debug.assert(self.channel.closed);
+        if (!self.channel.closed) {
+            self.channel.mutex.unlock();
+            sim.protocolPanic("Channel: recv winner without a result");
+        }
         self.channel.mutex.unlock();
         return error.Closed;
     }
@@ -770,6 +792,10 @@ pub fn AsyncReceive(comptime T: type) type {
         pub const WaitContext = struct {
             impl_ctx: AsyncReceiveImpl.WaitContext = .{ .result_ptr = undefined },
             result: T = undefined,
+
+            pub fn holdsDeposit(self: *const WaitContext) bool {
+                return self.impl_ctx.holdsDeposit();
+            }
         };
 
         fn init(channel: *ChannelImpl) Self {
@@ -822,6 +848,10 @@ pub fn AsyncSend(comptime T: type) type {
 
         pub const WaitContext = struct {
             impl_ctx: AsyncSendImpl.WaitContext = .{ .item_ptr = undefined },
+
+            pub fn holdsDeposit(self: *const WaitContext) bool {
+                return self.impl_ctx.holdsDeposit();
+            }
         };
 
         fn init(channel: *ChannelImpl, item: T) Self {
