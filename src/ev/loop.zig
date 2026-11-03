@@ -19,6 +19,7 @@ const FileRead = @import("completion.zig").FileRead;
 const NetSend = @import("completion.zig").NetSend;
 const NetRecv = @import("completion.zig").NetRecv;
 const NetClose = @import("completion.zig").NetClose;
+const NetShutdown = @import("completion.zig").NetShutdown;
 const WallTimerMode = @import("completion.zig").WallTimerMode;
 const NetSendFile = @import("completion.zig").NetSendFile;
 const ReadBuf = @import("buf.zig").ReadBuf;
@@ -1686,29 +1687,33 @@ pub const Loop = struct {
         return try self.backend.poll(&self.state, timeout);
     }
 
-    fn firstReadSlice(buf: ReadBuf) []u8 {
-        if (buf.iovecs.len == 0) return &.{};
-        const v = buf.iovecs[0];
-        return v.base[0..v.len];
+    const sim_max_iovecs = 16;
+
+    fn readSlices(buf: ReadBuf, out: *[sim_max_iovecs][]u8) [][]u8 {
+        if (buf.iovecs.len > sim_max_iovecs) sim.panic("sim: recv with {d} iovecs (max {d})", .{ buf.iovecs.len, sim_max_iovecs });
+        for (buf.iovecs, 0..) |v, i| out[i] = v.base[0..v.len];
+        return out[0..buf.iovecs.len];
     }
 
-    fn firstWriteSlice(buf: WriteBuf) []const u8 {
-        if (buf.iovecs.len == 0) return &.{};
-        const v = buf.iovecs[0];
-        return v.base[0..v.len];
+    fn writeSlices(buf: WriteBuf, out: *[sim_max_iovecs][]const u8) []const []const u8 {
+        if (buf.iovecs.len > sim_max_iovecs) sim.panic("sim: send with {d} iovecs (max {d})", .{ buf.iovecs.len, sim_max_iovecs });
+        for (buf.iovecs, 0..) |v, i| out[i] = v.base[0..v.len];
+        return out[0..buf.iovecs.len];
     }
 
-    /// Sim: start a net op on a `sim.pipePair` end. Only the first iovec is
-    /// used. A result the pipe can give now is set here and delivered after
-    /// a seeded delay (`harvestSimIo`); otherwise the op parks on the pipe.
+    /// Sim: start a net op on a `sim.pipePair` end, scattering or gathering
+    /// across every iovec. A result the pipe can give now is set here and
+    /// delivered after a seeded delay (`harvestSimIo`); otherwise the op
+    /// parks on the pipe.
     fn submitSimIo(self: *Loop, c: *Completion) void {
         switch (c.op) {
             .net_recv => {
                 const op = c.cast(NetRecv);
-                const dst = firstReadSlice(op.buffers);
-                switch (sim.recvInto(op.handle, dst, c, op.flags.dontwait)) {
+                var sl: [sim_max_iovecs][]u8 = undefined;
+                switch (sim.recvInto(op.handle, readSlices(op.buffers, &sl), c, op.flags.dontwait)) {
                     .due => |n| c.setResult(.net_recv, n),
                     .eof => c.setResult(.net_recv, 0),
+                    .reset => c.setError(error.ConnectionResetByPeer),
                     .parked => {},
                     .would_block => {
                         c.setError(error.WouldBlock);
@@ -1720,10 +1725,11 @@ pub const Loop = struct {
             },
             .net_send => {
                 const op = c.cast(NetSend);
-                const src = firstWriteSlice(op.buffer);
-                switch (sim.sendBytes(op.handle, src, c)) {
+                var sl: [sim_max_iovecs][]const u8 = undefined;
+                switch (sim.sendBytes(op.handle, writeSlices(op.buffer, &sl), c)) {
                     .due => |n| c.setResult(.net_send, n),
                     .eof => c.setError(error.BrokenPipe),
+                    .reset => c.setError(error.ConnectionResetByPeer),
                     .parked => {},
                     .would_block => unreachable,
                     .bad_fd => c.setError(error.FileDescriptorNotASocket),
@@ -1734,6 +1740,18 @@ pub const Loop = struct {
                 switch (sim.closeFd(op.handle, c)) {
                     .due => c.setResult(.net_close, {}),
                     .bad_fd => c.setError(error.FileDescriptorNotASocket),
+                }
+            },
+            .net_shutdown => {
+                const op = c.cast(NetShutdown);
+                const how: sim.ShutdownHow = switch (op.how) {
+                    .receive => .receive,
+                    .send => .send,
+                    .both => .both,
+                };
+                switch (sim.shutdownFd(op.handle, how, c)) {
+                    .due => c.setResult(.net_shutdown, {}),
+                    .bad_fd => c.setError(error.SocketUnconnected),
                 }
             },
             else => sim.panic("sim: unsimulated I/O op {s}", .{@tagName(c.op)}),
@@ -1762,11 +1780,13 @@ pub const Loop = struct {
                 switch (c.op) {
                     .net_recv => {
                         const op = c.cast(NetRecv);
-                        const dst = firstReadSlice(op.buffers);
-                        if (sim.recvIsEof(op.handle)) {
+                        var sl: [sim_max_iovecs][]u8 = undefined;
+                        if (sim.isReset(op.handle)) {
+                            c.setError(error.ConnectionResetByPeer);
+                        } else if (sim.recvIsEof(op.handle)) {
                             c.setResult(.net_recv, 0);
                         } else {
-                            c.setResult(.net_recv, sim.drainBuf(op.handle, dst));
+                            c.setResult(.net_recv, sim.drainForRecv(op.handle, readSlices(op.buffers, &sl)));
                         }
                     },
                     .net_send => {
@@ -1774,16 +1794,18 @@ pub const Loop = struct {
                         // Do not re-queue this completion. BrokenPipe is
                         // only for a closed peer.
                         const op = c.cast(NetSend);
-                        const src = firstWriteSlice(op.buffer);
-                        switch (sim.harvestSend(op.handle, src, c, buf[i].id)) {
+                        var sl: [sim_max_iovecs][]const u8 = undefined;
+                        switch (sim.harvestSend(op.handle, writeSlices(op.buffer, &sl), c, buf[i].id)) {
                             .due => |sent| c.setResult(.net_send, sent),
                             .eof => c.setError(error.BrokenPipe),
+                            .reset => c.setError(error.ConnectionResetByPeer),
                             .parked => continue,
                             .would_block => unreachable,
                             .bad_fd => c.setError(error.FileDescriptorNotASocket),
                         }
                     },
                     .net_close => c.setResult(.net_close, {}),
+                    .net_shutdown => c.setResult(.net_shutdown, {}),
                     else => {},
                 }
             }
