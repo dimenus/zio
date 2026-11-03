@@ -8,6 +8,7 @@ const options = @import("options.zig");
 /// Compile-time configuration; declare `pub const zio_options: zio.Options`
 /// in your root module to set it.
 pub const Options = options.Options;
+pub const SimMutant = options.SimMutant;
 pub const Scheduling = options.Scheduling;
 
 const runtime = @import("runtime.zig");
@@ -25,6 +26,7 @@ pub const yield = runtime.yield;
 pub const maybeYield = runtime.maybeYield;
 pub const sleep = runtime.sleep;
 pub const now = runtime.now;
+pub const getCurrentExecutor = runtime.getCurrentExecutor;
 
 pub const random = @import("random.zig").random;
 pub const randomSecure = @import("random.zig").randomSecure;
@@ -108,6 +110,10 @@ pub const ev = @import("ev/root.zig");
 
 /// Low-level OS APIs.
 pub const os = @import("os/root.zig");
+
+/// Deterministic simulation (DST). `sim.begin` panics unless the build
+/// declares `zio_options.sim = true` (or zio is built with `-Dsim=true`).
+pub const sim = @import("sim.zig");
 
 test {
     std.testing.refAllDecls(@This());

@@ -760,6 +760,12 @@ fn waitEvents(self: *Self, timeout: Duration) !usize {
 }
 
 pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
+
+    // Sim never opens this backend (`Loop.init`), and must never wait in a
+
+    // kernel: reaching here is the D4 trip.
+
+    if (comptime @import("../../../options.zig").options.sim) @import("../../../sim.zig").forbidBackendPoll();
     // Reset pending changes counter before poll (less aggressive)
     self.pending_changes = 0;
 

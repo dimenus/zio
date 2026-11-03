@@ -271,6 +271,12 @@ pub fn Backend(comptime mode: Mode) type {
         }
 
         pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
+
+            // Sim never opens this backend (`Loop.init`), and must never wait in a
+
+            // kernel: reaching here is the D4 trip.
+
+            if (comptime @import("../../options.zig").options.sim) @import("../../sim.zig").forbidBackendPoll();
             return switch (mode) {
                 .io_uring => self.engine.io_uring.poll(state, timeout),
                 .epoll => self.engine.epoll.poll(state, timeout),

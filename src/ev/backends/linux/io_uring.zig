@@ -1410,6 +1410,12 @@ pub fn syncWallTimer(self: *Self, clock: Clock, deadline: ?u64) bool {
 }
 
 pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
+
+    // Sim never opens this backend (`Loop.init`), and must never wait in a
+
+    // kernel: reaching here is the D4 trip.
+
+    if (comptime @import("../../../options.zig").options.sim) @import("../../../sim.zig").forbidBackendPoll();
     const linux_os = @import("../../../os/linux.zig");
 
     // The waker poll is normally already armed (a no-op here). It only needs
