@@ -36,6 +36,7 @@ test {
     _ = @import("test/process_wait.zig");
     _ = @import("test/async_stress.zig");
     _ = @import("test/send_retry.zig");
+    _ = @import("test/sockreg.zig");
 }
 
 test "Loop: empty poll(.zero)" {

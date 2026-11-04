@@ -325,6 +325,19 @@ pub fn service(self: anytype, state: anytype, fd: net.fd_t, dir: Dir, event: any
 /// condition. The reverse - inferring it from the `.completed` phase - would
 /// race, because `service` deliberately marks the op completed only after
 /// dropping the lock.
+///
+/// "Still in the queue" is decided by finding `target` among the queue's
+/// members, never from `target`'s own links. `service` moves the ops it
+/// finishes onto a local list and rewrites their links after dropping the
+/// lock, so an op it has already claimed can have non-null links that point
+/// into that list. `Queue.remove` reads non-null links as membership, so on
+/// such an op it claimed the op a second time (the caller then finished it
+/// with `error.Canceled` as well), corrupted this queue's head and tail, and
+/// cut the next op out of `service`'s list so that nothing ever finished it
+/// (t-3835, reproduced in `ev/test/sockreg.zig`). Only `park`, `service` and
+/// this function change this queue, all under the shard lock, so a member's
+/// links are stable here. The walk is over the ops parked on one fd and
+/// direction, usually one or two.
 pub fn detach(self: anytype, target: *Completion) bool {
     const fd = netHandle(target);
     const dir = dirForOp(target);
@@ -340,7 +353,12 @@ pub fn detach(self: anytype, target: *Completion) bool {
     // the op - so claiming it here would double-complete an op that is already on
     // its way out. Leaving it alone is the safe default.
     const entry = shard.map.getPtr(@as(u32, @bitCast(fd))) orelse return false;
-    return entry.waiters(dir).remove(target);
+    const queue = entry.waiters(dir);
+    var it = queue.head;
+    while (it) |c| : (it = c.next) {
+        if (c == target) return queue.remove(target);
+    }
+    return false;
 }
 
 /// Tear down the shared registration for a socket fd about to be closed. Closing
