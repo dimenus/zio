@@ -10,6 +10,7 @@ const LoopState = @import("../loop.zig").LoopState;
 const Duration = @import("../../time.zig").Duration;
 const Clock = @import("../../time.zig").Clock;
 const os = @import("../../os/root.zig");
+const posix = @import("../../os/posix.zig");
 
 /// Compile-time Linux backend policy. `auto` prefers io_uring and falls back to
 /// epoll only when ring setup itself is unavailable; explicit engine selections
@@ -87,6 +88,14 @@ pub fn Backend(comptime mode: Mode) type {
             io_uring: IoUring,
             epoll: Epoll,
         },
+        /// The engine's waker eventfd, copied here at init. `wake` is the one
+        /// backend call made from threads that do not own the loop, so it
+        /// must not touch `engine`: in a Debug build Zig 0.17 copies the whole
+        /// union (several KiB) to read its tag, while the owner thread is
+        /// writing that memory, which is a data race (TSan, t-3832). The
+        /// engine creates, arms, drains and closes the fd; it does not change
+        /// between `init` and `deinit`.
+        waker_fd: i32,
 
         pub fn capability(comptime op: Op) Support {
             return switch (mode) {
@@ -115,7 +124,7 @@ pub fn Backend(comptime mode: Mode) type {
         ) !void {
             var engine: IoUring = undefined;
             try engine.init(allocator, queue_size, &shared_state.io_uring);
-            self.* = .{ .engine = .{ .io_uring = engine } };
+            self.* = .{ .engine = .{ .io_uring = engine }, .waker_fd = engine.waker_eventfd };
             shared_state.selection = .io_uring;
         }
 
@@ -127,7 +136,7 @@ pub fn Backend(comptime mode: Mode) type {
         ) !void {
             var engine: Epoll = undefined;
             try engine.init(allocator, queue_size, &shared_state.epoll);
-            self.* = .{ .engine = .{ .epoll = engine } };
+            self.* = .{ .engine = .{ .epoll = engine }, .waker_fd = engine.waker_eventfd };
             shared_state.selection = .epoll;
         }
 
@@ -204,15 +213,11 @@ pub fn Backend(comptime mode: Mode) type {
             };
         }
 
+        /// Wake the loop's poll from any thread. Both engines park on the
+        /// same kind of eventfd, so this needs only `waker_fd`.
         pub fn wake(self: *Self, state: *LoopState) void {
-            switch (mode) {
-                .io_uring => self.engine.io_uring.wake(state),
-                .epoll => self.engine.epoll.wake(state),
-                .auto => switch (self.engine) {
-                    .io_uring => |*engine| engine.wake(state),
-                    .epoll => |*engine| engine.wake(state),
-                },
-            }
+            _ = state;
+            posix.eventfd_write(self.waker_fd, 1) catch {};
         }
 
         pub fn syncWallTimer(self: *Self, clock: Clock, deadline: ?u64) bool {

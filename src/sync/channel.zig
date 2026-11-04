@@ -1855,10 +1855,7 @@ test "Channel: close wakes blocked select sender" {
 test "Channel: close classifies select waiters before signaling" {
     const Helpers = struct {
         fn notifyState(waiter: *Waiter) u32 {
-            return switch (waiter.mode) {
-                .direct => waiter.signalCount(),
-                .select => unreachable,
-            };
+            return waiter.signalCount();
         }
     };
 

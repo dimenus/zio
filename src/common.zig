@@ -144,29 +144,61 @@ pub const ClaimResult = enum {
 /// linked into the queue.
 pub const Waiter = struct {
     node: WaitNode = .{},
-    mode: union(enum) {
+    /// Which member of `mode` is live. The constructors set it and nothing
+    /// changes it afterwards, so any thread may read it with a plain load.
+    tag: ModeTag,
+    /// Untagged, with the tag kept in `tag`: in a Debug build Zig 0.17 copies
+    /// a whole tagged union to check its tag, on every switch and every field
+    /// access. For a thread waiter that copy is a plain read of the
+    /// `os.thread.Notify` state, which a signaller on another thread
+    /// `fetchAdd`s at the same time, so it is a data race (TSan reports it,
+    /// t-3832). `Direct` is untagged the same way. Outside the `Waiter`
+    /// methods, reach the members through `direct()` and `select()`, which
+    /// assert `tag`, so a wrong-member access still panics in safe builds.
+    mode: extern union {
         direct: Direct,
         select: Select,
     },
 
-    /// Direct waiter for single-future waiting.
-    pub const Direct = union(enum) {
-        /// Parks a task. Its wake-up is counted in the task's state word.
-        task: TaskWait,
-        /// Blocks a thread on a futex: foreign threads, thread-pool workers,
-        /// and tasks inside a no-suspend region.
-        thread: os.thread.Notify,
+    pub const ModeTag = enum(u8) { direct, select };
+
+    /// The direct member. Asserts that this is a direct waiter.
+    pub inline fn direct(self: *Waiter) *Direct {
+        std.debug.assert(self.tag == .direct);
+        return &self.mode.direct;
+    }
+
+    /// The select member. Asserts that this is a select waiter.
+    pub inline fn select(self: *Waiter) *Select {
+        std.debug.assert(self.tag == .select);
+        return &self.mode.select;
+    }
+
+    /// Direct waiter for single-future waiting. Untagged with its tag in
+    /// `tag`, for the reason on `Waiter.mode`.
+    pub const Direct = extern struct {
+        /// Which member of `payload` is live. Set by `init`, never changed.
+        tag: Tag,
+        payload: extern union {
+            /// Parks a task. Its wake-up is counted in the task's state word.
+            task: TaskWait,
+            /// Blocks a thread on a futex: foreign threads, thread-pool
+            /// workers, and tasks inside a no-suspend region.
+            thread: os.thread.Notify,
+        },
+
+        pub const Tag = enum(u8) { task, thread };
 
         pub fn init(kind: Kind) Direct {
             // Waitable, not current: inside a no-suspend region the wait
             // must block the thread, not park the task.
-            if (getWaitableTaskOrNull()) |task| return .{ .task = .init(task, kind) };
-            return .{ .thread = .init() };
+            if (getWaitableTaskOrNull()) |task| return .{ .tag = .task, .payload = .{ .task = .init(task, kind) } };
+            return .{ .tag = .thread, .payload = .{ .thread = .init() } };
         }
     };
 
     /// Which field of the task's state word a direct wait uses.
-    pub const Kind = enum {
+    pub const Kind = enum(u8) {
         /// Any wait other than the two below. Gets exactly one wake-up.
         ordinary,
         /// A `zio.Mutex` lock wait. Gets exactly one wake-up, and may be open
@@ -177,8 +209,9 @@ pub const Waiter = struct {
         select,
     };
 
-    /// A direct wait of a task.
-    pub const TaskWait = struct {
+    /// A direct wait of a task. Extern so it can sit in `Direct`'s untagged
+    /// union.
+    pub const TaskWait = extern struct {
         task: *AnyTask,
         kind: Kind,
         /// The kind's field when the wait started: the flag value for
@@ -220,7 +253,7 @@ pub const Waiter = struct {
     };
 
     /// Select waiter for multi-future select().
-    pub const Select = struct {
+    pub const Select = extern struct {
         parent: *Waiter,
         winner: *std.atomic.Value(usize),
         /// Bumped by claimers before their winner CAS. The owning select
@@ -257,17 +290,17 @@ pub const Waiter = struct {
 
     /// Initialize a direct waiter for an ordinary wait.
     pub fn init() Waiter {
-        return .{ .mode = .{ .direct = Direct.init(.ordinary) } };
+        return .{ .tag = .direct, .mode = .{ .direct = Direct.init(.ordinary) } };
     }
 
     /// Initialize a direct waiter for a `zio.Mutex` lock wait.
     pub fn initLock() Waiter {
-        return .{ .mode = .{ .direct = Direct.init(.lock) } };
+        return .{ .tag = .direct, .mode = .{ .direct = Direct.init(.lock) } };
     }
 
     /// Initialize the parent waiter of a select.
     pub fn initSelectParent() Waiter {
-        return .{ .mode = .{ .direct = Direct.init(.select) } };
+        return .{ .tag = .direct, .mode = .{ .direct = Direct.init(.select) } };
     }
 
     /// End a direct waiter's wait. Must run on the waiting task once every
@@ -275,9 +308,10 @@ pub const Waiter = struct {
     /// nesting rules (safe builds); a no-op otherwise.
     pub fn deinit(self: *Waiter) void {
         if (!compat.is_safe) return;
-        switch (self.mode) {
-            .direct => |*d| switch (d.*) {
-                .task => |*t| {
+        switch (self.tag) {
+            .direct => switch (self.mode.direct.tag) {
+                .task => {
+                    const t = &self.mode.direct.payload.task;
                     const open = &t.task.open_waits;
                     switch (t.kind) {
                         .ordinary => open.ordinary = false,
@@ -309,27 +343,31 @@ pub const Waiter = struct {
     /// The runtime of the task a signal to this waiter wakes, or null when it
     /// wakes a thread.
     fn wakeRuntime(self: *const Waiter) ?*Runtime {
-        const direct: *const Waiter = switch (self.mode) {
+        const direct_waiter: *const Waiter = switch (self.tag) {
             .direct => self,
-            .select => |*s| s.parent,
+            .select => self.mode.select.parent,
         };
-        const task = direct.directTask() orelse return null;
+        const task = direct_waiter.directTask() orelse return null;
         return task.runtime;
     }
 
     /// The task a direct waiter parks, or null when it blocks a thread.
     pub fn directTask(self: *const Waiter) ?*AnyTask {
-        return switch (self.mode.direct) {
-            .task => |*t| t.task,
+        std.debug.assert(self.tag == .direct);
+        const d = &self.mode.direct;
+        return switch (d.tag) {
+            .task => d.payload.task.task,
             .thread => null,
         };
     }
 
     /// Wake-ups this direct waiter has received so far.
     pub fn signalCount(self: *const Waiter) u32 {
-        return switch (self.mode.direct) {
-            .task => |*t| t.count(t.task.state.load(.acquire)),
-            .thread => |*n| n.state.load(.acquire),
+        std.debug.assert(self.tag == .direct);
+        const d = &self.mode.direct;
+        return switch (d.tag) {
+            .task => d.payload.task.count(d.payload.task.task.state.load(.acquire)),
+            .thread => d.payload.thread.state.load(.acquire),
         };
     }
 
@@ -342,6 +380,7 @@ pub const Waiter = struct {
         index: usize,
     ) Waiter {
         return .{
+            .tag = .select,
             .mode = .{ .select = Select.init(parent, winner, gen, pending, index) },
         };
     }
@@ -355,10 +394,7 @@ pub const Waiter = struct {
     /// (unlike a select's sweep), so it can never have a prior registration to
     /// unhook. Sources use this to skip that check for direct waiters.
     pub inline fn isDirect(self: *const Waiter) bool {
-        return switch (self.mode) {
-            .direct => true,
-            .select => false,
-        };
+        return self.tag == .direct;
     }
 
     /// Signal this waiter.
@@ -370,9 +406,10 @@ pub const Waiter = struct {
     /// can see it. For a task the wake-up and the wake are one CAS on the
     /// task's state word (see `Executor.scheduleTask`).
     pub fn signal(self: *Waiter) void {
-        switch (self.mode) {
-            .direct => |*d| switch (d.*) {
-                .task => |*t| {
+        switch (self.tag) {
+            .direct => switch (self.mode.direct.tag) {
+                .task => {
+                    const t = &self.mode.direct.payload.task;
                     // Before the wake: once scheduled, the waiter may return
                     // and its task be freed.
                     if (comptime @import("options.zig").options.sim) {
@@ -385,9 +422,10 @@ pub const Waiter = struct {
                         .select => Executor.scheduleTask(t.task, .select),
                     }
                 },
-                .thread => |*n| n.signal(),
+                .thread => self.mode.direct.payload.thread.signal(),
             },
-            .select => |*s| {
+            .select => {
+                const s = &self.mode.select;
                 // Try to claim winner slot with our index. The CAS fails both
                 // when another arm already won and when the select's own sweep
                 // holds the COMMITTING fence.
@@ -420,9 +458,10 @@ pub const Waiter = struct {
     /// owner's re-poll can find it.
     ///
     pub fn tryClaim(self: *Waiter) ClaimResult {
-        switch (self.mode) {
+        switch (self.tag) {
             .direct => return .won,
-            .select => |*s| {
+            .select => {
+                const s = &self.mode.select;
                 const prev = s.winner.cmpxchgStrong(NO_WINNER, s.index, .acq_rel, .acquire) orelse return .won;
                 if (prev != COMMITTING) return .lost;
                 // The owner's sweep holds the commit fence. Bump the
@@ -441,9 +480,9 @@ pub const Waiter = struct {
     /// Check if this waiter won its select (was claimed).
     /// Returns true if won (or if direct waiter).
     pub fn didWin(self: *const Waiter) bool {
-        return switch (self.mode) {
+        return switch (self.tag) {
             .direct => true,
-            .select => |s| s.winner.load(.acquire) == s.index,
+            .select => self.mode.select.winner.load(.acquire) == self.mode.select.index,
         };
     }
 
@@ -456,18 +495,19 @@ pub const Waiter = struct {
     /// Direct waiters need no fence (nobody can claim them) and always
     /// succeed.
     pub fn beginCommit(self: *Waiter) bool {
-        return switch (self.mode) {
+        return switch (self.tag) {
             .direct => true,
-            .select => |*s| s.winner.cmpxchgStrong(NO_WINNER, COMMITTING, .seq_cst, .seq_cst) == null,
+            .select => self.mode.select.winner.cmpxchgStrong(NO_WINNER, COMMITTING, .seq_cst, .seq_cst) == null,
         };
     }
 
     /// Owner-side: decide this arm while holding the commit fence. Cannot
     /// fail: the fence excludes external claims.
     pub fn finishCommit(self: *Waiter) void {
-        switch (self.mode) {
+        switch (self.tag) {
             .direct => {},
-            .select => |*s| {
+            .select => {
+                const s = &self.mode.select;
                 std.debug.assert(s.winner.load(.monotonic) == COMMITTING);
                 s.winner.store(s.index, .seq_cst);
             },
@@ -479,9 +519,10 @@ pub const Waiter = struct {
     /// generation counter first, so the owner's post-release generation check
     /// is guaranteed to see them and re-poll.
     pub fn abortCommit(self: *Waiter) void {
-        switch (self.mode) {
+        switch (self.tag) {
             .direct => {},
-            .select => |*s| {
+            .select => {
+                const s = &self.mode.select;
                 std.debug.assert(s.winner.load(.monotonic) == COMMITTING);
                 s.winner.store(NO_WINNER, .seq_cst);
             },
@@ -513,9 +554,10 @@ pub const Waiter = struct {
     /// See the note on `Waiter` - one waiter, one wait, plus the `.no_cancel`
     /// re-wait of the cancellation handshake.
     pub fn wait(self: *Waiter, expected: u32, comptime cancel_mode: Executor.YieldCancelMode) if (cancel_mode == .allow_cancel) Cancelable!void else void {
-        return switch (self.mode.direct) {
-            .task => |*t| waitTask(t, expected, cancel_mode),
-            .thread => |*n| waitFutex(n, expected, cancel_mode),
+        const d = self.direct();
+        return switch (d.tag) {
+            .task => waitTask(&d.payload.task, expected, cancel_mode),
+            .thread => waitFutex(&d.payload.thread, expected, cancel_mode),
         };
     }
 
@@ -549,9 +591,10 @@ pub const Waiter = struct {
             return;
         }
 
-        const t = switch (self.mode.direct) {
-            .task => |*t| t,
-            .thread => |*n| return timedWaitFutex(n, expected, futexTimeout(timeout, clock), cancel_mode),
+        const d = self.direct();
+        const t = switch (d.tag) {
+            .task => &d.payload.task,
+            .thread => return timedWaitFutex(&d.payload.thread, expected, futexTimeout(timeout, clock), cancel_mode),
         };
         std.debug.assert(t.kind == .ordinary);
         const task = t.task;
@@ -600,7 +643,9 @@ pub const Waiter = struct {
         // drop the frame holding the timer, and the task may finish. The flip
         // is the wake (see `Executor.scheduleTask`), so it is the last touch
         // of both.
-        const task = self.mode.direct.task.task;
+        const d = self.direct();
+        std.debug.assert(d.tag == .task);
+        const task = d.payload.task.task;
         Executor.scheduleTask(task, .timer);
     }
 
@@ -956,7 +1001,8 @@ test "timedWaitForIo: completes before timeout" {
 test "Waiter: futex-based timed wait with timeout" {
     // Create waiter without task (blocking context)
     var waiter: Waiter = .{
-        .mode = .{ .direct = .{ .thread = .init() } },
+        .tag = .direct,
+        .mode = .{ .direct = .{ .tag = .thread, .payload = .{ .thread = .init() } } },
     };
 
     var timer = Stopwatch.start();
@@ -986,7 +1032,8 @@ test "Waiter: cancelable futex park returns Canceled via the bound token" {
     // Parked on the futex and never signaled to completion (expected stays 1),
     // so the only way out is cancellation.
     var waiter: Waiter = .{
-        .mode = .{ .direct = .{ .thread = .init() } },
+        .tag = .direct,
+        .mode = .{ .direct = .{ .tag = .thread, .payload = .{ .thread = .init() } } },
     };
 
     const Worker = struct {
