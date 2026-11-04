@@ -12,9 +12,22 @@ const log = @import("../common.zig").log;
 pub const ThreadPool = struct {
     allocator: std.mem.Allocator,
 
+    /// Every worker thread that is neither retired nor taken by `stop()`.
+    /// Each worker's handle is joined exactly once, by whoever holds it last:
+    /// the next worker to retire (see `retired`) or `stop()`. A worker never
+    /// joins or detaches itself. A thread that exits without either keeps its
+    /// stack for the life of the process (a "thread leak"), so a handle must
+    /// never be dropped. Guarded by `workers_mutex`, as are the two below.
     workers: std.ArrayList(Worker) = .empty,
     workers_mutex: os.Mutex = .init(),
     next_worker_id: u64 = 0,
+    /// The worker that left `workers` last. It may still be running its last
+    /// instructions. The next worker to leave joins it, or `stop()` does.
+    retired: ?std.Thread = null,
+    /// Set once, by `stop()`, when it takes `workers` and `retired` to join
+    /// them. From then on no worker is spawned, and a worker that does not
+    /// find itself in `workers` leaves its join to `stop()`.
+    joining: bool = false,
 
     queue: Queue(Completion) = .{},
     queue_mutex: os.Mutex = .init(),
@@ -127,10 +140,14 @@ pub const ThreadPool = struct {
         self.starting -= 1;
     }
 
-    /// Spawn a worker thread, already counted by `reserveSpawn`.
+    /// Spawn a worker thread, already counted by `reserveSpawn`. Refused
+    /// after `stop()` has taken the worker list: a submit can decide to spawn
+    /// before `stop()` and get here after it, and a thread spawned then would
+    /// never be joined and would outlive the pool.
     fn spawnThread(self: *ThreadPool) !void {
         self.workers_mutex.lock();
         defer self.workers_mutex.unlock();
+        if (self.joining) return error.PoolStopped;
 
         const worker_id = self.next_worker_id;
         self.next_worker_id +%= 1;
@@ -143,17 +160,29 @@ pub const ThreadPool = struct {
         worker.thread = try std.Thread.spawn(.{}, run, .{ self, worker_id });
     }
 
-    fn removeThread(self: *ThreadPool, worker_id: u64) void {
-        self.workers_mutex.lock();
-        defer self.workers_mutex.unlock();
-
-        for (self.workers.items, 0..) |*worker, i| {
-            if (worker.worker_id == worker_id) {
-                _ = self.workers.swapRemove(i);
-                return;
+    /// A worker's last step, on its own thread, after its last job. It moves
+    /// its handle from `workers` to `retired` and joins the worker that
+    /// retired before it, so at most one exited worker waits to be joined. If
+    /// `stop()` already took the list, `stop()` joins this thread instead.
+    fn exitWorker(self: *ThreadPool, worker_id: u64) void {
+        const previous = blk: {
+            self.workers_mutex.lock();
+            defer self.workers_mutex.unlock();
+            for (self.workers.items, 0..) |worker, i| {
+                if (worker.worker_id == worker_id) {
+                    _ = self.workers.swapRemove(i);
+                    const previous = self.retired;
+                    self.retired = worker.thread;
+                    break :blk previous;
+                }
             }
-        }
-        unreachable;
+            // Only `stop()` removes a worker that is still running.
+            std.debug.assert(self.joining);
+            return;
+        };
+        // The previous worker has already left `workers_mutex`, so this join
+        // waits only for its last instructions (and, in turn, its own join).
+        if (previous) |thread| thread.join();
     }
 
     pub fn deinit(self: *ThreadPool) void {
@@ -186,19 +215,25 @@ pub const ThreadPool = struct {
             self.queue_not_empty.broadcast();
         }
 
-        // Join all threads - they will remove themselves from the list.
-        // We need to keep joining until all workers are gone.
-        while (true) {
+        // Take every handle that is not yet joined, in one step: the workers
+        // still listed and the last retired one. A worker that exits after
+        // this finds itself gone from the list and leaves its join here. A
+        // worker that left the list before this is `retired`, or was joined
+        // by the worker that retired after it.
+        var taken: std.ArrayList(Worker) = undefined;
+        var last_retired: ?std.Thread = undefined;
+        {
             self.workers_mutex.lock();
-            const thread = if (self.workers.items.len > 0) self.workers.items[0].thread else null;
-            self.workers_mutex.unlock();
-
-            if (thread) |t| {
-                t.join();
-            } else {
-                break;
-            }
+            defer self.workers_mutex.unlock();
+            self.joining = true;
+            taken = self.workers;
+            self.workers = .empty;
+            last_retired = self.retired;
+            self.retired = null;
         }
+        for (taken.items) |worker| worker.thread.join();
+        if (last_retired) |thread| thread.join();
+        taken.deinit(self.allocator);
     }
 
     pub fn submit(self: *ThreadPool, work: *Work) void {
@@ -246,7 +281,9 @@ pub const ThreadPool = struct {
             // On failure the job stays queued and runs once a worker frees up,
             // or gets a worker from the next submit's spawn decision.
             self.spawnThread() catch |err| {
-                log.err("Failed to spawn thread: {}", .{err});
+                // PoolStopped: stop() ran after this submit queued its job,
+                // and dropped the job with the rest of the queue.
+                if (err != error.PoolStopped) log.err("Failed to spawn thread: {}", .{err});
                 self.cancelSpawn();
             };
         }
@@ -303,7 +340,7 @@ pub const ThreadPool = struct {
         os.syscall_cancel.bindThread();
         self.runTasks();
         os.syscall_cancel.unbindThread();
-        self.removeThread(worker_id);
+        self.exitWorker(worker_id);
     }
 
     /// Run queued jobs until shutdown, or until the worker has been idle for

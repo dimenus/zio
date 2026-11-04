@@ -369,3 +369,163 @@ test "ev.ThreadPool: an idle worker is counted for one queued job only" {
     first.started.wait();
     second.started.wait();
 }
+
+/// KiB of writable anonymous memory mapped in this process (the "rw" lines
+/// with no file in /proc/self/maps). A pthread's stack is all writable and
+/// stays mapped from its spawn until it is joined or detached, even after
+/// the thread exits. The C library's malloc arenas, which it keeps on purpose
+/// and adds under contention, reserve 64 MiB each but make only a small part
+/// writable, so they barely move this count.
+fn writableAnonKiB() !usize {
+    const fd = std.c.open("/proc/self/maps", .{ .ACCMODE = .RDONLY });
+    if (fd < 0) return error.OpenFailed;
+    defer _ = std.c.close(fd);
+    var buf: [4096]u8 = undefined;
+    var line: [512]u8 = undefined;
+    var line_len: usize = 0;
+    var total: usize = 0;
+    while (true) {
+        const n = std.c.read(fd, &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        for (buf[0..@intCast(n)]) |c| {
+            if (c != '\n') {
+                if (line_len == line.len) return error.LineTooLong;
+                line[line_len] = c;
+                line_len += 1;
+                continue;
+            }
+            total += try writableAnonLineKiB(line[0..line_len]);
+            line_len = 0;
+        }
+    }
+    return total;
+}
+
+/// One /proc/self/maps line: "start-end perms offset dev inode [path]".
+fn writableAnonLineKiB(line: []const u8) !usize {
+    var fields = std.mem.tokenizeScalar(u8, line, ' ');
+    const range = fields.next() orelse return error.BadMaps;
+    const perms = fields.next() orelse return error.BadMaps;
+    _ = fields.next() orelse return error.BadMaps; // offset
+    _ = fields.next() orelse return error.BadMaps; // dev
+    const inode = fields.next() orelse return error.BadMaps;
+    const path = fields.rest();
+    if (!std.mem.startsWith(u8, perms, "rw")) return 0;
+    if (!std.mem.eql(u8, inode, "0")) return 0;
+    // [stack], [heap] and other named regions are not thread stacks.
+    if (path.len != 0) return 0;
+    const dash = std.mem.indexOfScalar(u8, range, '-') orelse return error.BadMaps;
+    const start = try std.fmt.parseInt(usize, range[0..dash], 16);
+    const end = try std.fmt.parseInt(usize, range[dash + 1 ..], 16);
+    return (end - start) / 1024;
+}
+
+test "ev.ThreadPool: a worker that retires after its idle timeout is joined, not leaked" {
+    // Linux only: the leak is observed through /proc/self/maps. A worker
+    // thread that exits and is never joined or detached keeps its stack
+    // mapped for the life of the process (and ThreadSanitizer reports a
+    // "thread leak"), so each spawn-and-retire cycle adds a stack of
+    // writable memory. A joined worker's stack goes back to the C library,
+    // and the next spawn reuses it.
+    if (builtin.single_threaded or builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var thread_pool: ev.ThreadPool = undefined;
+    try thread_pool.init(std.testing.allocator, .{
+        .min_threads = 0,
+        .max_threads = 1,
+        .idle_timeout_ms = 1,
+    });
+    defer thread_pool.deinit();
+    defer thread_pool.stop();
+
+    var open_gate = ResetEvent.init();
+    defer open_gate.deinit();
+    open_gate.set();
+
+    const cycles = 32;
+    var before: usize = 0;
+    for (0..cycles + 1) |i| {
+        var job: GatedJob = undefined;
+        job.init(&open_gate);
+        defer job.deinit();
+        thread_pool.submit(&job.work);
+        job.started.wait();
+        // Wait until the worker retired: it left the running count and the
+        // worker list. Each cycle then spawns a new worker.
+        var spins: usize = 0;
+        while (true) {
+            thread_pool.workers_mutex.lock();
+            const listed = thread_pool.workers.items.len;
+            thread_pool.workers_mutex.unlock();
+            if (listed == 0 and thread_pool.running_threads.load(.monotonic) == 0) break;
+            spins += 1;
+            if (spins > 100_000_000) return error.TimedOut;
+            os_thread.yield();
+        }
+        // The first cycle warms the C library's stack cache; measure from there.
+        if (i == 0) before = try writableAnonKiB();
+    }
+    const after = try writableAnonKiB();
+    // Leaked: one stack per cycle. Joined: a stack or two stay mapped (the
+    // last retired worker, which the next retirement or stop() joins, and
+    // the cached one). Allow a quarter of the cycles.
+    const stack_kib = std.Thread.SpawnConfig.default_stack_size / 1024;
+    if (after > before + (cycles / 4) * stack_kib) {
+        std.debug.print("ev.ThreadPool: {d} spawn-and-retire cycles grew writable anonymous memory from {d} KiB to {d} KiB ({d} stacks of {d} KiB)\n", .{ cycles, before, after, (after - before) / stack_kib, stack_kib });
+        return error.RetiredWorkersLeaked;
+    }
+}
+
+/// Run `n_workers` blocking jobs at once on a new pool (one worker each), let
+/// every worker go idle, then stop the pool, so all of them wake and exit
+/// together at `stop()`.
+fn runAllThenStop(comptime n_workers: usize) !void {
+    var thread_pool: ev.ThreadPool = undefined;
+    try thread_pool.init(std.testing.allocator, .{
+        .min_threads = 0,
+        .max_threads = n_workers,
+    });
+    defer thread_pool.deinit();
+
+    var gate = ResetEvent.init();
+    defer gate.deinit();
+    var jobs: [n_workers]GatedJob = undefined;
+    for (&jobs) |*job| job.init(&gate);
+    defer for (&jobs) |*job| job.deinit();
+    for (&jobs) |*job| thread_pool.submit(&job.work);
+    for (&jobs) |*job| job.started.wait();
+    gate.set();
+    var spins: usize = 0;
+    while (thread_pool.idle_threads.load(.monotonic) < n_workers) {
+        spins += 1;
+        if (spins > 100_000_000) return error.TimedOut;
+        os_thread.yield();
+    }
+    thread_pool.stop();
+}
+
+test "ev.ThreadPool: stop() joins every worker, including one that exits before stop() reaches it" {
+    // Linux only, as above. At stop() every worker wakes, leaves its loop and
+    // exits; stop() must join each one whatever the order. A worker that
+    // took itself out of the pool's bookkeeping before stop() read it was
+    // never joined, and kept its stack.
+    if (builtin.single_threaded or builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const n_workers = 8;
+    // The first round warms what the C library keeps on purpose (its stack
+    // cache, malloc arenas for concurrent threads). Measure the second round
+    // only.
+    try runAllThenStop(n_workers);
+    const before = try writableAnonKiB();
+    try runAllThenStop(n_workers);
+    const after = try writableAnonKiB();
+    // Joined: the second round reuses the cached stacks and unmaps the
+    // rest, so the count does not grow by a stack. Leaked: each worker
+    // stop() missed keeps its whole stack. Half a stack separates the two.
+    const stack_kib = std.Thread.SpawnConfig.default_stack_size / 1024;
+    if (after > before + stack_kib / 2) {
+        std.debug.print("ev.ThreadPool: a second round of stop() with {d} workers grew writable anonymous memory from {d} KiB to {d} KiB ({d} stacks of {d} KiB)\n", .{ n_workers, before, after, (after - before) / stack_kib, stack_kib });
+        return error.StoppedWorkersLeaked;
+    }
+}
