@@ -517,7 +517,7 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
     // the request back for the next cancelable operation. A null task
     // binding means the wait blocked the thread and consumed nothing.
     if (canceled) {
-        if (waiter.mode.direct.task) |t| t.recancel();
+        if (waiter.direct().task) |t| t.recancel();
     }
 
     // Return result from winner.
@@ -613,7 +613,7 @@ pub fn selectAwaitables(awaitables: []const *Awaitable) Cancelable!usize {
     // operation. A null task binding means the wait blocked the thread and
     // consumed nothing.
     if (canceled) {
-        if (waiter.mode.direct.task) |t| t.recancel();
+        if (waiter.direct().task) |t| t.recancel();
     }
     return winner_index;
 }

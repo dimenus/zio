@@ -128,13 +128,38 @@ pub const ClaimResult = enum {
 /// linked into the queue.
 pub const Waiter = struct {
     node: WaitNode = .{},
-    mode: union(enum) {
+    /// Which member of `mode` is live. `init` and `initSelect` set it and
+    /// nothing changes it afterwards, so any thread may read it with a plain
+    /// load.
+    kind: Kind,
+    /// Untagged, with the tag kept in `kind`: in a Debug build Zig 0.17 copies
+    /// a whole tagged union to check its tag, on every switch and every field
+    /// access. That copy is a plain read of `direct.notify.state`, which
+    /// signallers on other threads `fetchAdd` at the same time, so it is a data
+    /// race (TSan reports it in every multi-executor test, t-3832). Outside the
+    /// `Waiter` methods, reach the members through `direct()` and `select()`,
+    /// which assert `kind`, so a wrong-kind access still panics in safe builds.
+    mode: extern union {
         direct: Direct,
         select: Select,
     },
 
+    pub const Kind = enum(u8) { direct, select };
+
+    /// The direct member. Asserts that this is a direct waiter.
+    pub inline fn direct(self: *Waiter) *Direct {
+        std.debug.assert(self.kind == .direct);
+        return &self.mode.direct;
+    }
+
+    /// The select member. Asserts that this is a select waiter.
+    pub inline fn select(self: *Waiter) *Select {
+        std.debug.assert(self.kind == .select);
+        return &self.mode.select;
+    }
+
     /// Direct waiter for single-future waiting.
-    pub const Direct = struct {
+    pub const Direct = extern struct {
         notify: os.thread.Notify,
         task: ?*AnyTask,
 
@@ -149,7 +174,7 @@ pub const Waiter = struct {
     };
 
     /// Select waiter for multi-future select().
-    pub const Select = struct {
+    pub const Select = extern struct {
         parent: *Waiter,
         winner: *std.atomic.Value(usize),
         /// Bumped by claimers before their winner CAS. The owning select
@@ -187,6 +212,7 @@ pub const Waiter = struct {
     /// Initialize a direct waiter for single-future waiting.
     pub fn init() Waiter {
         return .{
+            .kind = .direct,
             .mode = .{ .direct = Direct.init() },
         };
     }
@@ -200,6 +226,7 @@ pub const Waiter = struct {
         index: usize,
     ) Waiter {
         return .{
+            .kind = .select,
             .mode = .{ .select = Select.init(parent, winner, gen, pending, index) },
         };
     }
@@ -213,18 +240,16 @@ pub const Waiter = struct {
     /// (unlike a select's sweep), so it can never have a prior registration to
     /// unhook. Sources use this to skip that check for direct waiters.
     pub inline fn isDirect(self: *const Waiter) bool {
-        return switch (self.mode) {
-            .direct => true,
-            .select => false,
-        };
+        return self.kind == .direct;
     }
 
     /// Signal this waiter.
     /// For direct: increments signal count and wakes the task.
     /// For select: tries to claim winner slot, then signals the parent.
     pub fn signal(self: *Waiter) void {
-        switch (self.mode) {
-            .direct => |*d| {
+        switch (self.kind) {
+            .direct => {
+                const d = &self.mode.direct;
                 if (d.task) |task| {
                     _ = d.notify.state.fetchAdd(1, .release);
                     if (comptime @import("options.zig").options.sim) {
@@ -236,7 +261,8 @@ pub const Waiter = struct {
                     d.notify.signal();
                 }
             },
-            .select => |*s| {
+            .select => {
+                const s = &self.mode.select;
                 // Try to claim winner slot with our index. The CAS fails both
                 // when another arm already won and when the select's own sweep
                 // holds the COMMITTING fence.
@@ -269,9 +295,10 @@ pub const Waiter = struct {
     /// owner's re-poll can find it.
     ///
     pub fn tryClaim(self: *Waiter) ClaimResult {
-        switch (self.mode) {
+        switch (self.kind) {
             .direct => return .won,
-            .select => |*s| {
+            .select => {
+                const s = &self.mode.select;
                 const prev = s.winner.cmpxchgStrong(NO_WINNER, s.index, .acq_rel, .acquire) orelse return .won;
                 if (prev != COMMITTING) return .lost;
                 // The owner's sweep holds the commit fence. Bump the
@@ -290,9 +317,9 @@ pub const Waiter = struct {
     /// Check if this waiter won its select (was claimed).
     /// Returns true if won (or if direct waiter).
     pub fn didWin(self: *const Waiter) bool {
-        return switch (self.mode) {
+        return switch (self.kind) {
             .direct => true,
-            .select => |s| s.winner.load(.acquire) == s.index,
+            .select => self.mode.select.winner.load(.acquire) == self.mode.select.index,
         };
     }
 
@@ -305,18 +332,19 @@ pub const Waiter = struct {
     /// Direct waiters need no fence (nobody can claim them) and always
     /// succeed.
     pub fn beginCommit(self: *Waiter) bool {
-        return switch (self.mode) {
+        return switch (self.kind) {
             .direct => true,
-            .select => |*s| s.winner.cmpxchgStrong(NO_WINNER, COMMITTING, .seq_cst, .seq_cst) == null,
+            .select => self.mode.select.winner.cmpxchgStrong(NO_WINNER, COMMITTING, .seq_cst, .seq_cst) == null,
         };
     }
 
     /// Owner-side: decide this arm while holding the commit fence. Cannot
     /// fail: the fence excludes external claims.
     pub fn finishCommit(self: *Waiter) void {
-        switch (self.mode) {
+        switch (self.kind) {
             .direct => {},
-            .select => |*s| {
+            .select => {
+                const s = &self.mode.select;
                 std.debug.assert(s.winner.load(.monotonic) == COMMITTING);
                 s.winner.store(s.index, .seq_cst);
             },
@@ -328,9 +356,10 @@ pub const Waiter = struct {
     /// generation counter first, so the owner's post-release generation check
     /// is guaranteed to see them and re-poll.
     pub fn abortCommit(self: *Waiter) void {
-        switch (self.mode) {
+        switch (self.kind) {
             .direct => {},
-            .select => |*s| {
+            .select => {
+                const s = &self.mode.select;
                 std.debug.assert(s.winner.load(.monotonic) == COMMITTING);
                 s.winner.store(NO_WINNER, .seq_cst);
             },
@@ -366,6 +395,7 @@ pub const Waiter = struct {
 
     /// Whether this waiter's timeout timer fired.
     fn timedOut(self: *const Waiter) bool {
+        std.debug.assert(self.kind == .direct);
         return self.mode.direct.notify.state.load(.acquire) & timeout_flag != 0;
     }
 
@@ -377,7 +407,7 @@ pub const Waiter = struct {
     /// See the note on `Waiter` - one waiter, one wait, plus the `.no_cancel`
     /// re-wait of the cancellation handshake.
     pub fn wait(self: *Waiter, expected: u32, comptime cancel_mode: Executor.YieldCancelMode) if (cancel_mode == .allow_cancel) Cancelable!void else void {
-        const d = &self.mode.direct;
+        const d = self.direct();
         if (d.task) |task| {
             return waitTask(d, task, expected, cancel_mode);
         } else {
@@ -415,7 +445,7 @@ pub const Waiter = struct {
             return;
         }
 
-        const d = &self.mode.direct;
+        const d = self.direct();
         const task = d.task orelse return timedWaitFutex(d, expected, futexTimeout(timeout, clock), cancel_mode);
 
         // Drop a flag left behind by an earlier timed wait on this waiter.
@@ -456,7 +486,7 @@ pub const Waiter = struct {
     /// Callback for the `timedWaitClock` timer.
     fn timeoutCallback(_: *ev.Loop, c: *ev.Completion) void {
         const self: *Waiter = @ptrCast(@alignCast(c.userdata.?));
-        const d = &self.mode.direct;
+        const d = self.direct();
         // Read the task before publishing: once the flag is visible the waiter
         // may return and drop the frame holding the timer, so nothing below may
         // touch `self` or the completion again.
@@ -651,7 +681,7 @@ fn waitForIoImpl(c: *ev.Completion, comptime cancel_check: CancelCheck, comptime
     };
 
     // Blocking path: Execute synchronously without event loop
-    const task = waiter.mode.direct.task orelse {
+    const task = waiter.direct().task orelse {
         // TODO: Don't use std.heap.c_allocator - it should be passed as a parameter
         ev.executeBlocking(c, std.heap.c_allocator);
         return;
@@ -689,7 +719,7 @@ fn waitForIoImpl(c: *ev.Completion, comptime cancel_check: CancelCheck, comptime
     // (one that owns the socket) can signal before the wait, which then
     // returns without parking; charge the coop budget for that case so it
     // still hits a yield point.
-    const signaled_early = waiter.mode.direct.notify.state.load(.acquire) != 0;
+    const signaled_early = waiter.direct().notify.state.load(.acquire) != 0;
     waiter.wait(1, .allow_cancel) catch |err| switch (err) {
         error.Canceled => {
             // On cancellation, cancel the I/O and wait for completion
@@ -728,7 +758,7 @@ pub fn waitForIoUncancelable(c: *ev.Completion) void {
     };
 
     // Blocking path: Execute synchronously without event loop
-    const task = waiter.mode.direct.task orelse {
+    const task = waiter.direct().task orelse {
         // TODO: Don't use std.heap.c_allocator - it should be passed as a parameter
         ev.executeBlocking(c, std.heap.c_allocator);
         return;
@@ -737,7 +767,7 @@ pub fn waitForIoUncancelable(c: *ev.Completion) void {
     // Async path: Submit to the event loop and wait for completion (no cancel)
     task.getExecutor().loopAdd(c);
     // See waitForIo.
-    const signaled_early = waiter.mode.direct.notify.state.load(.acquire) != 0;
+    const signaled_early = waiter.direct().notify.state.load(.acquire) != 0;
     waiter.wait(1, .no_cancel);
     if (signaled_early) {
         task.getExecutor().maybeYield(.reschedule, .no_cancel);
@@ -815,6 +845,7 @@ test "timedWaitForIo: completes before timeout" {
 test "Waiter: futex-based timed wait with timeout" {
     // Create waiter without task (blocking context)
     var waiter: Waiter = .{
+        .kind = .direct,
         .mode = .{ .direct = .{
             .task = null,
             .notify = .init(),
@@ -848,6 +879,7 @@ test "Waiter: cancelable futex park returns Canceled via the bound token" {
     // Parked on the futex and never signaled to completion (expected stays 1),
     // so the only way out is cancellation.
     var waiter: Waiter = .{
+        .kind = .direct,
         .mode = .{ .direct = .{ .task = null, .notify = .init() } },
     };
 

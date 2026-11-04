@@ -290,11 +290,6 @@ pub fn deinit(self: *Self) void {
     self.shared.sock_table.release();
 }
 
-pub fn wake(self: *Self, state: *LoopState) void {
-    _ = state;
-    posix.eventfd_write(self.waker_eventfd, 1) catch {};
-}
-
 /// Arm/update/disarm the given wall clock's timerfd to an absolute deadline (ns
 /// in that clock's epoch; null = disarm). Returns false only if it couldn't arm
 /// a pending deadline, so the loop folds that clock into the capped poll timeout.

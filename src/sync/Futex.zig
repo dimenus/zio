@@ -106,7 +106,7 @@ pub fn wait(ptr: *const u32, expect: u32) Cancelable!void {
         // for it to land before destroying the waiter, and put the consumed
         // cancellation request back for the next cancellation point.
         futex_waiter.waiter.wait(1, .no_cancel);
-        if (waiter.mode.direct.task) |t| t.recancel();
+        if (waiter.direct().task) |t| t.recancel();
     };
 }
 
@@ -197,7 +197,7 @@ pub fn waitTimeoutClock(ptr: *const u32, expect: u32, timeout: Timeout, clock: C
             // Claimed by wake() - take the wake instead of the cancellation,
             // and put the consumed cancellation request back.
             futex_waiter.waiter.wait(1, .no_cancel);
-            if (waiter.mode.direct.task) |t| t.recancel();
+            if (waiter.direct().task) |t| t.recancel();
         },
     };
 }
