@@ -459,11 +459,6 @@ pub fn deinit(self: *Self) void {
     }
 }
 
-pub fn wake(self: *Self, state: *LoopState) void {
-    _ = state;
-    posix.eventfd_write(self.waker_eventfd, 1) catch {};
-}
-
 /// Arm the multishot poll on the waker eventfd if needed. Returns false only
 /// when a rearm was needed but the ring refused the SQE (caller must not
 /// block). Normally a no-op: the poll is armed once and the kernel keeps it

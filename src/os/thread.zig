@@ -553,7 +553,8 @@ const FutexDragonFly = struct {
 // ============================================================================
 
 /// Futex-based notify for platforms with futex-like primitives
-const NotifyFutex = struct {
+/// Extern so it can sit in `Waiter`'s untagged union (common.zig).
+const NotifyFutex = extern struct {
     state: std.atomic.Value(u32) = .init(0),
 
     pub fn init() NotifyFutex {

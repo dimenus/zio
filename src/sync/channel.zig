@@ -187,7 +187,7 @@ const ChannelImpl = struct {
                 // binding means the wait blocked the thread and consumed
                 // nothing.
                 waiter.wait(1, .no_cancel);
-                if (waiter.mode.direct.task) |t| t.recancel();
+                if (waiter.direct().task) |t| t.recancel();
                 return recv.getResult(&ctx);
             }
             return err;
@@ -277,7 +277,7 @@ const ChannelImpl = struct {
                 // reports its result and the consumed cancellation request
                 // goes back for the next cancelable operation.
                 waiter.wait(1, .no_cancel);
-                if (waiter.mode.direct.task) |t| t.recancel();
+                if (waiter.direct().task) |t| t.recancel();
                 return send_op.getResult(&ctx);
             }
             return err;
@@ -1853,10 +1853,7 @@ test "Channel: close wakes blocked select sender" {
 test "Channel: close classifies select waiters before signaling" {
     const Helpers = struct {
         fn notifyState(waiter: *Waiter) u32 {
-            return switch (waiter.mode) {
-                .direct => |*direct| direct.notify.state.load(.acquire),
-                .select => unreachable,
-            };
+            return waiter.direct().notify.state.load(.acquire);
         }
     };
 
