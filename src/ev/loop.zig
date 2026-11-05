@@ -424,7 +424,7 @@ pub const LoopState = struct {
                 var now = self.nowFor(timer.clock);
                 if (comptime zio_options.sim) {
                     if (sim.mutantArmTimerStale()) {
-                        now = .fromNanoseconds(sim.epochNs(@intFromEnum(timer.clock)));
+                        now = .fromNanoseconds(sim.epochNs(@backingInt(timer.clock)));
                     }
                 }
                 timer.deadline = now.addDuration(d);
@@ -434,7 +434,7 @@ pub const LoopState = struct {
                 if (comptime zio_options.sim) {
                     if (d.value > 0) {
                         const dl = timer.deadline.toNanoseconds();
-                        const true_now = sim.nowNsFor(@intFromEnum(timer.clock));
+                        const true_now = sim.nowNsFor(@backingInt(timer.clock));
                         const expected = true_now +| d.toNanoseconds();
                         if (dl +| 1 < expected) {
                             sim.panic("armTimer backdated: deadline behind true now + duration", .{});
@@ -1207,7 +1207,7 @@ pub const Loop = struct {
                 }
                 for (batch[0..batch_count]) |timer| {
                     if (comptime zio_options.sim) {
-                        sim.emit(.timer_fire, @intFromEnum(clock), @truncate(timer.deadline.value));
+                        sim.emit(.timer_fire, @backingInt(clock), @truncate(timer.deadline.value));
                     }
                     self.state.markCompleted(&timer.c);
                     fired = true;
@@ -1717,7 +1717,7 @@ pub const Loop = struct {
                     .parked => {},
                     .would_block => {
                         c.setError(error.WouldBlock);
-                        if (sim.takeOpId(c)) |id| sim.emit(.io_complete, @intFromEnum(c.op), id);
+                        if (sim.takeOpId(c)) |id| sim.emit(.io_complete, @backingInt(c.op), id);
                         self.state.markCompleted(c);
                     },
                     .bad_fd => c.setError(error.FileDescriptorNotASocket),
@@ -1764,7 +1764,7 @@ pub const Loop = struct {
     fn cancelSimIo(self: *Loop, c: *Completion) void {
         const id = sim.cancelIo(c);
         if (!c.has_result) c.setError(error.Canceled);
-        if (id) |op_id| sim.emit(.io_complete, @intFromEnum(c.op), op_id);
+        if (id) |op_id| sim.emit(.io_complete, @backingInt(c.op), op_id);
         self.state.markCompleted(c);
     }
 
@@ -1811,7 +1811,7 @@ pub const Loop = struct {
             }
             if (!c.has_result) continue;
             const id = sim.takeOpId(c) orelse buf[i].id;
-            sim.emit(.io_complete, @intFromEnum(c.op), id);
+            sim.emit(.io_complete, @backingInt(c.op), id);
             self.state.markCompleted(c);
         }
     }

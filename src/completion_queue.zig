@@ -391,7 +391,7 @@ pub const CompletionQueue = struct {
                 if (comptime zio_options.sim) {
                     if (node) |n| {
                         const c = completionFromGroup(n);
-                        sim.emit(.cq_pop, @intFromEnum(c.op), 0);
+                        sim.emit(.cq_pop, @backingInt(c.op), 0);
                     }
                 }
                 const drained = node == null and self.closed and self.pending.isEmpty();

@@ -181,7 +181,7 @@ pub fn nowNs() u64 {
     return clock_ns;
 }
 
-/// Wall-clock now. `clock_idx` is `@intFromEnum(time.Clock)`. `.real` (2)
+/// Wall-clock now. `clock_idx` is `@backingInt(time.Clock)`. `.real` (2)
 /// lives in a distinct epoch so `AutoCancel.setClock(..., .real)` is
 /// load-bearing: a `.real` deadline on the awake heap never fires.
 pub fn nowNsFor(clock_idx: u8) u64 {
@@ -225,7 +225,7 @@ pub fn emit(kind: EventKind, a: u32, b: u32) void {
     if (comptime !compiled_in) return;
     if (!begun) return;
     var word: [8]u8 = undefined;
-    word[0] = @intFromEnum(kind);
+    word[0] = @backingInt(kind);
     std.mem.writeInt(u24, word[1..4], @truncate(a), .little);
     std.mem.writeInt(u32, word[4..8], b, .little);
     hasher.update(&word);
@@ -291,7 +291,7 @@ pub fn stateDigest() u64 {
     while (d < due_len) : (d += 1) {
         std.mem.writeInt(u64, buf[0..8], due[d].due_at, .little);
         std.mem.writeInt(u32, buf[8..12], due[d].id, .little);
-        buf[12] = @intFromEnum(due[d].kind);
+        buf[12] = @backingInt(due[d].kind);
         h.update(buf[0..13]);
     }
     return h.final();
