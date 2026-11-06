@@ -635,6 +635,21 @@ pub const Executor = struct {
     // Used by getCurrentTaskOrNull() instead of the TLS current_context chain.
     current_task: ?*AnyTask,
 
+    /// Scheduler progress, for an observer on another thread (a watchdog):
+    /// `generation << 1 | parked`. This executor's thread stores a new word
+    /// at every transition: every switch to a task or back to the scheduler
+    /// (also to the same task again), and the entry to and exit from a
+    /// blocking poll (`parked` set between them). So a word that stays the
+    /// same, not parked, for a long time is an executor making no scheduler
+    /// progress: one task running without yielding, or the scheduler stuck.
+    /// One release store per transition: no lock and no clock. Read it with
+    /// `readActivity`.
+    activity: std.atomic.Value(usize) = .init(0),
+    /// The label (`AnyTask.label`, `setTaskLabel`) of the task this executor
+    /// switched to, 0 in scheduler code. Stored before the `activity` word of
+    /// the same transition.
+    activity_label: std.atomic.Value(usize) = .init(0),
+
     // Depth of no-suspend regions on this thread; see `beginNoSuspend`. Unlike
     // clearing `current_task`, this leaves the task identity visible to locks,
     // user log callbacks and the wake path's "inside the run loop" test.
@@ -727,7 +742,65 @@ pub const Executor = struct {
 
         self.main_task.coro.setCurrent();
         setCurrentExecutor(self);
-        self.current_task = &self.main_task;
+        self.setCurrentTask(&self.main_task);
+    }
+
+    /// Set `current_task` and publish the transition (`activity`): the
+    /// task's label, then a new generation, not parked. Every write of
+    /// `current_task` goes through here. This executor's thread only.
+    pub fn setCurrentTask(self: *Executor, task: ?*AnyTask) void {
+        self.current_task = task;
+        self.publishActivity(false, if (task) |t| t.label else 0);
+    }
+
+    /// One transition: the label first, then the word with the next
+    /// generation, both release stores. This executor's thread is the only
+    /// writer, so the load of its own word needs no ordering.
+    fn publishActivity(self: *Executor, parked: bool, label: usize) void {
+        self.activity_label.store(label, .release);
+        const word = self.activity.load(.monotonic);
+        self.activity.store(((word >> 1) +% 1) << 1 | @intFromBool(parked), .release);
+    }
+
+    /// Around a blocking poll: parked from here until `endPark`, also when
+    /// the poll fails.
+    fn beginPark(self: *Executor) void {
+        self.publishActivity(true, 0);
+    }
+
+    fn endPark(self: *Executor) void {
+        self.publishActivity(false, 0);
+    }
+
+    /// What `activity` says, read from another thread.
+    pub const Activity = struct {
+        generation: usize,
+        parked: bool,
+        /// The label of the task the executor is in, 0 in scheduler code.
+        label: usize,
+    };
+
+    /// Read this executor's activity from any thread: the word, the label,
+    /// the word again. Null when the two words differ (a transition happened
+    /// during the read): read again later.
+    ///
+    /// What equal words guarantee: the label is the one published for that
+    /// state, or a later one the same task set (`setTaskLabel`), or the
+    /// label of the NEXT transition when that transition is half done (its
+    /// label stored, its word not yet). The last case lasts two adjacent
+    /// stores on the executor's thread, so a state that stays the same for
+    /// a long time, the one a watchdog reports, reads its own label.
+    pub fn readActivity(self: *const Executor) ?Activity {
+        const w1 = self.activity.load(.acquire);
+        // Acquire keeps the second word load after this one.
+        const label = self.activity_label.load(.acquire);
+        const w2 = self.activity.load(.acquire);
+        return pairActivity(w1, label, w2);
+    }
+
+    fn pairActivity(w1: usize, label: usize, w2: usize) ?Activity {
+        if (w1 != w2) return null;
+        return .{ .generation = w1 >> 1, .parked = w1 & 1 != 0, .label = label };
     }
 
     pub fn deinit(self: *Executor) void {
@@ -890,9 +963,9 @@ pub const Executor = struct {
         const next_task = exec.getNextTask() orelse return;
         updateParentContext(next_task, &exec.main_task.coro.context);
         const prev_task = exec.current_task;
-        exec.current_task = next_task;
+        exec.setCurrentTask(next_task);
         next_task.coro.step();
-        exec.current_task = prev_task;
+        exec.setCurrentTask(prev_task);
         exec.processCleanup();
     }
 
@@ -1058,8 +1131,8 @@ pub const Executor = struct {
         // does not run (a panic does not unwind), so the null marker survives
         // until abort(); markCrashed additionally pins the thread as a
         // no-suspend region.
-        self.current_task = null;
-        defer self.current_task = &self.main_task;
+        self.setCurrentTask(null);
+        defer self.setCurrentTask(&self.main_task);
         defer self.spawn_streak = 0;
 
         // Process deferred cleanup (e.g. main task's park/reschedule)
@@ -1098,10 +1171,10 @@ pub const Executor = struct {
             // Process ready coroutines
             while (self.getNextTask()) |next_task| {
                 updateParentContext(next_task, &self.main_task.coro.context);
-                self.current_task = next_task;
+                self.setCurrentTask(next_task);
                 self.spawn_streak = 0;
                 next_task.coro.step();
-                self.current_task = null;
+                self.setCurrentTask(null);
                 self.processCleanup();
             }
 
@@ -1174,7 +1247,11 @@ pub const Executor = struct {
     fn parkAndSearch(self: *Executor, check_ready: bool) !void {
         if (!migrates) {
             self.bump("parks_full", 1);
-            try self.loop.poll(.max);
+            {
+                self.beginPark();
+                defer self.endPark();
+                try self.loop.poll(.max);
+            }
             self.drainDispatched();
             return;
         }
@@ -1238,7 +1315,11 @@ pub const Executor = struct {
         if (!found_work) found_work = self.rescueStuck();
         const wait: Duration = if (found_work) .zero else if (self.holdBaton()) baton_tick else .max;
         if (wait.value == baton_tick.value) self.bump("baton_parks", 1);
-        try self.loop.poll(wait);
+        {
+            self.beginPark();
+            defer self.endPark();
+            try self.loop.poll(wait);
+        }
         // Drain before withdrawing the bit, so the post-park work checks
         // below see the woken batch.
         self.drainDispatched();
@@ -1708,11 +1789,11 @@ pub const Executor = struct {
         // so I/O performed here doesn't re-enter the event loop. On the direct-switch
         // path it is set to the target task just before the switch; on the fall-back
         // path it stays null and the run loop keeps it null until it steps a task.
-        self.current_task = null;
+        self.setCurrentTask(null);
         self.spawn_streak = 0;
         if (self.getNextTask()) |next_task| {
             updateParentContext(next_task, &self.main_task.coro.context);
-            self.current_task = next_task;
+            self.setCurrentTask(next_task);
             coro.yieldTo(&next_task.coro);
         } else {
             coro.yield();
@@ -1861,6 +1942,19 @@ pub fn markCrashed() void {
 /// The current task will be rescheduled and continue execution later.
 /// Returns error.Canceled if the task was canceled.
 /// No-op if called from a thread without an executor (returns without error).
+/// Label the current task with `v`, 0 for no label, for an observer of its
+/// executor (`Executor.readActivity`, a watchdog naming what a stalled
+/// executor runs). Published at once, and again each time the executor
+/// switches back to this task, so a task that yields keeps its label and
+/// never shows another's. Off an executor thread, or in scheduler code,
+/// there is no task to label, and this does nothing.
+pub fn setTaskLabel(v: usize) void {
+    const exec = getCurrentExecutorOrNull() orelse return;
+    const task = exec.current_task orelse return;
+    task.label = v;
+    exec.activity_label.store(v, .release);
+}
+
 pub fn yield() Cancelable!void {
     const exec = getCurrentExecutorOrNull() orelse {
         os.thread.yield();
@@ -2113,7 +2207,7 @@ pub const Runtime = struct {
                     worker.ready.set();
                     return e;
                 };
-                worker.executor.current_task = null;
+                worker.executor.setCurrentTask(null);
                 worker.ready.set();
             }
             for (self.workers.items) |*worker| {
@@ -2692,6 +2786,118 @@ test "Runtime: metrics monitor thread starts and stops" {
 
     // Long enough for a couple of monitor reports.
     try runtime.sleep(.fromMilliseconds(15));
+}
+
+/// Spin without yielding for `ms`: no scheduler transition can happen.
+fn activitySpin(ms: u64) void {
+    const until = Timestamp.now(.monotonic).toNanoseconds() + ms * std.time.ns_per_ms;
+    while (Timestamp.now(.monotonic).toNanoseconds() < until) std.atomic.spinLoopHint();
+}
+
+/// The watchdog's view, from an OS thread: two reads of one executor's
+/// activity, `gap_ms` apart, after `delay_ms`.
+const ActivityProbe = struct {
+    exec: *const Executor,
+    delay_ms: u64,
+    gap_ms: u64,
+    first: ?Executor.Activity = null,
+    second: ?Executor.Activity = null,
+
+    fn run(self: *ActivityProbe) void {
+        os.time.sleep(.fromMilliseconds(self.delay_ms));
+        self.first = readSettled(self.exec);
+        os.time.sleep(.fromMilliseconds(self.gap_ms));
+        self.second = readSettled(self.exec);
+    }
+
+    fn readSettled(exec: *const Executor) ?Executor.Activity {
+        for (0..1000) |_| if (exec.readActivity()) |a| return a;
+        return null;
+    }
+};
+
+test "Executor activity: a parked executor shows the parked bit and its word does not move while it sleeps (t-3760)" {
+    if (comptime zio_options.sim) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer runtime.deinit();
+    const exec = runtime.executors.items[0];
+    var probe: ActivityProbe = .{ .exec = exec, .delay_ms = 50, .gap_ms = 100 };
+    const t = try std.Thread.spawn(.{}, ActivityProbe.run, .{&probe});
+    // The only task sleeps: the executor parks for the whole probe.
+    try runtime.sleep(.fromMilliseconds(300));
+    t.join();
+    const a = probe.first.?;
+    const b = probe.second.?;
+    try std.testing.expect(a.parked and b.parked);
+    try std.testing.expectEqual(a.generation, b.generation);
+    // Awake again: not parked, and the word moved.
+    const awake = exec.readActivity().?;
+    try std.testing.expect(!awake.parked);
+    try std.testing.expect(awake.generation != b.generation);
+}
+
+test "Executor activity: a task that spins without yielding leaves the word unchanged and not parked (t-3760)" {
+    if (comptime zio_options.sim) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer runtime.deinit();
+    const exec = runtime.executors.items[0];
+    var probe: ActivityProbe = .{ .exec = exec, .delay_ms = 50, .gap_ms = 100 };
+    const t = try std.Thread.spawn(.{}, ActivityProbe.run, .{&probe});
+    activitySpin(300);
+    t.join();
+    const a = probe.first.?;
+    const b = probe.second.?;
+    try std.testing.expect(!a.parked and !b.parked);
+    try std.testing.expectEqual(a.generation, b.generation);
+}
+
+test "Executor activity: a task's label is published while it runs and comes back when it resumes (t-3760)" {
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer runtime.deinit();
+    const exec = runtime.executors.items[0];
+    const Y = struct {
+        fn run(e: *const Executor, seen: *usize) void {
+            setTaskLabel(22);
+            seen.* = e.readActivity().?.label;
+            yield() catch {};
+        }
+    };
+    var seen_by_y: usize = 0;
+    setTaskLabel(11);
+    try std.testing.expectEqual(@as(usize, 11), exec.readActivity().?.label);
+    var h = try runtime.spawn(Y.run, .{ exec, &seen_by_y });
+    // X yields; Y runs, labels itself, yields; X resumes.
+    try yield();
+    h.join();
+    try std.testing.expectEqual(@as(usize, 22), seen_by_y);
+    try std.testing.expectEqual(@as(usize, 11), exec.readActivity().?.label);
+    setTaskLabel(0);
+    try std.testing.expectEqual(@as(usize, 0), exec.readActivity().?.label);
+}
+
+test "Executor activity: the double read rejects a word that moved, and what it cannot reject (t-3760)" {
+    // Words 4 and 6: generations 2 and 3, not parked; 5: generation 2, parked.
+    try std.testing.expectEqual(@as(?Executor.Activity, null), Executor.pairActivity(4, 7, 6));
+    try std.testing.expectEqual(@as(?Executor.Activity, null), Executor.pairActivity(4, 7, 5));
+    const ok = Executor.pairActivity(5, 7, 5).?;
+    try std.testing.expectEqual(@as(usize, 2), ok.generation);
+    try std.testing.expect(ok.parked);
+    try std.testing.expectEqual(@as(usize, 7), ok.label);
+
+    // A real read during a half-done transition: the next label is stored,
+    // its word is not yet. The two words agree, so the read is accepted
+    // with the next state's label. That is the documented window
+    // (`readActivity`); it closes at the word store that follows.
+    var e: Executor = undefined;
+    e.activity = .init(4);
+    e.activity_label = .init(7);
+    try std.testing.expectEqual(@as(usize, 7), e.readActivity().?.label);
+    e.activity_label.store(9, .release);
+    const torn = e.readActivity().?;
+    try std.testing.expectEqual(@as(usize, 2), torn.generation);
+    try std.testing.expectEqual(@as(usize, 9), torn.label);
+    e.activity.store(6, .release);
+    try std.testing.expectEqual(@as(usize, 3), e.readActivity().?.generation);
 }
 
 test "runtime: spawnBlocking smoke test" {
