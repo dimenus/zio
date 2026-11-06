@@ -636,14 +636,31 @@ pub const Executor = struct {
     current_task: ?*AnyTask,
 
     /// Scheduler progress, for an observer on another thread (a watchdog):
-    /// `generation << 1 | parked`. This executor's thread stores a new word
-    /// at every transition: every switch to a task or back to the scheduler
-    /// (also to the same task again), and the entry to and exit from a
-    /// blocking poll (`parked` set between them). So a word that stays the
-    /// same, not parked, for a long time is an executor making no scheduler
-    /// progress: one task running without yielding, or the scheduler stuck.
-    /// One release store per transition: no lock and no clock. Read it with
-    /// `readActivity`.
+    /// `generation << 1 | parked`. A new word is stored at every transition:
+    /// every switch to a task or back to the scheduler (also to the same
+    /// task again; a direct switch in `switchOut` is one transition), the
+    /// entry to and exit from a blocking poll (`parked` set between them),
+    /// and a worker's error back-off sleep in `runWorker` (parked). So a
+    /// word that stays the same, not parked, for a long time is an executor
+    /// making no scheduler progress: one task running without yielding, or
+    /// the scheduler stuck. One release store per transition: no lock and no
+    /// clock. Read it with `readActivity`.
+    ///
+    /// Who stores it: the executor's own thread, and before that thread
+    /// runs any task, the thread that initializes it (`init`; in the sim the
+    /// main thread also stores every logical worker's word, at worker init
+    /// and at each step). Never two threads at once.
+    ///
+    /// What it does not show:
+    /// - A completion callback runs inside the blocking poll (each backend
+    ///   calls it right after its kernel wait), so a callback that does not
+    ///   return is shown as parked. Tasks never run as callbacks; this is
+    ///   zio's own machinery and user callbacks registered on the loop.
+    /// - A worker waiting at its start barrier or its teardown barrier in
+    ///   `runWorker` shows its last word, not parked. `Runtime.init`
+    ///   releases the start barrier before it returns, and the teardown
+    ///   barrier is reached only in `deinit`, so an observer that runs while
+    ///   the runtime runs tasks does not see either.
     activity: std.atomic.Value(usize) = .init(0),
     /// The label (`AnyTask.label`, `setTaskLabel`) of the task this executor
     /// switched to, 0 in scheduler code. Stored before the `activity` word of
@@ -747,17 +764,20 @@ pub const Executor = struct {
 
     /// Set `current_task` and publish the transition (`activity`): the
     /// task's label, then a new generation, not parked. Every write of
-    /// `current_task` goes through here. This executor's thread only.
+    /// `current_task` goes through here, except the clear at the top of
+    /// `switchOut`, whose transition is published once at its end. This
+    /// executor's thread only.
     pub fn setCurrentTask(self: *Executor, task: ?*AnyTask) void {
         self.current_task = task;
         self.publishActivity(false, if (task) |t| t.label else 0);
     }
 
     /// One transition: the label first, then the word with the next
-    /// generation, both release stores. This executor's thread is the only
-    /// writer, so the load of its own word needs no ordering.
+    /// generation. The word's release store orders the label store before
+    /// it, so the label store can be monotonic. One writer at a time (see
+    /// `activity`), so the load of its own word needs no ordering.
     fn publishActivity(self: *Executor, parked: bool, label: usize) void {
-        self.activity_label.store(label, .release);
+        self.activity_label.store(label, .monotonic);
         const word = self.activity.load(.monotonic);
         self.activity.store(((word >> 1) +% 1) << 1 | @intFromBool(parked), .release);
     }
@@ -792,9 +812,10 @@ pub const Executor = struct {
     /// a long time, the one a watchdog reports, reads its own label.
     pub fn readActivity(self: *const Executor) ?Activity {
         const w1 = self.activity.load(.acquire);
-        // Acquire keeps the second word load after this one.
+        // Acquire keeps the second word load after this one, so that load
+        // itself can be monotonic.
         const label = self.activity_label.load(.acquire);
-        const w2 = self.activity.load(.acquire);
+        const w2 = self.activity.load(.monotonic);
         return pairActivity(w1, label, w2);
     }
 
@@ -1836,13 +1857,19 @@ pub const Executor = struct {
         // so I/O performed here doesn't re-enter the event loop. On the direct-switch
         // path it is set to the target task just before the switch; on the fall-back
         // path it stays null and the run loop keeps it null until it steps a task.
-        self.setCurrentTask(null);
+        //
+        // One published transition, not two: the raw clear below is the only
+        // write of `current_task` that does not publish. The word keeps the
+        // yielding task's state while the next task is picked, then moves
+        // once, to the next task or to the scheduler.
+        self.current_task = null;
         self.spawn_streak = 0;
         if (self.getNextTask()) |next_task| {
             updateParentContext(next_task, &self.main_task.coro.context);
             self.setCurrentTask(next_task);
             coro.yieldTo(&next_task.coro);
         } else {
+            self.setCurrentTask(null);
             coro.yield();
         }
     }
@@ -1985,23 +2012,27 @@ pub fn markCrashed() void {
     exec.no_suspend += 1;
 }
 
-/// Cooperatively yield control to allow other tasks to run.
-/// The current task will be rescheduled and continue execution later.
-/// Returns error.Canceled if the task was canceled.
-/// No-op if called from a thread without an executor (returns without error).
 /// Label the current task with `v`, 0 for no label, for an observer of its
 /// executor (`Executor.readActivity`, a watchdog naming what a stalled
 /// executor runs). Published at once, and again each time the executor
 /// switches back to this task, so a task that yields keeps its label and
 /// never shows another's. Off an executor thread, or in scheduler code,
-/// there is no task to label, and this does nothing.
+/// there is no task to label, and this does nothing. A task spawned by a
+/// labelled task starts with no label.
 pub fn setTaskLabel(v: usize) void {
     const exec = getCurrentExecutorOrNull() orelse return;
     const task = exec.current_task orelse return;
     task.label = v;
-    exec.activity_label.store(v, .release);
+    // Monotonic: the word does not change, so there is nothing to order
+    // this store against; a reader sees this label or the one before it,
+    // both the same task's.
+    exec.activity_label.store(v, .monotonic);
 }
 
+/// Cooperatively yield control to allow other tasks to run.
+/// The current task will be rescheduled and continue execution later.
+/// Returns error.Canceled if the task was canceled.
+/// No-op if called from a thread without an executor (returns without error).
 pub fn yield() Cancelable!void {
     const exec = getCurrentExecutorOrNull() orelse {
         os.thread.yield();
@@ -2647,7 +2678,14 @@ pub const Runtime = struct {
             worker.executor.run(.until_stopped) catch |e| {
                 if (self.shutting_down.load(.acquire)) break;
                 log.err("Worker executor error: {}, retrying in {f}", .{ e, backoff });
-                os.time.sleep(backoff);
+                // Parked: it runs no task while it waits, and the error is
+                // logged above, so an observer must not report this wait as
+                // a task holding the executor.
+                {
+                    worker.executor.beginPark();
+                    defer worker.executor.endPark();
+                    os.time.sleep(backoff);
+                }
                 backoff = .{ .value = @min(backoff.value *| 2, max_backoff.value) };
                 continue;
             };
