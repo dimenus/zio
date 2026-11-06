@@ -208,6 +208,11 @@ pub const AnyTask = struct {
     /// task itself.
     open_waits: if (compat.is_safe) OpenWaits else void = if (compat.is_safe) .{} else {},
 
+    /// A caller-chosen word naming what this task is doing, 0 for nothing
+    /// (`setTaskLabel`). Written only by the task itself; its executor copies
+    /// it into `Executor.activity_label` whenever it switches to the task.
+    label: usize = 0,
+
     /// See `Options.debug_cancel`. Only accessed by the task itself.
     cancel_debug: if (zio_options.debug_cancel) CancelDebug else void = if (zio_options.debug_cancel) .{} else {},
 
@@ -672,7 +677,7 @@ pub const AnyTask = struct {
 
         // Landing site (a): handle cleanup for the task that yielded to us
         var executor = getCurrentExecutor();
-        executor.current_task = self;
+        executor.setCurrentTask(self);
         executor.processCleanup();
 
         // Run the task's function
