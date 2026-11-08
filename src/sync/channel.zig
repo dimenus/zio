@@ -4,6 +4,7 @@
 const std = @import("std");
 const Runtime = @import("../runtime.zig").Runtime;
 const yield = @import("../runtime.zig").yield;
+const runtime_mod = @import("../runtime.zig");
 const Group = @import("../group.zig").Group;
 const SimpleQueue = @import("../utils/simple_queue.zig").SimpleQueue;
 const SimpleStack = @import("../utils/simple_stack.zig").SimpleStack;
@@ -17,6 +18,22 @@ const Closeable = common.Closeable;
 const AsyncWaitState = common.AsyncWaitState;
 const NO_WINNER = common.NO_WINNER;
 const Mutex = @import("Mutex.zig");
+
+/// Sim only: a seeded preemption after a non-blocking operation decided its
+/// result and released the channel lock (`sim.Preempt`). The caller sleeps
+/// under a shield, so a pending cancel waits for the next cancellation
+/// point instead of being consumed here, and the operation's result is
+/// returned unchanged. Only from a task: a thread outside the runtime has
+/// nothing to suspend. No code in a native build.
+fn simPreempt() void {
+    if (comptime !sim.compiled_in) return;
+    if (runtime_mod.getCurrentTaskOrNull() == null) return;
+    const ns = sim.preemptNs();
+    if (ns == 0) return;
+    runtime_mod.beginShield();
+    defer runtime_mod.endShield();
+    runtime_mod.sleep(.fromNanoseconds(ns)) catch sim.panic("sim: a shielded preemption sleep was canceled", .{});
+}
 
 /// Specifies how a channel should be closed.
 pub const CloseMode = enum {
@@ -695,6 +712,7 @@ pub fn Channel(comptime T: type) type {
         /// Returns `error.Closed` if the channel is closed and empty.
         pub fn tryReceive(self: *Self) !T {
             var result: T = undefined;
+            defer simPreempt();
             try self.impl.tryReceive(std.mem.asBytes(&result).ptr);
             return result;
         }
@@ -716,6 +734,7 @@ pub fn Channel(comptime T: type) type {
         /// Returns `error.WouldBlock` if the channel is full.
         /// Returns `error.Closed` if the channel is closed.
         pub fn trySend(self: *Self, item: T) !void {
+            defer simPreempt();
             return self.impl.trySend(std.mem.asBytes(&item).ptr);
         }
 

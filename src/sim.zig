@@ -17,6 +17,7 @@ pub const EventKind = enum(u8) {
     timer_fire = 3,
     cq_pop = 4,
     io_complete = 5,
+    preempt = 6,
 };
 
 const TaskIdEnt = struct { ptr: usize, id: u32 };
@@ -126,6 +127,54 @@ const LiveOp = struct {
 
 var live: [max_live]LiveOp = undefined;
 var live_len: usize = 0;
+
+/// Seeded preemption at a non-blocking channel operation
+/// (`Channel(T).tryReceive` / `trySend`, `sync/channel.zig`). On real
+/// threads a task can be descheduled right after such an operation decided
+/// its result, and other tasks, including ones on other executors, run
+/// before it acts on that result. One thread never does that: a task runs
+/// until it suspends. So when this is on, the operation's caller sleeps for
+/// a seed-chosen simulated time after the result is decided, and every
+/// other task may run meanwhile.
+///
+/// `one_in` is the rate: one operation in `one_in` preempts; 0 is off, the
+/// default, and then no random number is drawn, so every trace is the same
+/// as without this setting. The duration is log-uniform in
+/// [`min_ns`, `max_ns`]. Kept across `begin`/`end`: a harness sets it once.
+pub const Preempt = struct {
+    one_in: u32,
+    min_ns: u64,
+    max_ns: u64,
+};
+
+var preempt: Preempt = .{ .one_in = 0, .min_ns = 0, .max_ns = 0 };
+
+pub fn setPreempt(p: Preempt) void {
+    if (p.one_in != 0 and (p.min_ns == 0 or p.max_ns < p.min_ns)) {
+        panic("sim: setPreempt needs 0 < min_ns <= max_ns", .{});
+    }
+    preempt = p;
+}
+
+pub fn preemptSetting() Preempt {
+    return preempt;
+}
+
+/// Called by a task after a non-blocking channel operation. Returns how
+/// long the task sleeps, 0 for no preemption. Draws from the seed only
+/// while preemption is on.
+pub fn preemptNs() u64 {
+    if (comptime !compiled_in) return 0;
+    if (!begun or preempt.one_in == 0) return 0;
+    const r = rng.random();
+    if (r.uintLessThan(u32, preempt.one_in) != 0) return 0;
+    // Log-uniform: as many short preemptions as long ones per decade.
+    const lo: f64 = @floatFromInt(preempt.min_ns);
+    const hi: f64 = @floatFromInt(preempt.max_ns);
+    const ns: u64 = @intFromFloat(@exp(@log(lo) + r.float(f64) * (@log(hi) - @log(lo))));
+    emit(.preempt, @truncate(ns >> 10), @truncate(ns));
+    return @max(ns, 1);
+}
 
 pub fn isBegun() bool {
     return begun;
