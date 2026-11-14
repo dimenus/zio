@@ -932,7 +932,28 @@ the mutants in its commits.
   builds), and the op model's seeds 9 to 16, which gather one send in 16
   from many buffers (215 sends of exactly 1024). Mutants:
   `mut/21-iov.json` (17, all killed).
-- **Phase 2 is built.** Not done in it, by decision: NAT rebinding
+- **Round 5 of the outside review (gpt-simnet7.md, of 3340b0f): no P1,
+  two P2, both closed (sitting 22).**
+  - Finding 1, d77f351: a faulted send that failed for memory moved fault
+    state (counts, matches, draws, burst). Every allocation now comes
+    before the decision. Test: `sim: net faults: a send whose payload
+    copy, duplicate copy or wire growth fails ...` (it failed before).
+  - Finding 2, 975da92: the op model now compares the sim's wire landing
+    times with its own after every step and poll, and a poll may not pass
+    the model's earliest landing. The review's mutant (1 ms late) was
+    already killed by the old model; the mutant "a poll's clock skips
+    landings" survived it and is killed now.
+  - Its generator list: added in sitting 22 a wildcard-bound socket, a
+    host's silence, and rule changes inside a harvest (seeds 9 to 16; mutant
+    "a wildcard socket receives nothing" killed). **Left, not built:** an
+    implicit bind at a first send in the op model (the bridge test covers
+    it); `requireEveryRuleMatched` at the end of each seed with the model
+    predicting a panic (it needs a non-panicking count or a child per
+    seed); faults that change at a timer; sends predicted to fail; source
+    address overrides (`from`); more than 6 rules; `flowClash` across
+    different destination ports.
+- **Phase 2 is built and reviewed.** This section is its acceptance record:
+  the slices above, the gates in each commit, and round 5. Not done in it, by decision: NAT rebinding
   (t-4100). Still open from phase 1: t-4096, t-4098 (the op model's
   holes; flows sharing a landing instant are still kept out of it).
 - Open and filed: t-4096 (zero-length receive on an empty sim pipe), t-4098
