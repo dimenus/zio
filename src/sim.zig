@@ -1395,7 +1395,15 @@ pub fn dgramRecv(fd: i32, dst: []const []u8, dont_wait: bool) error{WouldBlock}!
     d.meta_head = (d.meta_head + 1) % d.meta.len;
     d.meta_len -= 1;
     d.ring_used -= q.len;
-    d.ring_head = if (d.ring_used == 0) 0 else (q.off + q.len) % d.ring.len;
+    // The ring starts where the next queued datagram's bytes start. An empty
+    // datagram occupies no bytes, so the ring can hold none while entries
+    // remain: only an empty queue may reset the head.
+    if (d.meta_len == 0) {
+        if (d.ring_used != 0) panic("sim: sim fd {d} has no queued datagram but {d} queued bytes", .{ fd, d.ring_used });
+        d.ring_head = 0;
+    } else {
+        d.ring_head = d.meta[d.meta_head].off;
+    }
     d.charged -= q.len + datagram_overhead;
     return .{ .copied = copied, .len = q.len, .from = q.from, .to = if (d.dst_addr) q.to else null };
 }
@@ -3928,6 +3936,134 @@ test "sim: dgram: each flow is first in, first out; flows due at the same time i
     }
     // The seeded order is not one fixed order: 20 seeds give several.
     try std.testing.expect(n_distinct >= 3);
+}
+
+// The outside review's sequence for finding 1 (review of 158ebba): an empty
+// datagram left queued while the byte ring empties must not move where the
+// next payload is written.
+test "sim: dgram: an empty datagram queued while the ring empties does not make two later payloads share bytes" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            const rx = try dg.open();
+            const tx = try dg.open();
+            try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
+            const to = dg.addr(127, 0, 0, 1, (try dg.local(rx)).port);
+            var buf: [4]u8 = undefined;
+            _ = try dg.sendFrom(tx, to, null, "A");
+            _ = try dg.sendFrom(tx, to, null, "");
+            try dg.settle();
+            try std.testing.expectEqualStrings("A", buf[0..(try dg.recvInto(rx, &.{&buf})).info.len]);
+            _ = try dg.sendFrom(tx, to, null, "B");
+            try dg.settle();
+            try std.testing.expectEqual(@as(usize, 0), (try dg.recvInto(rx, &.{&buf})).info.len);
+            _ = try dg.sendFrom(tx, to, null, "C");
+            try dg.settle();
+            try std.testing.expectEqualStrings("B", buf[0..(try dg.recvInto(rx, &.{&buf})).info.len]);
+            _ = try dg.sendFrom(tx, to, null, "D");
+            try dg.settle();
+            try std.testing.expectEqualStrings("C", buf[0..(try dg.recvInto(rx, &.{&buf})).info.len]);
+            try std.testing.expectEqualStrings("D", buf[0..(try dg.recvInto(rx, &.{&buf})).info.len]);
+        }
+    }.body);
+}
+
+/// The reference for the datagram queue's model test: a list of byte strings
+/// and the byte limit, with the landing and receive rules of design section 6
+/// written plainly. The packet limit is not reached here (1024 datagrams);
+/// `sim: dgram limits: with a large byte budget, the packet limit drops
+/// empty datagrams` covers it.
+const QueueModel = struct {
+    queued: std.ArrayList([]const u8) = .empty,
+    head: usize = 0,
+    limit: usize = default_rcvbuf_bytes,
+    charged: usize = 0,
+    dropped: u64 = 0,
+
+    fn land(m: *QueueModel, gpa: std.mem.Allocator, bytes: []const u8) !void {
+        const cost = bytes.len + datagram_overhead;
+        if (m.queued.items.len - m.head == rcv_packet_limit or m.charged + cost > m.limit) {
+            m.dropped += 1;
+            return;
+        }
+        try m.queued.append(gpa, bytes);
+        m.charged += cost;
+    }
+
+    fn take(m: *QueueModel) ?[]const u8 {
+        if (m.head == m.queued.items.len) return null;
+        const b = m.queued.items[m.head];
+        m.head += 1;
+        m.charged -= b.len + datagram_overhead;
+        return b;
+    }
+};
+
+// A random mix of sends (one to three per step, a quarter of them empty),
+// receives into buffers smaller or larger than the datagram, and SO_RCVBUF
+// changes small enough that the byte limit drops datagrams, checked against
+// `QueueModel` after every step. A failure prints the seed and the step.
+test "sim: dgram: the receive queue matches a list of byte strings under random sends, receives, truncation and SO_RCVBUF changes" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    const T = struct {
+        var model_seed: u64 = 0;
+        var step: usize = 0;
+        fn body() !void {
+            var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            defer arena.deinit();
+            const gpa = arena.allocator();
+            var prng: std.Random.DefaultPrng = .init(model_seed);
+            const r = prng.random();
+            var model: QueueModel = .{};
+            const rx = try dg.open();
+            const tx = try dg.open();
+            try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
+            const to = dg.addr(127, 0, 0, 1, (try dg.local(rx)).port);
+            step = 0;
+            while (step < 400) : (step += 1) {
+                switch (r.uintLessThan(u8, 10)) {
+                    0...3 => {
+                        const n = r.intRangeAtMost(usize, 1, 3);
+                        for (0..n) |_| {
+                            const len: usize = if (r.uintLessThan(u8, 4) == 0) 0 else r.intRangeAtMost(usize, 1, 700);
+                            const bytes = try gpa.alloc(u8, len);
+                            r.bytes(bytes);
+                            _ = try dg.sendFrom(tx, to, null, bytes);
+                            try model.land(gpa, bytes);
+                        }
+                        try dg.settle();
+                    },
+                    4...7 => {
+                        const want = model.take();
+                        var buf: [800]u8 = undefined;
+                        const cap = if (want) |w| r.uintAtMost(usize, w.len + 2) else r.uintAtMost(usize, 8);
+                        if (want) |w| {
+                            const got = try dg.recvInto(rx, &.{buf[0..cap]});
+                            const copied = @min(cap, w.len);
+                            try std.testing.expectEqual(copied, got.info.len);
+                            try std.testing.expectEqual(w.len > cap, got.info.truncated);
+                            try std.testing.expectEqualSlices(u8, w[0..copied], buf[0..copied]);
+                        } else {
+                            try std.testing.expectError(error.WouldBlock, dg.recvInto(rx, &.{buf[0..cap]}));
+                        }
+                    },
+                    else => {
+                        const v = r.intRangeAtMost(c_int, 300, 3000);
+                        try dg.setInt(rx, sys.SOL.SOCKET, sys.SO.RCVBUF, v);
+                        model.limit = @intCast(v);
+                    },
+                }
+                try std.testing.expectEqual(model.dropped, datagramStats(rx).dropped_rcvbuf);
+            }
+        }
+    };
+    for ([_]u64{ 1, 2, 3, 4, 5 }) |s| {
+        T.model_seed = s;
+        dg.run(s, T.body) catch |err| {
+            std.debug.print("datagram queue model test: seed {d}, step {d}: {t}\n", .{ s, T.step, err });
+            return err;
+        };
+    }
 }
 
 test "sim: dgram: a closed fd number is reused by the next open, which does not see the old socket's data" {
