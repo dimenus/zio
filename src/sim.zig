@@ -1541,6 +1541,8 @@ fn resetNet() void {
     wire_hasher = std.hash.Wyhash.init(0);
     rules_len = 0;
     rule_history_len = 0;
+    udp_rule_set = false;
+    tcp_rule_set = false;
     fault_stats = .{};
     fault_draws = 0;
 }
@@ -1730,7 +1732,7 @@ pub fn dgramSend(fd: i32, src: anytype, to: Ip4, from: ?[4]u8) error{ AddressUna
         @memcpy(bytes[at..][0..sl.len], sl);
         at += sl.len;
     }
-    if (rule_history_len != 0) {
+    if (udp_rule_set) {
         const src_addr: Ip4 = .{ .ip = src_ip, .port = d.local.port };
         // Every allocation this send could need comes before any fault
         // decision: a decision moves counts, matches, draws and a burst
@@ -2398,14 +2400,49 @@ fn isFlowHead(rest: []const WireDatagram, k: usize) bool {
 //   `streamRecv`, `streamSend`, `streamShutdown`, `closeEndpoint` and the
 //   `land*` functions are those lists, line by line.
 // - `testStreamDir` gives a test each direction's counters, so it can check
-//   `admitted = in flight + unread + read + discarded`.
+//   `admitted = in flight + held + unread + read + discarded`.
+//
+// Faults (design 17.9 and 17.9a):
+// - A fault rule whose endpoints say `.protocol = .tcp` acts on TCP entries
+//   (SYN, SYN-ACK, ACK, data, FIN, RST, credit), never on datagrams; a
+//   `.udp` rule (the default) never on TCP entries. An entry goes from its
+//   sender's local address to its peer (a SYN to its destination); a path
+//   matches both, a silence either. The calls are the datagram ones:
+//   `setImpairment`, `setPartition`, `silence`, and their clears.
+// - A `.tcp` impairment takes `delay_ns` and `jitter_ns` (the last set
+//   that matches acts). Both are fixed at the entry's send, the jitter by
+//   `tcpJitterDraw`; the entry lands `wire_latency_ns` + its chunk spacing
+//   + delay + jitter after its send, never before the entry before it in
+//   its direction. `loss_ppm`, `burst`, `dup_ppm` and `reorder` refuse.
+// - A `.tcp` partition or silence holds entries, never loses them. An entry
+//   is held if one matches at its send or at its landing, or if its
+//   direction already holds one (order). Held data stays charged to the
+//   window, so a held credit stalls the sender; a held credit is replaced
+//   by a newer one of its direction. When a clear leaves a held direction
+//   with no matching partition or silence, it is released, in (`conn_id`,
+//   direction) order: each entry lands `wire_latency_ns` + its extra time
+//   after the release, in order. Held entries never stop the clock, count
+//   in `streamEntriesInFlight` and toward `max_tcp_entries`, and keep a
+//   connection from retiring. A test that drains before `sim.end` clears
+//   its rules first.
+// - An abort (close with unread bytes or SO_LINGER {1, 0}, an RST landing,
+//   a local reset) discards the endpoint's held data, FIN and credits;
+//   its RST follows. A close in `C-syn` or `C-failed` discards a held SYN.
+//   Each discard is recorded (`StreamOutcome.discarded_held`).
+// - The connect with no answer is a held SYN: the connect stays parked
+//   until its deadline (`Timeout`), a cancel, a close, or the release.
+// - `failStream(fd, .reset | .timed_out)`: its doc comment.
+// - Counts: `streamStats()` (`held_at_send`, `held_at_landing`, `released`,
+//   `credits_coalesced`, `discarded_held`, `delayed`, `dropped_failed`),
+//   each rule's `matched` and `delayed`, `streamFaultDraws()`.
 //
 // Refused by name (a panic): poll and the datagram calls on a stream
 // socket; the socket layer's own recv, send and the rest (only the native
 // backends call them); a receive of 0 bytes; a second receive or send while
 // one is unresolved; a send or receive flag other than the defaults;
-// shutdown(.receive); SO_LINGER with a linger time; `failStream`, `.tcp`
-// fault rules and the connect with no answer (slice 3); `connect` on a socket
+// shutdown(.receive); SO_LINGER with a linger time; `failStream` misuse (its
+// doc comment); a `.tcp` impairment with loss, burst, duplication or
+// reorder; a path whose ends name two protocols; `connect` on a socket
 // the program bound, on a listener or on an endpoint; `local_address` in
 // `IpAddress.connect` (refused in src/net.zig before any side effect);
 // `listen` on an unbound socket, a listener or an endpoint; `accept` on
@@ -2514,6 +2551,10 @@ const StreamEnd = struct {
     shut_rd: bool = false,
     /// An op returned the reset's error (design 17.8, the two facts).
     reset_reported: bool = false,
+    /// `failStream` hit it (design 17.9): how, and whether an op has
+    /// returned its error. Kept after it dies, to drop late entries.
+    failed: ?StreamFailure = null,
+    fail_reported: bool = false,
     /// The op id of the send that was parked when the reset was received,
     /// if one was. Set with `reset_received`, profile-neutral; the send
     /// evaluation reads it at that op's harvest (design 17.8: a parked send
@@ -2529,11 +2570,9 @@ const StreamEnd = struct {
     }
 };
 
-/// Why bytes were discarded (design 17.7, conservation). Slice 2 reaches
-/// `abort` (nothing is held without faults, so it stays 0),
-/// `closed_receiver`, `unread_at_close`, `shut_receiver`, `both_discard`,
-/// `after_reset` and `listener_closed`; the `failed_*` causes are
-/// `failStream`'s (slice 3).
+/// Why bytes were discarded (design 17.7, conservation). `abort`: held
+/// data at its sender's abort; `failed_sender` and `failed_receiver`:
+/// `failStream`'s (held outbound, and unread or landing later).
 pub const Discard = enum(u8) { abort, failed_sender, failed_receiver, closed_receiver, unread_at_close, shut_receiver, both_discard, after_reset, listener_closed };
 
 /// One direction of a connection: data from side `d` to the other side,
@@ -2591,6 +2630,8 @@ const Conn = struct {
     syn_landed: bool = false,
     dirs: [2]StreamDir = .{ .{}, .{} },
     chunking: ChunkMode = .hashed,
+    /// Entries of each direction in `tcp_held` (design 17.9).
+    held: [2]u32 = .{ 0, 0 },
 };
 
 var conns: [max_conns]Conn = @splat(.{});
@@ -2615,7 +2656,18 @@ const TcpEntry = struct {
     bytes: []u8 = &.{},
     /// A credit's count: the receiver's `read + reclaimed` at departure.
     count: u64 = 0,
+    /// Its time after `wire_latency_ns`, fixed at its send: the chunk
+    /// spacing, a `.tcp` delay and its jitter. A release lands it this long
+    /// after `release + wire_latency_ns` (design 17.9a, point 6).
+    extra_ns: u64 = 0,
 };
+
+/// TCP entries a `.tcp` partition or silence holds, in (`conn_id`,
+/// direction, sequence) order (design 17.9). Not on the wire: they never
+/// make the clock stop.
+var tcp_held: std.ArrayList(TcpEntry) = .empty;
+/// Jitter draws of `.tcp` rules (`streamFaultDraws`).
+var stream_fault_draws: u64 = 0;
 
 /// TCP entries not yet landed, sorted by (due_at, conn_id, dir, seq):
 /// landing order. Apart from the datagram `wire` so that `landDue` stays
@@ -2636,6 +2688,12 @@ const StreamOutcome = enum(u8) {
     dropped_shut = 4,
     /// A credit for a terminal direction, or at a dead endpoint.
     dropped_stale = 5,
+    /// A held entry discarded: by an abort or `failStream` of its sender,
+    /// or a held SYN at its client's close (design 17.9a, point 10).
+    discarded_held = 6,
+    /// Landed at an endpoint `failStream` hit (design 17.8, line 1 of each
+    /// landing list).
+    dropped_failed = 7,
 };
 
 pub const StreamStats = struct {
@@ -2651,7 +2709,8 @@ pub const StreamStats = struct {
     /// Connections retired.
     retired: u64 = 0,
     /// Credits dropped: at departure or landing, for a direction that is
-    /// terminal, or at a dead endpoint (`stale_credit`).
+    /// terminal, or at a dead endpoint (`stale_credit`); and a credit owed
+    /// by an endpoint that `failStream` hit.
     stale_credit: u64 = 0,
     /// Local resets: data that landed after `.both` under `.linux`.
     local_resets: u64 = 0,
@@ -2659,6 +2718,21 @@ pub const StreamStats = struct {
     chunks_landed: u64 = 0,
     /// Credits that raised a sender's `credited`.
     credits_landed: u64 = 0,
+    /// Entries a `.tcp` partition or silence held at their send, and at
+    /// their landing; entries released when the last rule holding their
+    /// direction was cleared (design 17.9).
+    held_at_send: u64 = 0,
+    held_at_landing: u64 = 0,
+    released: u64 = 0,
+    /// Held credits replaced by a newer one of their direction.
+    credits_coalesced: u64 = 0,
+    /// Held entries discarded (`StreamOutcome.discarded_held`).
+    discarded_held: u64 = 0,
+    /// Entries a `.tcp` impairment gave a delay or a jitter above 0.
+    delayed: u64 = 0,
+    /// Entries that landed at an endpoint `failStream` hit, credits apart
+    /// (those are `stale_credit`).
+    dropped_failed: u64 = 0,
     /// Bytes discarded in this run, by cause: the sum over every direction,
     /// kept after a connection retires.
     discarded: [@typeInfo(Discard).@"enum".field_names.len]u64 = @splat(0),
@@ -2690,7 +2764,8 @@ fn resetStreams() void {
     for (conns) |k| {
         if (k.used) panic("sim: a connection outlived the last run", .{});
     }
-    if (tcp_wire.items.len != 0 or reservations.items.len != 0) panic("sim: TCP entries or reservations outlived the last run", .{});
+    if (tcp_wire.items.len != 0 or tcp_held.items.len != 0 or reservations.items.len != 0) panic("sim: TCP entries or reservations outlived the last run", .{});
+    stream_fault_draws = 0;
     stream_profile = null;
     stream_used = false;
     next_conn_id = 1;
@@ -2702,6 +2777,8 @@ fn resetStreams() void {
 
 fn freeStreams() void {
     for (tcp_wire.items) |w| net_alloc.free(w.bytes);
+    for (tcp_held.items) |w| net_alloc.free(w.bytes);
+    tcp_held.clearAndFree(net_alloc);
     for (&conns) |*k| {
         for (&k.ends) |*e| e.unread.deinit(net_alloc);
     }
@@ -2942,13 +3019,175 @@ fn sendTcp(ci: u16, from: Side, kind: TcpKind, to: Ip4) void {
 fn sendTcpAt(ci: u16, from: Side, kind: TcpKind, to: Ip4, extra_ns: u64, bytes: []u8, count: u64) void {
     const k = &conns[ci];
     const d = @backingInt(from);
-    const at = @max(tcpLandingAfter(extra_ns), k.last_due[d]);
-    k.last_due[d] = at;
-    const e: TcpEntry = .{ .due_at = at, .conn_id = k.id, .conn = ci, .dir = from, .seq = k.next_seq[d], .kind = kind, .to = to, .bytes = bytes, .count = count };
+    var e: TcpEntry = .{ .due_at = 0, .conn_id = k.id, .conn = ci, .dir = from, .seq = k.next_seq[d], .kind = kind, .to = to, .bytes = bytes, .count = count, .extra_ns = extra_ns };
     k.next_seq[d] += 1;
+    // A run that never set a `.tcp` rule takes none of this: its entries
+    // land exactly as before slice 3 (promise 1).
+    if (tcp_rule_set) {
+        const from_addr, const to_addr = tcpPath(k, from);
+        for (rules[0..rules_len]) |*r| {
+            if (r.key.protocol() == .tcp and r.key.matches(from_addr, to_addr)) countMatched(r);
+        }
+        if (dropRule(.impairment, .tcp, from_addr, to_addr)) |r| {
+            var add = r.imp.delay_ns;
+            if (r.imp.jitter_ns != 0) {
+                add += tcpJitterDraw(k.id, from, e.seq) % (r.imp.jitter_ns + 1);
+                stream_fault_draws += 1;
+            }
+            if (add > 0) {
+                e.extra_ns += add;
+                stream_stats.delayed += 1;
+                r.stats.delayed += 1;
+            }
+        }
+        if (k.held[d] > 0 or tcpBlocked(from_addr, to_addr)) {
+            stream_stats.held_at_send += 1;
+            holdTcp(e);
+            return;
+        }
+    }
+    putOnWire(e);
+}
+
+/// Puts `e` on the wire, due `wire_latency_ns + e.extra_ns` from now and no
+/// earlier than the entry before it in its direction. Capacity was reserved.
+fn putOnWire(entry: TcpEntry) void {
+    var e = entry;
+    const k = &conns[e.conn];
+    const d = @backingInt(e.dir);
+    e.due_at = @max(tcpLandingAfter(e.extra_ns), k.last_due[d]);
+    k.last_due[d] = e.due_at;
     var pos = tcp_wire.items.len;
     while (pos > 0 and tcpBefore(e, tcp_wire.items[pos - 1])) pos -= 1;
     tcp_wire.insertAssumeCapacity(pos, e);
+}
+
+/// The addresses an entry of direction `from` travels between, for the
+/// `.tcp` rules (design 17.9a, point 3): the sender's local address and its
+/// peer. A server side that no SYN made (`absent`: the RST that refuses a
+/// SYN) sends from the address the SYN went to.
+fn tcpPath(k: *const Conn, from: Side) struct { Ip4, Ip4 } {
+    const x = k.ends[@backingInt(from)];
+    const y = k.ends[@backingInt(otherSide(from))];
+    if (x.phase == .absent) return .{ y.peer, y.local };
+    return .{ x.local, x.peer };
+}
+
+/// Whether a `.tcp` partition or silence in force matches the path.
+fn tcpBlocked(from: Ip4, to: Ip4) bool {
+    return dropRule(.silence, .tcp, from, to) != null or dropRule(.partition, .tcp, from, to) != null;
+}
+
+/// The jitter draw of a `.tcp` rule: a keyed SipHash of (seed, conn_id,
+/// direction, sequence, "jitter"), with `chunkDraw`'s key: the run's seed
+/// in the key's first 8 bytes and zeros after; the message is those fields,
+/// little endian, then the 6 bytes "jitter". The jitter is this modulo
+/// `jitter_ns + 1`. It never touches the run's RNG.
+fn tcpJitterDraw(conn_id: u32, dir: Side, seq: u64) u64 {
+    var key: [16]u8 = @splat(0);
+    std.mem.writeInt(u64, key[0..8], current_seed, .little);
+    var m: [19]u8 = undefined;
+    std.mem.writeInt(u32, m[0..4], conn_id, .little);
+    m[4] = @backingInt(dir);
+    std.mem.writeInt(u64, m[5..13], seq, .little);
+    @memcpy(m[13..19], "jitter");
+    return std.hash.SipHash64(2, 4).toInt(&m, &key);
+}
+
+fn heldBefore(a: TcpEntry, b: TcpEntry) bool {
+    if (a.conn_id != b.conn_id) return a.conn_id < b.conn_id;
+    if (a.dir != b.dir) return @backingInt(a.dir) < @backingInt(b.dir);
+    return a.seq < b.seq;
+}
+
+/// Holds `e` (design 17.9 items 2 and 3). A credit replaces a credit its
+/// direction already holds: counts only grow, so the newer one carries the
+/// older's news. Capacity was reserved.
+fn holdTcp(e: TcpEntry) void {
+    const k = &conns[e.conn];
+    const d = @backingInt(e.dir);
+    if (e.kind == .credit) {
+        for (tcp_held.items, 0..) |h, i| {
+            if (h.conn == e.conn and h.dir == e.dir and h.kind == .credit) {
+                _ = tcp_held.orderedRemove(i);
+                k.held[d] -= 1;
+                stream_stats.credits_coalesced += 1;
+                break;
+            }
+        }
+    }
+    var pos = tcp_held.items.len;
+    while (pos > 0 and heldBefore(e, tcp_held.items[pos - 1])) pos -= 1;
+    tcp_held.insertAssumeCapacity(pos, e);
+    k.held[d] += 1;
+}
+
+/// Releases every held direction that no `.tcp` partition or silence
+/// matches any more, in (`conn_id`, direction) order (design 17.9 item 4).
+/// Each entry lands `wire_latency_ns + extra_ns` after now, behind the
+/// entry before it in its direction.
+fn releaseHeld() void {
+    var order: [max_conns]u16 = undefined;
+    var n: usize = 0;
+    for (conns, 0..) |k, ci| {
+        if (!k.used or k.held[0] + k.held[1] == 0) continue;
+        var pos = n;
+        while (pos > 0 and conns[order[pos - 1]].id > k.id) : (pos -= 1) order[pos] = order[pos - 1];
+        order[pos] = @intCast(ci);
+        n += 1;
+    }
+    for (order[0..n]) |ci| {
+        const k = &conns[ci];
+        for ([_]Side{ .client, .server }) |dir| {
+            const d = @backingInt(dir);
+            if (k.held[d] == 0) continue;
+            const from_addr, const to_addr = tcpPath(k, dir);
+            if (tcpBlocked(from_addr, to_addr)) continue;
+            _ = tcpLandingTime();
+            tcp_wire.ensureUnusedCapacity(net_alloc, k.held[d]) catch panic("sim: out of memory for a TCP wire entry", .{});
+            var i: usize = 0;
+            while (i < tcp_held.items.len) {
+                const h = tcp_held.items[i];
+                if (h.conn != ci or h.dir != dir) {
+                    i += 1;
+                    continue;
+                }
+                _ = tcp_held.orderedRemove(i);
+                putOnWire(h);
+                stream_stats.released += 1;
+            }
+            k.held[d] = 0;
+        }
+    }
+}
+
+/// Discards side `side`'s held data, FIN and credits: an abort (`cause`
+/// `.abort`) or `failStream` (`.failed_sender`) of that side (design 17.9
+/// item 7 and 17.9a point 9). Its held handshake entries stay.
+fn discardHeldOutbound(ci: u16, side: Side, cause: Discard) void {
+    const k = &conns[ci];
+    const d = @backingInt(side);
+    var i: usize = 0;
+    while (k.held[d] > 0 and i < tcp_held.items.len) {
+        const h = tcp_held.items[i];
+        if (h.conn != ci or h.dir != side or (h.kind != .data and h.kind != .fin and h.kind != .credit)) {
+            i += 1;
+            continue;
+        }
+        _ = tcp_held.orderedRemove(i);
+        k.held[d] -= 1;
+        if (h.kind == .data) discardBytes(&k.dirs[d], cause, h.bytes.len);
+        discardHeld(h);
+    }
+}
+
+/// Records a held entry discarded now, and frees it.
+fn discardHeld(entry: TcpEntry) void {
+    var e = entry;
+    e.due_at = clock_ns;
+    stream_stats.discarded_held += 1;
+    recordStream(e, .discarded_held);
+    net_alloc.free(e.bytes);
 }
 
 /// `tcpLandingTime` plus `extra_ns`, under the same named limit.
@@ -2970,8 +3209,11 @@ fn tcpLandingTime() u64 {
 /// has no error to return.
 fn reserveTcp(n: usize) void {
     _ = tcpLandingTime();
-    if (tcp_wire.items.len + n > max_tcp_entries) panic("sim: {d} TCP entries on the wire: the limit is max_tcp_entries, {d}", .{ tcp_wire.items.len + n, max_tcp_entries });
+    // Held entries count toward the limit (design 17.9 item 10). Room is
+    // made in both lists: a send goes to one or the other.
+    if (tcp_wire.items.len + tcp_held.items.len + n > max_tcp_entries) panic("sim: {d} TCP entries on the wire: the limit is max_tcp_entries, {d}", .{ tcp_wire.items.len + tcp_held.items.len + n, max_tcp_entries });
     tcp_wire.ensureUnusedCapacity(net_alloc, n) catch panic("sim: out of memory for a TCP wire entry", .{});
+    tcp_held.ensureUnusedCapacity(net_alloc, n) catch panic("sim: out of memory for a held TCP entry", .{});
 }
 
 fn wakeStream(slot: usize) void {
@@ -2992,11 +3234,11 @@ fn wakeSend(slot: usize) void {
     pushDueAt(p.c, .stream, p.id, clock_ns);
 }
 
-/// TCP entries on the wire, and credit departures owed (held entries join
-/// this count in slice 3). A test sleeps while it is not 0 before
-/// `sim.end`.
+/// TCP entries on the wire or held, and credit departures owed. A test
+/// sleeps while it is not 0 before `sim.end`, after it cleared the rules
+/// that hold entries (design 17.15 item 3).
 pub fn streamEntriesInFlight() usize {
-    var n = tcp_wire.items.len;
+    var n = tcp_wire.items.len + tcp_held.items.len;
     for (conns) |k| {
         if (!k.used) continue;
         for (k.dirs) |d| n += @intFromBool(d.owed_at != null);
@@ -3072,9 +3314,15 @@ pub fn streamConnect(fd: i32, to: Ip4, c: *anyopaque, id: u32) error{AddressInUs
 /// (`streamOpOnItsSocket`): ok if the SYN-ACK landed, `ConnectionRefused`
 /// if an RST did. A later landing in the same instant does not change
 /// that: it is the next call's to see.
-pub fn streamHarvestConnect(fd: i32) error{ConnectionRefused}!void {
+pub fn streamHarvestConnect(fd: i32) error{ ConnectionRefused, ConnectionResetByPeer, Timeout }!void {
     const s = streamSlot("a harvested connect", fd);
     const e = conns[s.conn].ends[@backingInt(s.side)];
+    // `failStream` in `C-syn` (17.9): `ConnectError` has no
+    // `ConnectionTimedOut`, so a timed-out death is `Timeout`.
+    if (e.failed) |how| return switch (how) {
+        .reset => error.ConnectionResetByPeer,
+        .timed_out => error.Timeout,
+    };
     return switch (e.phase) {
         .est => {},
         .c_failed => error.ConnectionRefused,
@@ -3139,7 +3387,14 @@ pub fn streamHarvestAccept(fd: i32, nonblocking: bool) Accepted {
 
 /// What a receive or a send evaluation gives: a count, an error, or "park".
 pub const StreamResult = union(enum) { n: usize, err: StreamError, park };
-pub const StreamError = error{ ConnectionResetByPeer, BrokenPipe };
+pub const StreamError = error{ ConnectionResetByPeer, ConnectionTimedOut, BrokenPipe };
+
+fn failError(how: StreamFailure) StreamError {
+    return switch (how) {
+        .reset => error.ConnectionResetByPeer,
+        .timed_out => error.ConnectionTimedOut,
+    };
+}
 
 fn endOf(s: *const StreamSock) *StreamEnd {
     return &conns[s.conn].ends[@backingInt(s.side)];
@@ -3156,11 +3411,11 @@ fn estSlot(comptime what: []const u8, fd: i32) *StreamSock {
 }
 
 /// Whether data direction `data` (from side `data`) has ended its window
-/// accounting: its sender is dead, or has received a reset (design 17.7;
-/// a failed sender joins this with `failStream`, slice 3).
+/// accounting: its sender is dead, failed, or has received a reset (design
+/// 17.7).
 fn dirTerminal(k: *const Conn, data: Side) bool {
     const x = k.ends[@backingInt(data)];
-    return x.phase == .dead or x.phase == .absent or x.reset_received;
+    return x.phase == .dead or x.phase == .absent or x.reset_received or x.failed != null;
 }
 
 /// Moves the unread bytes of side `side` to a discard cause.
@@ -3197,11 +3452,17 @@ fn copyOutUnread(e: *StreamEnd, bufs: anytype) usize {
     return n;
 }
 
-/// Design 17.8, the receive evaluation (lines 3 to 6; lines 1 and 2 are
-/// `failStream`'s, slice 3).
+/// Design 17.8, the receive evaluation.
 fn recvEval(s: *StreamSock, bufs: anytype) StreamResult {
     const ci = s.conn;
     const e = endOf(s);
+    // Lines 1 and 2: `failStream`. One op reports it; which one is the
+    // harvest order (17.9).
+    if (e.failed) |how| {
+        if (e.fail_reported) return .{ .n = 0 };
+        e.fail_reported = true;
+        return .{ .err = failError(how) };
+    }
     if (e.unreadLen() > 0) {
         const n = copyOutUnread(e, bufs);
         conns[ci].dirs[@backingInt(otherSide(s.side))].read += n;
@@ -3232,6 +3493,12 @@ fn recvEval(s: *StreamSock, bufs: anytype) StreamResult {
 fn sendEval(s: *StreamSock, bufs: anytype) StreamResult {
     const ci = s.conn;
     const e = endOf(s);
+    // Lines 1 and 2: `failStream`.
+    if (e.failed) |how| {
+        if (e.fail_reported) return .{ .err = error.BrokenPipe };
+        e.fail_reported = true;
+        return .{ .err = failError(how) };
+    }
     if (e.reset_received) {
         if (e.reset_reported) return .{ .err = error.BrokenPipe };
         // Line 3a: the send that was parked when the reset arrived, at its
@@ -3482,7 +3749,7 @@ pub fn streamShutdown(fd: i32, how: ShutdownHow) error{SocketUnconnected}!void {
     const ci = s.conn;
     const e = endOf(s);
     // Line 2, before line 3 (rows 37, 38 and 39w). `.both` stops here too.
-    if (e.reset_received) return error.SocketUnconnected;
+    if (e.reset_received or e.failed != null) return error.SocketUnconnected;
     const shut_rd = how == .both and !e.shut_rd;
     const discards = shut_rd and e.unreadLen() > 0;
     // Before anything moves: the profile, and room on the wire.
@@ -3516,7 +3783,7 @@ pub fn streamPeer(fd: i32) ?Ip4 {
     const s = streamSlot("getpeername", fd);
     if (s.kind != .endpoint) return null;
     const e = endOf(s);
-    if (e.phase != .est or e.reset_received) return null;
+    if (e.phase != .est or e.reset_received or e.failed != null) return null;
     return e.peer;
 }
 
@@ -3617,6 +3884,76 @@ pub fn isStreamOp(c: *anyopaque, id: u32) bool {
 
 /// `close` of a stream socket (design 17.6 and 17.8). Wakes an op waiting
 /// on it: its harvest ends it `FileDescriptorNotASocket` (the generation).
+/// How `failStream` kills an endpoint's transport.
+pub const StreamFailure = enum(u8) { reset = 1, timed_out = 2 };
+
+/// A local transport death of the endpoint behind `fd`, at the virtual time
+/// of the call: the host on the other side vanished, or the kernel gave up
+/// (design 17.9). Nothing goes on the wire, and the peer is not told.
+/// - In `C-syn`: the parked connect (if any) fails now,
+///   `ConnectionResetByPeer` for `.reset` and `Timeout` for `.timed_out`
+///   (`ConnectError` has no `ConnectionTimedOut`); the endpoint is
+///   `C-failed`, and a SYN-ACK that lands later gets no answer.
+/// - In `est`: a parked receive and a parked send are woken now. The first
+///   one harvested (the seed's harvest order) gets `ConnectionResetByPeer`
+///   or `ConnectionTimedOut`; after that, receives give 0 and sends
+///   `BrokenPipe`. Its held data, FIN and credits are discarded
+///   (`failed_sender`), its unread bytes too (`failed_receiver`), and a
+///   credit it owed never leaves (`stale_credit`). Its entries already on
+///   the wire still land at the peer. Entries that land on it later are
+///   dropped, with no answer. `shutdown` gives `SocketUnconnected`, and a
+///   close puts nothing on the wire.
+/// Refused: an fd that is not a connection's endpoint; any other phase; an
+/// endpoint that already failed, or that received a reset (its transport is
+/// already over).
+pub fn failStream(fd: i32, how: StreamFailure) void {
+    if (comptime !compiled_in) unreachable;
+    refuseOtherThread("sim.failStream");
+    if (!begun) panic("sim: failStream outside a sim run", .{});
+    const s = streamSlot("failStream", fd);
+    if (s.kind != .endpoint) panic("sim: failStream on sim fd {d}, a {s}: only a connection's endpoint can fail", .{ fd, kindName(s.kind) });
+    const ci = s.conn;
+    const e = endOf(s);
+    if (e.failed != null) panic("sim: failStream on sim fd {d}, which already failed", .{fd});
+    if (e.reset_received) panic("sim: failStream on sim fd {d}, which has received a reset: its transport is already over", .{fd});
+    const j = sockIndex(fd);
+    switch (e.phase) {
+        .c_syn => {
+            e.phase = .c_failed;
+            e.failed = how;
+            wakeStream(j);
+        },
+        .est => {
+            e.failed = how;
+            discardHeldOutbound(ci, s.side, .failed_sender);
+            const din = &conns[ci].dirs[@backingInt(otherSide(s.side))];
+            if (din.owed_at != null) {
+                din.owed_at = null;
+                stream_stats.stale_credit += 1;
+            }
+            _ = discardUnread(ci, s.side, .failed_receiver);
+            wakeRecv(j);
+            wakeSend(j);
+        },
+        else => panic("sim: failStream on sim fd {d}, whose connection is in phase {t}: only C-syn and est are simulated", .{ fd, e.phase }),
+    }
+}
+
+/// A client's SYN that is still held, discarded at its close (design 17.9
+/// item 9): it never makes server state, and the connection can retire.
+fn discardHeldSyn(ci: u16) void {
+    const k = &conns[ci];
+    if (k.held[@backingInt(Side.client)] == 0) return;
+    for (tcp_held.items, 0..) |h, i| {
+        if (h.conn != ci or h.dir != .client or h.kind != .syn) continue;
+        _ = tcp_held.orderedRemove(i);
+        k.held[@backingInt(Side.client)] -= 1;
+        stream_stats.syn_dropped_dead += 1;
+        discardHeld(h);
+        return;
+    }
+}
+
 pub fn streamClose(fd: i32) void {
     refuseOtherThread("sim socket close");
     const s = streamSlot("close", fd);
@@ -3655,21 +3992,23 @@ fn closeListener(j: usize) void {
 fn closeEndpoint(ci: u16, side: Side, reuse: bool, linger0: bool) void {
     const e = &conns[ci].ends[@backingInt(side)];
     switch (e.phase) {
-        // The SYN is dropped at its landing if it has not landed; if it
-        // has, the SYN-ACK is answered with an RST at its landing.
-        .c_syn, .c_failed => {},
+        // The SYN is dropped at its landing if it is on the wire, and
+        // discarded now if it is held (design 17.9 item 9); if it landed,
+        // the SYN-ACK is answered with an RST at its landing.
+        .c_syn, .c_failed => discardHeldSyn(ci),
         .est => {
-            // Line 2: after a reset nothing goes on the wire; an endpoint
-            // sends at most one RST in its life.
-            const quiet = e.reset_received or e.rst_sent;
+            // Line 2: after a reset or a failure nothing goes on the wire;
+            // an endpoint sends at most one RST in its life.
+            const quiet = e.reset_received or e.rst_sent or e.failed != null;
             const rst = !quiet and (e.unreadLen() > 0 or linger0);
             const fin = !quiet and !rst and !e.fin_out;
             if (rst or fin) reserveTcp(1);
             // Line 1, always (review 3, finding 6).
             _ = discardUnread(ci, side, .unread_at_close);
             if (rst) {
-                // Line 3. Nothing is held without faults, so `abort` has
-                // nothing to discard here (slice 3 holds entries).
+                // Line 3: its held data, FIN and credits go first, so its
+                // RST is not held behind them.
+                discardHeldOutbound(ci, side, .abort);
                 e.rst_sent = true;
                 sendTcp(ci, side, .rst, e.peer);
             } else if (fin) {
@@ -3695,6 +4034,7 @@ fn maybeRetire(ci: usize) void {
     for (tcp_wire.items) |w| {
         if (w.conn == ci) return;
     }
+    if (k.held[0] + k.held[1] != 0) return;
     for (k.dirs) |d| {
         if (d.owed_at != null) return;
     }
@@ -3720,8 +4060,32 @@ fn listenerAt(to: Ip4) ?usize {
 /// is not in this pass.
 fn landStreamDue() void {
     while (tcp_wire.items.len > 0 and tcp_wire.items[0].due_at <= clock_ns) {
-        landStream(tcp_wire.orderedRemove(0));
+        const e = tcp_wire.orderedRemove(0);
+        if (tcp_rule_set and holdAtLanding(e)) continue;
+        landStream(e);
     }
+}
+
+/// Holds `e` at its landing if a `.tcp` partition or silence matches it
+/// now, or its direction already holds an entry (design 17.9 items 1, 2
+/// and 6). A drop rule that matches it now was set after its send (one in
+/// force then would have held it), so it counts as matched here.
+fn holdAtLanding(e: TcpEntry) bool {
+    const k = &conns[e.conn];
+    if (!k.used or k.id != e.conn_id) panic("sim: a TCP entry of connection {d} landed after the connection retired (the guard that cannot fire by construction)", .{e.conn_id});
+    const from_addr, const to_addr = tcpPath(k, e.dir);
+    var matched = false;
+    for (rules[0..rules_len]) |*r| {
+        if (r.key != .impairment and r.key.protocol() == .tcp and r.key.matches(from_addr, to_addr)) {
+            countMatched(r);
+            matched = true;
+        }
+    }
+    if (!matched and k.held[@backingInt(e.dir)] == 0) return false;
+    tcp_held.ensureUnusedCapacity(net_alloc, 1) catch panic("sim: out of memory for a held TCP entry", .{});
+    stream_stats.held_at_landing += 1;
+    holdTcp(e);
+    return true;
 }
 
 fn landStream(e: TcpEntry) void {
@@ -3742,6 +4106,8 @@ fn landStream(e: TcpEntry) void {
         .dropped_dead_client => stream_stats.syn_dropped_dead += 1,
         .dropped_dead => stream_stats.dropped_dead += 1,
         .dropped_reset => stream_stats.dropped_after_reset += 1,
+        .dropped_failed => stream_stats.dropped_failed += 1,
+        .discarded_held => unreachable,
     }
     recordStream(e, outcome);
     net_alloc.free(e.bytes);
@@ -3795,6 +4161,8 @@ fn landSyn(e: TcpEntry) StreamOutcome {
 /// A SYN-ACK lands at the client endpoint (design 17.6).
 fn landSynAck(ci: u16) StreamOutcome {
     const cl = &conns[ci].ends[@backingInt(Side.client)];
+    // Line 1: a failed client answers nothing, closed or not (17.6).
+    if (cl.failed != null) return .dropped_failed;
     switch (cl.phase) {
         .dead => {
             if (!cl.rst_sent) {
@@ -3836,6 +4204,7 @@ fn landAck(ci: u16) StreamOutcome {
 /// A FIN lands at side `at` (design 17.8).
 fn landFin(ci: u16, at: Side) StreamOutcome {
     const x = &conns[ci].ends[@backingInt(at)];
+    if (x.failed != null) return .dropped_failed;
     switch (x.phase) {
         .dead => return .dropped_dead,
         .s_queued, .est => {
@@ -3852,6 +4221,7 @@ fn landFin(ci: u16, at: Side) StreamOutcome {
 /// finding 2).
 fn landRst(ci: u16, at: Side) StreamOutcome {
     const x = &conns[ci].ends[@backingInt(at)];
+    if (x.failed != null) return .dropped_failed;
     if (x.reset_received) return .dropped_reset;
     switch (x.phase) {
         .dead => return .dropped_dead,
@@ -3868,6 +4238,7 @@ fn landRst(ci: u16, at: Side) StreamOutcome {
             // reads the profile. Unread bytes stay, and are read first.
             x.reset_received = true;
             x.fin_before_reset = x.fin_in;
+            discardHeldOutbound(ci, at, .abort);
             if (x.phase == .est) {
                 x.reset_parked_send = if (streams[x.slot].parked_send) |p| p.id else null;
                 wakeRecv(x.slot);
@@ -3888,14 +4259,17 @@ fn answerRst(ci: u16, at: Side) void {
     sendTcp(ci, at, .rst, x.peer);
 }
 
-/// A data chunk lands (design 17.8, the data landing list; line 1 is
-/// `failStream`'s, slice 3).
+/// A data chunk lands (design 17.8, the data landing list).
 fn landData(e: TcpEntry) StreamOutcome {
     const k = &conns[e.conn];
     const at = otherSide(e.dir);
     const x = &k.ends[@backingInt(at)];
     const d = &k.dirs[@backingInt(e.dir)];
     const n = e.bytes.len;
+    if (x.failed != null) {
+        discardBytes(d, .failed_receiver, n);
+        return .dropped_failed;
+    }
     if (x.reset_received) {
         discardBytes(d, .after_reset, n);
         return .dropped_reset;
@@ -3919,6 +4293,7 @@ fn landData(e: TcpEntry) StreamOutcome {
             x.reset_received = true;
             x.fin_before_reset = false;
             x.reset_parked_send = if (streams[x.slot].parked_send) |ps| ps.id else null;
+            discardHeldOutbound(e.conn, at, .abort);
             stream_stats.local_resets += 1;
             wakeRecv(x.slot);
             wakeSend(x.slot);
@@ -3969,11 +4344,13 @@ pub const TestStreamEnd = struct {
     shut_rd: bool,
     reset_reported: bool,
     unread: usize,
+    failed: ?StreamFailure,
+    fail_reported: bool,
 };
 
 fn endView(ci: usize, side: Side) TestStreamEnd {
     const e = conns[ci].ends[@backingInt(side)];
-    return .{ .conn_id = conns[ci].id, .phase = e.phase, .fin_in = e.fin_in, .fin_out = e.fin_out, .rst_sent = e.rst_sent, .reset_received = e.reset_received, .fin_before_reset = e.fin_before_reset, .local = e.local, .peer = e.peer, .shut_rd = e.shut_rd, .reset_reported = e.reset_reported, .unread = e.unreadLen() };
+    return .{ .conn_id = conns[ci].id, .phase = e.phase, .fin_in = e.fin_in, .fin_out = e.fin_out, .rst_sent = e.rst_sent, .reset_received = e.reset_received, .fin_before_reset = e.fin_before_reset, .local = e.local, .peer = e.peer, .shut_rd = e.shut_rd, .reset_reported = e.reset_reported, .unread = e.unreadLen(), .failed = e.failed, .fail_reported = e.fail_reported };
 }
 
 /// The endpoint behind stream socket `fd`, which must be an endpoint's
@@ -4006,6 +4383,10 @@ pub const TestStreamDir = struct {
     reclaimed: u64,
     discarded: [@typeInfo(Discard).@"enum".field_names.len]u64,
     in_flight: u64,
+    /// Data bytes held by a `.tcp` partition or silence, and the entries of
+    /// every kind this direction holds (design 17.9).
+    held: u64,
+    held_entries: u32,
     unread: u64,
     data_send_index: u64,
     owed: bool,
@@ -4016,10 +4397,10 @@ pub const TestStreamDir = struct {
         return n;
     }
 
-    /// `admitted = in_flight + unread + read + discarded` (nothing is held
-    /// without faults).
+    /// `admitted = in_flight + held + unread + read + discarded` (design
+    /// 17.7).
     pub fn conserved(d: TestStreamDir) bool {
-        return d.admitted == d.in_flight + d.unread + d.read + d.discardedTotal();
+        return d.admitted == d.in_flight + d.held + d.unread + d.read + d.discardedTotal();
     }
 };
 
@@ -4035,9 +4416,21 @@ pub fn testStreamDir(conn_id: u32, from_client: bool) ?TestStreamDir {
         for (tcp_wire.items) |w| {
             if (w.conn == ci and w.kind == .data and w.dir == side) in_flight += w.bytes.len;
         }
-        return .{ .window = d.window, .admitted = d.admitted, .credited = d.credited, .read = d.read, .reclaimed = d.reclaimed, .discarded = d.discarded, .in_flight = in_flight, .unread = k.ends[@backingInt(otherSide(side))].unreadLen(), .data_send_index = d.data_send_index, .owed = d.owed_at != null };
+        var held: u64 = 0;
+        for (tcp_held.items) |w| {
+            if (w.conn == ci and w.kind == .data and w.dir == side) held += w.bytes.len;
+        }
+        return .{ .window = d.window, .admitted = d.admitted, .credited = d.credited, .read = d.read, .reclaimed = d.reclaimed, .discarded = d.discarded, .in_flight = in_flight, .held = held, .held_entries = k.held[@backingInt(side)], .unread = k.ends[@backingInt(otherSide(side))].unreadLen(), .data_send_index = d.data_send_index, .owed = d.owed_at != null };
     }
     return null;
+}
+
+/// The landing times of the TCP entries on the wire, in landing order.
+pub fn testTcpWireDues(out: []u64) usize {
+    if (comptime !builtin.is_test) @compileError("testTcpWireDues is for tests");
+    if (tcp_wire.items.len > out.len) panic("sim: testTcpWireDues: {d} entries on the wire, room for {d}", .{ tcp_wire.items.len, out.len });
+    for (tcp_wire.items, 0..) |w, i| out[i] = w.due_at;
+    return tcp_wire.items.len;
 }
 
 /// Moves the next `conn_id` of this run, to reach its limit in a test.
@@ -4093,7 +4486,7 @@ fn streamTeardownCheck() void {
         for (tcp_wire.items) |w| {
             if (w.conn_id == k.id) on_wire += 1;
         }
-        std.debug.print("sim: stream teardown: connection {d} is not retired: client {t}, server {t}, {d} entries on the wire, credits owed {}/{}\n", .{ k.id, k.ends[0].phase, k.ends[1].phase, on_wire, k.dirs[0].owed_at != null, k.dirs[1].owed_at != null });
+        std.debug.print("sim: stream teardown: connection {d} is not retired: client {t}, server {t}, {d} entries on the wire, {d} held, credits owed {}/{}\n", .{ k.id, k.ends[0].phase, k.ends[1].phase, on_wire, k.held[0] + k.held[1], k.dirs[0].owed_at != null, k.dirs[1].owed_at != null });
     }
     if (reservations.items.len != 0) {
         std.debug.print("sim: stream teardown: {d} TIME_WAIT reservations, expected, freed\n", .{reservations.items.len});
@@ -4200,6 +4593,8 @@ fn digestStreams(h: *std.hash.Wyhash) void {
                 std.mem.writeInt(u32, &g, id, .little);
                 h.update(&g);
             }
+            // The same for a failure (slice 3).
+            if (x.failed) |how| h.update(&.{ @backingInt(how), @intFromBool(x.fail_reported) });
             std.mem.writeInt(u64, &b, x.unreadLen(), .little);
             h.update(&b);
             h.update(x.unread.items[x.unread_head..]);
@@ -4226,6 +4621,43 @@ fn digestStreams(h: *std.hash.Wyhash) void {
     }
     std.mem.writeInt(u64, &b, stream_stats.retired, .little);
     h.update(&b);
+    // Slice 3, only for a run that set a `.tcp` rule (a run without one
+    // keeps its digests): every held entry, each one's extra time, the
+    // held counts per direction, the draws and the fault counts.
+    if (tcp_rule_set) {
+        for (tcp_held.items) |w| {
+            var e: [40]u8 = undefined;
+            std.mem.writeInt(u32, e[0..4], w.conn_id, .little);
+            e[4] = @backingInt(w.dir);
+            e[5] = @backingInt(w.kind);
+            std.mem.writeInt(u64, e[6..14], w.seq, .little);
+            std.mem.writeInt(u64, e[14..22], w.extra_ns, .little);
+            std.mem.writeInt(u64, e[22..30], w.count, .little);
+            std.mem.writeInt(u32, e[30..34], @intCast(w.bytes.len), .little);
+            @memcpy(e[34..38], &w.to.ip);
+            std.mem.writeInt(u16, e[38..40], w.to.port, .little);
+            h.update(&e);
+            h.update(w.bytes);
+        }
+        for (tcp_wire.items) |w| {
+            std.mem.writeInt(u64, &b, w.extra_ns, .little);
+            h.update(&b);
+        }
+        for (conns) |k| {
+            if (!k.used) continue;
+            std.mem.writeInt(u64, &b, (@as(u64, k.held[0]) << 32) | k.held[1], .little);
+            h.update(&b);
+        }
+        for ([_]u64{ stream_fault_draws, stream_stats.held_at_send, stream_stats.held_at_landing, stream_stats.released, stream_stats.credits_coalesced, stream_stats.discarded_held, stream_stats.delayed, stream_stats.dropped_failed }) |v| {
+            std.mem.writeInt(u64, &b, v, .little);
+            h.update(&b);
+        }
+    }
+}
+
+/// Jitter draws of `.tcp` rules in this run (design 17.9a, point 4).
+pub fn streamFaultDraws() u64 {
+    return stream_fault_draws;
 }
 
 // ---- Datagram faults (phase 2 of the sim network) ----
@@ -4234,6 +4666,10 @@ fn digestStreams(h: *std.hash.Wyhash) void {
 // that task runs; they act on datagrams sent (and landing) from then on.
 // `begin` starts a run with no rule. Every call is on the sim thread, during
 // a run. The sender of a faulted datagram succeeds, as a kernel's does.
+// This block is about rules whose endpoints say `.protocol = .udp` (the
+// default): only those act on datagrams, and "a run that set a rule" below
+// means a `.udp` rule. A `.tcp` rule acts on stream sockets instead (the
+// faults paragraph of the comment above `StreamProfile`).
 //
 // Rules, of three kinds:
 // - An impairment (`setImpairment`) on a `Path`: loss, burst loss, delay,
@@ -4307,6 +4743,9 @@ fn digestStreams(h: *std.hash.Wyhash) void {
 pub const Endpoint = struct {
     ip: ?[4]u8 = null,
     port: ?u16 = null,
+    /// What the rule acts on: datagrams (`.udp`) or a stream's TCP entries
+    /// (`.tcp`). A path's two endpoints name one protocol.
+    protocol: Protocol = .udp,
 
     fn matches(e: Endpoint, a: Ip4) bool {
         if (e.ip) |ip| {
@@ -4318,6 +4757,8 @@ pub const Endpoint = struct {
         return true;
     }
 };
+
+pub const Protocol = enum(u8) { udp = 1, tcp = 2 };
 
 /// One direction: datagrams from `from` to `to`. `.{}` matches every
 /// datagram.
@@ -4406,6 +4847,13 @@ const RuleKey = union(RuleKind) {
             .silence => |e| e.matches(from) or e.matches(to),
         };
     }
+
+    fn protocol(k: RuleKey) Protocol {
+        return switch (k) {
+            .impairment, .partition => |p| p.from.protocol,
+            .silence => |e| e.protocol,
+        };
+    }
 };
 
 const Rule = struct {
@@ -4428,6 +4876,10 @@ var rules_len: usize = 0;
 const HistoryEntry = struct { key: RuleKey, matched: u64, first_set_ns: u64 };
 var rule_history: [max_rule_history]HistoryEntry = undefined;
 var rule_history_len: usize = 0;
+/// Whether this run ever set a `.udp` rule (its datagrams take the fault
+/// path from then on), or a `.tcp` one (its TCP entries do).
+var udp_rule_set: bool = false;
+var tcp_rule_set: bool = false;
 
 var fault_stats: NetFaultStats = .{};
 var fault_draws: u64 = 0;
@@ -4481,12 +4933,13 @@ fn countMatched(r: *Rule) void {
     rule_history[r.hist].matched += 1;
 }
 
-/// The most recent drop rule of `kind` in force that matches the flow.
-fn dropRule(kind: RuleKind, from: Ip4, to: Ip4) ?*Rule {
+/// The most recent rule of `kind` and `proto` in force that matches the
+/// flow.
+fn dropRule(kind: RuleKind, proto: Protocol, from: Ip4, to: Ip4) ?*Rule {
     var i = rules_len;
     while (i > 0) {
         i -= 1;
-        if (rules[i].key == kind and rules[i].key.matches(from, to)) return &rules[i];
+        if (rules[i].key == kind and rules[i].key.protocol() == proto and rules[i].key.matches(from, to)) return &rules[i];
     }
     return null;
 }
@@ -4515,7 +4968,7 @@ fn flowLatest(from: Ip4, to: Ip4) ?u64 {
 /// delayed by a rule may still be on the wire).
 fn faultAtSend(send_no: u64, from: Ip4, to: Ip4) SendFate {
     if (faultDrop(send_no, from, to)) |outcome| return .{ .dropped = outcome };
-    const r = dropRule(.impairment, from, to);
+    const r = dropRule(.impairment, .udp, from, to);
     const imp: Impairment = if (r) |x| x.imp else .{};
     const base = clock_ns + wire_latency_ns;
     var fate: SendFate = .{ .sent = .{ .copies = 1, .due = .{ base, base } } };
@@ -4550,19 +5003,19 @@ fn faultAtSend(send_no: u64, from: Ip4, to: Ip4) SendFate {
 /// The drop decisions at a datagram's send. Null: it goes on the wire.
 fn faultDrop(send_no: u64, from: Ip4, to: Ip4) ?LandOutcome {
     for (rules[0..rules_len]) |*r| {
-        if (r.key.matches(from, to)) countMatched(r);
+        if (r.key.protocol() == .udp and r.key.matches(from, to)) countMatched(r);
     }
-    if (dropRule(.silence, from, to)) |r| {
+    if (dropRule(.silence, .udp, from, to)) |r| {
         r.stats.dropped += 1;
         fault_stats.silenced_at_send += 1;
         return .silenced;
     }
-    if (dropRule(.partition, from, to)) |r| {
+    if (dropRule(.partition, .udp, from, to)) |r| {
         r.stats.dropped += 1;
         fault_stats.partitioned_at_send += 1;
         return .partitioned;
     }
-    const r = dropRule(.impairment, from, to) orelse return null;
+    const r = dropRule(.impairment, .udp, from, to) orelse return null;
     if (r.imp.burst) |b| {
         if (r.bad) {
             if (happens(b.leave_ppm, send_no, .burst)) r.bad = false;
@@ -4588,14 +5041,14 @@ fn faultDrop(send_no: u64, from: Ip4, to: Ip4) ?LandOutcome {
 /// counting it as matched here counts no datagram twice for one rule.
 fn faultInFlight(from: Ip4, to: Ip4) ?LandOutcome {
     for (rules[0..rules_len]) |*r| {
-        if (r.key != .impairment and r.key.matches(from, to)) countMatched(r);
+        if (r.key != .impairment and r.key.protocol() == .udp and r.key.matches(from, to)) countMatched(r);
     }
-    if (dropRule(.silence, from, to)) |r| {
+    if (dropRule(.silence, .udp, from, to)) |r| {
         r.stats.dropped += 1;
         fault_stats.silenced_in_flight += 1;
         return .silenced_in_flight;
     }
-    if (dropRule(.partition, from, to)) |r| {
+    if (dropRule(.partition, .udp, from, to)) |r| {
         r.stats.dropped += 1;
         fault_stats.partitioned_in_flight += 1;
         return .partitioned_in_flight;
@@ -4620,6 +5073,7 @@ fn checkEndpoint(comptime what: []const u8, e: Endpoint) void {
 fn checkPath(comptime what: []const u8, p: Path) void {
     checkEndpoint(what, p.from);
     checkEndpoint(what, p.to);
+    if (p.from.protocol != p.to.protocol) panic("sim: " ++ what ++ ": a path from a {t} endpoint to a {t} one: both ends name one protocol", .{ p.from.protocol, p.to.protocol });
 }
 
 fn checkPpm(comptime what: []const u8, comptime field: []const u8, ppm: u32) void {
@@ -4652,6 +5106,10 @@ fn addRule(comptime what: []const u8, key: RuleKey, imp: Impairment) void {
     };
     rules[rules_len] = .{ .key = key, .imp = imp, .hist = hist };
     rules_len += 1;
+    switch (key.protocol()) {
+        .udp => udp_rule_set = true,
+        .tcp => tcp_rule_set = true,
+    }
 }
 
 /// Sets the impairment of `path`, replacing one already there (its burst
@@ -4671,6 +5129,14 @@ pub fn setImpairment(path: Path, imp: Impairment) void {
         panic("sim: setImpairment: delay_ns {d} plus jitter_ns {d} is over {d} ns", .{ imp.delay_ns, imp.jitter_ns, max_fault_delay_ns });
     }
     if (std.meta.eql(imp, Impairment{})) panic("sim: setImpairment with every field at its default: clearImpairment removes an impairment", .{});
+    if (path.from.protocol == .tcp) {
+        // Design 17.9: TCP does not lose, copy or reorder; a partition or
+        // silence holds entries instead.
+        if (imp.loss_ppm != 0) panic("sim: setImpairment: loss_ppm on a .tcp path is refused: a stream loses nothing (a partition or silence holds entries)", .{});
+        if (imp.burst != null) panic("sim: setImpairment: burst on a .tcp path is refused: a stream loses nothing (a partition or silence holds entries)", .{});
+        if (imp.dup_ppm != 0) panic("sim: setImpairment: dup_ppm on a .tcp path is refused: a stream delivers each byte once", .{});
+        if (imp.reorder) panic("sim: setImpairment: reorder on a .tcp path is refused: a stream delivers in order", .{});
+    }
     if (findRule(.{ .impairment = path })) |i| _ = removeRule(i);
     addRule("setImpairment", .{ .impairment = path }, imp);
 }
@@ -4693,7 +5159,9 @@ pub fn setPartition(path: Path) void {
 pub fn healPartition(path: Path) RuleStats {
     faultCall("healPartition");
     const i = findRule(.{ .partition = path }) orelse panic("sim: healPartition of a path that is not partitioned", .{});
-    return removeRule(i);
+    const st = removeRule(i);
+    if (path.from.protocol == .tcp) releaseHeld();
+    return st;
 }
 
 /// Drops every datagram from or to `ep`, at send and in flight.
@@ -4707,12 +5175,15 @@ pub fn silence(ep: Endpoint) void {
 pub fn unsilence(ep: Endpoint) RuleStats {
     faultCall("unsilence");
     const i = findRule(.{ .silence = ep }) orelse panic("sim: unsilence of an endpoint that is not silenced", .{});
-    return removeRule(i);
+    const st = removeRule(i);
+    if (ep.protocol == .tcp) releaseHeld();
+    return st;
 }
 
 fn writeEndpoint(w: *std.Io.Writer, e: Endpoint) !void {
     if (e.ip) |ip| try w.print("{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) else try w.writeByte('*');
     if (e.port) |p| try w.print(":{d}", .{p}) else try w.writeAll(":*");
+    if (e.protocol == .tcp) try w.writeAll("/tcp");
 }
 
 /// Panics, naming each one, unless every fault rule set in this run matched
@@ -4753,7 +5224,9 @@ fn describeRule(w: *std.Io.Writer, h: HistoryEntry, first: bool) !void {
 
 fn hashEndpoint(h: *std.hash.Wyhash, e: Endpoint) void {
     var b: [7]u8 = @splat(0);
-    b[0] = @as(u8, @intFromBool(e.ip != null)) | (@as(u8, @intFromBool(e.port != null)) << 1);
+    // The protocol's bit is set only for `.tcp`, so a `.udp` rule's record
+    // is what it was before slice 3 (design 17.9a, point 2).
+    b[0] = @as(u8, @intFromBool(e.ip != null)) | (@as(u8, @intFromBool(e.port != null)) << 1) | (@as(u8, @intFromBool(e.protocol == .tcp)) << 2);
     if (e.ip) |ip| @memcpy(b[1..5], &ip);
     if (e.port) |p| std.mem.writeInt(u16, b[5..7], p, .little);
     h.update(&b);
@@ -9864,6 +10337,7 @@ test {
     _ = @import("sim_op_model_test.zig");
     _ = @import("sim_stream_test.zig");
     _ = @import("sim_stream_bytes_test.zig");
+    _ = @import("sim_stream_fault_test.zig");
     _ = @import("sim_stream_op_model_test.zig");
 }
 

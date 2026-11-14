@@ -1230,7 +1230,7 @@ test "sim: stream parity: the other kernel's column in a sim run (row 12 under .
 
 /// The last slice of design 17.16 that is built. A row of a later slice is
 /// pending: it has no check, so it cannot pass.
-const built_slice = 2;
+const built_slice = 3;
 
 const Status = union(enum) {
     /// Built: `check` exercises it (a scenario, or a refusal's child).
@@ -1251,8 +1251,13 @@ fn built2(comptime check: fn () anyerror!void) Status {
     return .{ .built = .{ .slice = 2, .check = check } };
 }
 
-/// Slice 2's checks live beside its tests.
+fn built3(comptime check: fn () anyerror!void) Status {
+    return .{ .built = .{ .slice = 3, .check = check } };
+}
+
+/// Slice 2's and 3's checks live beside their tests.
 const c2 = @import("sim_stream_bytes_test.zig").chk2;
+const c3 = @import("sim_stream_fault_test.zig").chk3;
 
 fn scenario(comptime profile: ?sim.StreamProfile, comptime body: fn () anyerror!void) fn () anyerror!void {
     return struct {
@@ -1536,7 +1541,7 @@ const rule_rows = [_]RuleRow{
     .{ .id = .syn_listener_room, .name = "17.6 SYN 2: listener with room: S-prov, SYN-ACK (exact address, then 0.0.0.0)", .status = built(chk.other_lo) },
     .{ .id = .syn_listener_full, .name = "17.6 SYN 3: full listener: panic", .status = built(chk.backlog) },
     .{ .id = .syn_no_listener, .name = "17.6 SYN 4: no listener: RST, server absent", .status = built(chk.refused_) },
-    .{ .id = .synack_failed_client, .name = "17.6 SYN-ACK 1: failed client (failStream)", .status = .{ .pending = 3 } },
+    .{ .id = .synack_failed_client, .name = "17.6 SYN-ACK 1: failed client (failStream)", .status = built3(c3.synackFailedClient) },
     .{ .id = .synack_dead_client, .name = "17.6 SYN-ACK 2: dead client: RST back", .status = built(chk.cancel_after) },
     .{ .id = .synack_c_syn, .name = "17.6 SYN-ACK 3: C-syn: est, connect ok, ACK", .status = built(chk.handshake_) },
     .{ .id = .ack_dead_server, .name = "17.6 ACK 1: dead server endpoint: dropped", .status = built(chk.port_reuse_) },
@@ -1591,9 +1596,9 @@ const rule_rows = [_]RuleRow{
     .{ .id = .credit_landing, .name = "17.8 credit landing 1 and 2", .status = built2(c2.credit_) },
     .{ .id = .getpeername_bytes_readable, .name = "17.4 getpeername and bytesReadable (FIONREAD)", .status = built2(c2.peerAndReadable) },
     .{ .id = .window_chunking_settings, .name = "17.7 setStreamWindow and setStreamChunking", .status = built2(c2.settings) },
-    .{ .id = .tcp_rules, .name = "17.9 .tcp rules: delay, jitter, holding", .status = .{ .pending = 3 } },
-    .{ .id = .fail_stream, .name = "17.9 failStream", .status = .{ .pending = 3 } },
-    .{ .id = .connect_no_answer, .name = "17.9 the connect with no answer (a held SYN past its deadline)", .status = .{ .pending = 3 } },
+    .{ .id = .tcp_rules, .name = "17.9 .tcp rules: delay, jitter, holding", .status = built3(c3.tcpRules) },
+    .{ .id = .fail_stream, .name = "17.9 failStream", .status = built3(c3.failStream) },
+    .{ .id = .connect_no_answer, .name = "17.9 the connect with no answer (a held SYN past its deadline)", .status = built3(c3.connectNoAnswer) },
     .{ .id = .slice4_users, .name = "17.16 slice 4: starh2's dst-conn accept step; hotseat's tests", .status = .{ .pending = 4 } },
     .{ .id = .connect_close_parked, .name = "17.6 close of a client while its connect is parked: the op ends FileDescriptorNotASocket (before and after the SYN lands)", .status = built(chk.closeParkedConnect) },
     .{ .id = .syn_listener_closed_in_flight, .name = "17.6 SYN in flight when its listener closes, no replacement: RST, ConnectionRefused", .status = built(chk.synInFlightNoListener) },

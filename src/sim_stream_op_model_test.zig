@@ -111,6 +111,8 @@ const child_name = parent_name ++ ", in a child process";
 const L = sim.wire_latency_ns;
 const us: u64 = 1000;
 const default_steps = 1500;
+/// Seeds 1 to `n_seeds` are slice 2's mix, unchanged; seeds `n_seeds + 1`
+/// to `2 * n_seeds` add slice 3's fault steps (`fault_weights`).
 const n_seeds = 16;
 const max_live = 4;
 /// Connections made in a seed; the model's table holds those not retired.
@@ -119,8 +121,15 @@ const max_conns = 16;
 const max_slots = 2 * 2 * max_live;
 const buf_cap = 6000;
 
-const StepKind = enum { send, recv, poll, settle, shut_send, shut_both, close, abort, window, chunking, cancel, connect, owed_close };
-const step_weights = [_]u32{ 24, 22, 18, 6, 1, 1, 2, 1, 5, 2, 4, 6, 3 };
+const StepKind = enum { send, recv, poll, settle, shut_send, shut_both, close, abort, window, chunking, cancel, connect, owed_close, partition, silence, delay, clear_rule, fail };
+/// Slice 2's weights, with 0 for slice 3's steps: the same draws give the
+/// same steps as before slice 3, so seeds 1 to 16 are unchanged.
+const step_weights = [_]u32{ 24, 22, 18, 6, 1, 1, 2, 1, 5, 2, 4, 6, 3, 0, 0, 0, 0, 0 };
+const fault_weights = [_]u32{ 24, 22, 18, 6, 1, 1, 2, 1, 5, 2, 4, 6, 3, 3, 1, 2, 5, 1 };
+/// Rules in force at once, and distinct rule keys per seed (the sim keeps
+/// `max_rule_history`, 256).
+const max_model_rules = 6;
+const max_rule_keys = 200;
 
 /// What a model op ends with.
 const Want = union(enum) { n: usize, err: anyerror };
@@ -152,7 +161,7 @@ const Slot = struct {
 /// Why a parked op was woken. A shutdown's wake is split by its kind: a
 /// receive is woken by its own `.both` only (row 19: not by `.send`), a send
 /// by either (rows 24 and 16's `.both`).
-const Wake = enum { none, data, fin, rst, local_reset, credit, grow, shut_send, shut_both, close };
+const Wake = enum { none, data, fin, rst, local_reset, credit, grow, shut_send, shut_both, close, fail };
 const n_wake = @typeInfo(Wake).@"enum".field_names.len;
 
 const n_discard = @typeInfo(sim.Discard).@"enum".field_names.len;
@@ -173,8 +182,11 @@ const MEnd = struct {
     /// The serial of the send parked when the reset arrived.
     reset_parked_send: ?u32 = null,
     /// The local port, from `getsockname` at the connect: the peer's
-    /// `getpeername` answer.
+    /// `getpeername` answer, and what the `.tcp` rules match.
     port: u16 = 0,
+    /// `failStream`: how, and whether an op reported it.
+    failed: ?sim.StreamFailure = null,
+    fail_reported: bool = false,
     unread: std.ArrayList(u8) = .empty,
     recv: ?u8 = null,
     send: ?u8 = null,
@@ -205,9 +217,27 @@ const MConn = struct {
     chunking: sim.ChunkMode = .hashed,
     last_due: [2]u64 = .{ 0, 0 },
     next_order: u64 = 0,
+    /// Each direction's next sequence number: the client's SYN and ACK
+    /// were 0 and 1, the server's SYN-ACK 0.
+    next_seq: [2]u64 = .{ 2, 1 },
+    /// Each direction's held entries, in send order (design 17.9).
+    held: [2]std.ArrayList(MEntry) = .{ .empty, .empty },
 };
 
 const EKind = enum { data, fin, rst, credit };
+
+/// A `.tcp` rule of the model. A partition and an impairment match
+/// entries from port `from` to port `to`; a silence matches either.
+const MRuleKind = enum { partition, silence, impairment };
+const MRule = struct {
+    kind: MRuleKind,
+    from: u16,
+    to: u16,
+    delay: u64 = 0,
+    jitter: u64 = 0,
+    matched: u64 = 0,
+    delayed: u64 = 0,
+};
 
 const MEntry = struct {
     due: u64,
@@ -220,6 +250,12 @@ const MEntry = struct {
     kind: EKind,
     bytes: []const u8 = &.{},
     count: u64 = 0,
+    /// The sim's per-direction sequence: the jitter draw's key.
+    seq: u64 = 0,
+    /// Time after L, fixed at the send: chunk spacing, delay, jitter.
+    extra: u64 = 0,
+    /// A `.tcp` impairment added time to it.
+    own_delay: bool = false,
 };
 
 const Counts = struct {
@@ -232,6 +268,10 @@ const Counts = struct {
     skip_conn_limit: u64 = 0,
     skip_fixed_window: u64 = 0,
     skip_no_owed_shape: u64 = 0,
+    skip_rule_limit: u64 = 0,
+    skip_rule_exists: u64 = 0,
+    skip_no_rule: u64 = 0,
+    skip_no_fail_target: u64 = 0,
     send_admitted: u64 = 0,
     send_partial: u64 = 0,
     send_zero: u64 = 0,
@@ -280,6 +320,48 @@ const Counts = struct {
     end_proofs: u64 = 0,
     conns: u64 = 0,
     polls: u64 = 0,
+    // Slice 3 (seeds 17 to 32), each counted where its case is decided.
+    held_send: u64 = 0,
+    held_landing: u64 = 0,
+    released: u64 = 0,
+    coalesced: u64 = 0,
+    /// A FIN, an RST or a credit held (at its send or landing).
+    held_fin: u64 = 0,
+    held_rst: u64 = 0,
+    held_credit: u64 = 0,
+    /// Steps after which some data was held (conservation checked then).
+    held_data_steps: u64 = 0,
+    /// An abort that discarded held entries, and a failStream that did.
+    abort_discards: u64 = 0,
+    fail_discards: u64 = 0,
+    /// A close step on an endpoint whose outbound direction held entries.
+    close_while_held: u64 = 0,
+    /// A release whose direction held a credit while its data's sender had
+    /// a send parked: the reverse partition that stalled a sender.
+    stall_released: u64 = 0,
+    /// A held entry with a delay of its own, released.
+    held_delayed_released: u64 = 0,
+    /// An impairment cleared while an entry it delayed was on the wire.
+    clear_delay_in_flight: u64 = 0,
+    /// A release that lands data at an endpoint that closed meanwhile.
+    released_to_dead: u64 = 0,
+    delayed: u64 = 0,
+    jitter_draws: u64 = 0,
+    /// failStream by what was parked on the endpoint, and in which order
+    /// the two ops took the error when both were.
+    fail_recv_parked: u64 = 0,
+    fail_send_parked: u64 = 0,
+    fail_both_parked: u64 = 0,
+    fail_none_parked: u64 = 0,
+    fail_first_recv: u64 = 0,
+    fail_first_send: u64 = 0,
+    /// failStream on an endpoint whose connection had entries in flight
+    /// both ways.
+    fail_both_ways: u64 = 0,
+    fail_timed_out: u64 = 0,
+    dropped_failed: u64 = 0,
+    /// A rule's counts returned by its clear, compared with the model's.
+    rule_clears: u64 = 0,
 
     fn add(a: *Counts, b: Counts) void {
         const info = @typeInfo(Counts).@"struct";
@@ -320,6 +402,17 @@ const M = struct {
     var next_serial: u32 = 1;
     var model_clock: u64 = 0;
     var c: Counts = .{};
+    /// Slice 3: the `.tcp` rules in force, oldest first; whether the seed
+    /// ever set one; its distinct rule keys; the jitter draws.
+    var rules: [max_model_rules]MRule = undefined;
+    var n_rules: usize = 0;
+    var rules_ever: bool = false;
+    var rule_keys: usize = 0;
+    var draws: u64 = 0;
+    var faults: bool = false;
+    /// A failStream step found a receive and a send parked: the one
+    /// harvested first is counted by which it was.
+    var fail_both_now: bool = false;
     /// The run's `sim.streamStats()` as the model counts it: compared,
     /// field by field, after every step (`checkStats`).
     var st: sim.StreamStats = .{};
@@ -409,13 +502,195 @@ fn entryBefore(a: MEntry, b: MEntry) bool {
 
 fn sendEntry(ci: u8, from: u1, kind: EKind, extra: u64, bytes: []const u8, count: u64) void {
     const k = &M.conns[ci];
-    const at = @max(now() + L + extra, k.last_due[from]);
-    k.last_due[from] = at;
-    const e: MEntry = .{ .due = at, .conn_id = k.id, .ci = ci, .dir = from, .order = M.next_order, .kind = kind, .bytes = bytes, .count = count };
+    var e: MEntry = .{ .due = 0, .conn_id = k.id, .ci = ci, .dir = from, .order = M.next_order, .kind = kind, .bytes = bytes, .count = count, .seq = k.next_seq[from], .extra = extra };
     M.next_order += 1;
+    k.next_seq[from] += 1;
+    if (M.rules_ever) {
+        const fp, const tp = ports(k, from);
+        for (M.rules[0..M.n_rules]) |*r| {
+            if (ruleMatches(r.*, fp, tp)) r.matched += 1;
+        }
+        if (actingImpairment(fp, tp)) |r| {
+            var add = r.delay;
+            if (r.jitter != 0) {
+                add += jitterDraw(k.id, from, e.seq) % (r.jitter + 1);
+                M.draws += 1;
+                M.c.jitter_draws += 1;
+            }
+            if (add > 0) {
+                e.extra += add;
+                e.own_delay = true;
+                r.delayed += 1;
+                M.st.delayed += 1;
+                M.c.delayed += 1;
+            }
+        }
+        if (k.held[from].items.len > 0 or blocked(fp, tp)) {
+            M.st.held_at_send += 1;
+            M.c.held_send += 1;
+            hold(e);
+            return;
+        }
+    }
+    putOnWire(e);
+}
+
+fn putOnWire(entry: MEntry) void {
+    var e = entry;
+    const k = &M.conns[e.ci];
+    e.due = @max(now() + L + e.extra, k.last_due[e.dir]);
+    k.last_due[e.dir] = e.due;
     var pos = M.wire.items.len;
     while (pos > 0 and entryBefore(e, M.wire.items[pos - 1])) pos -= 1;
     M.wire.insert(M.arena.allocator(), pos, e) catch @panic("oom");
+}
+
+// ---- Slice 3: the model's own `.tcp` rules (design 17.9, 17.9a) ----
+
+/// The ports an entry of direction `from` goes between: the sender's and
+/// the receiver's (the model's endpoints are all on 127.0.0.1).
+fn ports(k: *const MConn, from: u1) struct { u16, u16 } {
+    return .{ k.ends[from].port, k.ends[other(from)].port };
+}
+
+fn ruleMatches(r: MRule, fp: u16, tp: u16) bool {
+    return switch (r.kind) {
+        .partition, .impairment => r.from == fp and r.to == tp,
+        .silence => r.from == fp or r.from == tp,
+    };
+}
+
+fn blocked(fp: u16, tp: u16) bool {
+    for (M.rules[0..M.n_rules]) |r| {
+        if (r.kind != .impairment and ruleMatches(r, fp, tp)) return true;
+    }
+    return false;
+}
+
+/// The impairment set last among those that match.
+fn actingImpairment(fp: u16, tp: u16) ?*MRule {
+    var i = M.n_rules;
+    while (i > 0) {
+        i -= 1;
+        if (M.rules[i].kind == .impairment and ruleMatches(M.rules[i], fp, tp)) return &M.rules[i];
+    }
+    return null;
+}
+
+/// The model's own copy of the jitter draw (the doc comment of
+/// `tcpJitterDraw` in sim.zig).
+fn jitterDraw(conn_id: u32, dir: u1, seq: u64) u64 {
+    var key: [16]u8 = @splat(0);
+    std.mem.writeInt(u64, key[0..8], M.seed, .little);
+    var m: [19]u8 = undefined;
+    std.mem.writeInt(u32, m[0..4], conn_id, .little);
+    m[4] = dir;
+    std.mem.writeInt(u64, m[5..13], seq, .little);
+    @memcpy(m[13..19], "jitter");
+    return std.hash.SipHash64(2, 4).toInt(&m, &key);
+}
+
+/// Holds `e` behind its direction's held entries; a credit replaces a held
+/// credit of its direction.
+fn hold(e: MEntry) void {
+    const list = &M.conns[e.ci].held[e.dir];
+    if (e.kind == .credit) {
+        for (list.items, 0..) |h, i| {
+            if (h.kind != .credit) continue;
+            _ = list.orderedRemove(i);
+            M.st.credits_coalesced += 1;
+            M.c.coalesced += 1;
+            break;
+        }
+        M.c.held_credit += 1;
+    }
+    if (e.kind == .fin) M.c.held_fin += 1;
+    if (e.kind == .rst) M.c.held_rst += 1;
+    // In sequence order: an entry held at its landing goes before one sent
+    // later and held at its send.
+    var pos = list.items.len;
+    while (pos > 0 and list.items[pos - 1].seq > e.seq) pos -= 1;
+    list.insert(M.arena.allocator(), pos, e) catch @panic("oom");
+}
+
+/// At a landing: held if a partition or silence matches now, or its
+/// direction holds entries. A drop rule that matches counts it.
+fn holdAtLanding(w: MEntry) bool {
+    const k = &M.conns[w.ci];
+    const fp, const tp = ports(k, w.dir);
+    var matched = false;
+    for (M.rules[0..M.n_rules]) |*r| {
+        if (r.kind != .impairment and ruleMatches(r.*, fp, tp)) {
+            r.matched += 1;
+            matched = true;
+        }
+    }
+    if (!matched and k.held[w.dir].items.len == 0) return false;
+    M.st.held_at_landing += 1;
+    M.c.held_landing += 1;
+    hold(w);
+    return true;
+}
+
+/// After a partition or silence is cleared: every held direction that no
+/// drop rule matches now goes on the wire, in (conn_id, direction) order,
+/// each entry L plus its extra time after now, in order.
+fn release() void {
+    var order: [max_conns]u8 = undefined;
+    var n: usize = 0;
+    for (M.conns, 0..) |k, ci| {
+        if (!k.used or k.held[0].items.len + k.held[1].items.len == 0) continue;
+        var pos = n;
+        while (pos > 0 and M.conns[order[pos - 1]].id > k.id) : (pos -= 1) order[pos] = order[pos - 1];
+        order[pos] = @intCast(ci);
+        n += 1;
+    }
+    for (order[0..n]) |ci| {
+        const k = &M.conns[ci];
+        for (0..2) |dd| {
+            const d: u1 = @intCast(dd);
+            if (k.held[d].items.len == 0) continue;
+            const fp, const tp = ports(k, d);
+            if (blocked(fp, tp)) continue;
+            var has_credit = false;
+            var has_data = false;
+            for (k.held[d].items) |h| {
+                if (h.kind == .credit) has_credit = true;
+                if (h.kind == .data) has_data = true;
+                if (h.own_delay) M.c.held_delayed_released += 1;
+                putOnWire(h);
+                M.st.released += 1;
+                M.c.released += 1;
+            }
+            if (has_credit) {
+                if (k.ends[other(d)].send) |i| {
+                    if (M.slots[i].state == .parked) M.c.stall_released += 1;
+                }
+            }
+            if (has_data and !k.ends[other(d)].open) M.c.released_to_dead += 1;
+            k.held[d].clearRetainingCapacity();
+        }
+    }
+}
+
+/// Side `side`'s held data, FIN and credits go: an abort or a failStream.
+/// Returns how many entries went.
+fn discardHeldOutbound(ci: u8, side: u1, cause: sim.Discard) usize {
+    const list = &M.conns[ci].held[side];
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < list.items.len) {
+        const h = list.items[i];
+        if (h.kind == .rst) {
+            i += 1;
+            continue;
+        }
+        _ = list.orderedRemove(i);
+        if (h.kind == .data) discard(ci, side, cause, h.bytes.len);
+        M.st.discarded_held += 1;
+        n += 1;
+    }
+    return n;
 }
 
 /// The next time something happens on the model's wire: a landing or an
@@ -441,6 +716,7 @@ fn advanceTo(t: u64) void {
         M.model_clock = e;
         while (M.wire.items.len > 0 and M.wire.items[0].due == e) {
             const w = M.wire.orderedRemove(0);
+            if (M.rules_ever and holdAtLanding(w)) continue;
             land(w);
         }
         departOwed(e);
@@ -471,7 +747,7 @@ fn departOwed(t: u64) void {
 
 fn dirTerminal(k: *const MConn, data: u1) bool {
     const x = k.ends[data];
-    return !x.open or x.reset_received;
+    return !x.open or x.reset_received or x.failed != null;
 }
 
 fn departCredit(ci: u8, data: u1) void {
@@ -597,6 +873,11 @@ fn land(w: MEntry) void {
     switch (w.kind) {
         .data => {
             const n = w.bytes.len;
+            if (x.failed != null) {
+                M.st.dropped_failed += 1;
+                M.c.dropped_failed += 1;
+                return discard(ci, w.dir, .failed_receiver, n);
+            }
             if (x.reset_received) {
                 M.st.dropped_after_reset += 1;
                 return discard(ci, w.dir, .after_reset, n);
@@ -614,6 +895,7 @@ fn land(w: MEntry) void {
                     x.reset_received = true;
                     x.fin_before_reset = false;
                     x.reset_parked_send = parkedSendSerial(x);
+                    if (discardHeldOutbound(ci, at, .abort) > 0) M.c.abort_discards += 1;
                     M.c.local_resets += 1;
                     M.st.local_resets += 1;
                     wakeRecv(ci, at, .local_reset);
@@ -626,7 +908,13 @@ fn land(w: MEntry) void {
             wakeRecv(ci, at, .data);
         },
         .fin => {
-            // Dead first, then reset (design 17.8, the FIN landing list).
+            // Failed, then dead, then reset (design 17.8, the FIN landing
+            // list).
+            if (x.failed != null) {
+                M.st.dropped_failed += 1;
+                M.c.dropped_failed += 1;
+                return;
+            }
             if (!x.open) {
                 M.st.dropped_dead += 1;
                 return;
@@ -639,7 +927,13 @@ fn land(w: MEntry) void {
             wakeRecv(ci, at, .fin);
         },
         .rst => {
-            // Reset first, then dead (design 17.8, the RST landing list).
+            // Failed, then reset, then dead (design 17.8, the RST landing
+            // list).
+            if (x.failed != null) {
+                M.st.dropped_failed += 1;
+                M.c.dropped_failed += 1;
+                return;
+            }
             if (x.reset_received) {
                 M.st.dropped_after_reset += 1;
                 return;
@@ -651,6 +945,7 @@ fn land(w: MEntry) void {
             x.reset_received = true;
             x.fin_before_reset = x.fin_in;
             x.reset_parked_send = parkedSendSerial(x);
+            if (discardHeldOutbound(ci, at, .abort) > 0) M.c.abort_discards += 1;
             const both = x.recv != null and x.send != null and M.slots[x.recv.?].state == .parked and M.slots[x.send.?].state == .parked;
             if (both) M.c.shared_reset += 1;
             wakeRecv(ci, at, .rst);
@@ -677,6 +972,15 @@ fn land(w: MEntry) void {
 fn recvEval(ci: u8, side: u1, s: *Slot) ?Want {
     const k = &M.conns[ci];
     const e = &k.ends[side];
+    if (e.failed) |how| {
+        if (e.fail_reported) return .{ .n = 0 };
+        e.fail_reported = true;
+        if (s.state == .woken and M.fail_both_now) {
+            M.c.fail_first_recv += 1;
+            M.fail_both_now = false;
+        }
+        return .{ .err = failErr(how) };
+    }
     if (e.unread.items.len > 0) {
         const n = @min(s.len, e.unread.items.len);
         @memcpy(s.want_bytes[0..n], e.unread.items[0..n]);
@@ -713,9 +1017,25 @@ fn profilePointNoShadow(comptime text: []const u8, at_call: bool) Profile {
     return M.profile;
 }
 
+fn failErr(how: sim.StreamFailure) anyerror {
+    return switch (how) {
+        .reset => error.ConnectionResetByPeer,
+        .timed_out => error.ConnectionTimedOut,
+    };
+}
+
 fn sendEval(ci: u8, side: u1, s: *Slot, bytes: []const u8) ?Want {
     const k = &M.conns[ci];
     const e = &k.ends[side];
+    if (e.failed) |how| {
+        if (e.fail_reported) return .{ .err = error.BrokenPipe };
+        e.fail_reported = true;
+        if (s.state == .woken and M.fail_both_now) {
+            M.c.fail_first_send += 1;
+            M.fail_both_now = false;
+        }
+        return .{ .err = failErr(how) };
+    }
     const at_call = s.state == .decided;
     if (e.reset_received) {
         const parked = !at_call and e.reset_parked_send == s.serial;
@@ -829,7 +1149,10 @@ fn connect() bool {
     cop.c.flags.defer_callback = false;
     M.loop.add(&cop.c);
     var aop = ev.NetAccept.init(M.listener, null, null);
-    runOp(&aop.c, 50 * us, 100);
+    // Each poll stops at the next landing, and a release can put hundreds
+    // of entries on the wire 1 µs apart: the handshake (3L) is bounded by
+    // time, not by a count of polls.
+    runOp(&aop.c, 50 * us, 100_000);
     const sfd = aop.getResult() catch |e| fail("accept: {t}", .{e});
     if (!M.setup_done[1]) fail("the connect did not complete before its accept", .{});
     cop.getResult() catch |e| fail("connect: {t}", .{e});
@@ -1067,7 +1390,7 @@ fn stepRecv() bool {
     return true;
 }
 
-const SkipWhy = enum { no_endpoint, unresolved, no_parked, fixed_window, no_owed_shape };
+const SkipWhy = enum { no_endpoint, unresolved, no_parked, fixed_window, no_owed_shape, rule_limit, rule_exists, no_rule, no_fail_target };
 
 fn skip(why: SkipWhy) bool {
     switch (why) {
@@ -1076,8 +1399,174 @@ fn skip(why: SkipWhy) bool {
         .no_parked => M.c.skip_no_parked += 1,
         .fixed_window => M.c.skip_fixed_window += 1,
         .no_owed_shape => M.c.skip_no_owed_shape += 1,
+        .rule_limit => M.c.skip_rule_limit += 1,
+        .rule_exists => M.c.skip_rule_exists += 1,
+        .no_rule => M.c.skip_no_rule += 1,
+        .no_fail_target => M.c.skip_no_fail_target += 1,
     }
     return false;
+}
+
+// ---- Slice 3's steps (seeds 17 to 32) ----
+//
+// Rules name one connection: a partition or an impairment its two ports in
+// one direction, a silence its client's port. A new connection's handshake
+// has a new client port and so matches none (design 17.9a, point 15).
+
+fn tcpEp(port: u16) sim.Endpoint {
+    return .{ .ip = .{ 127, 0, 0, 1 }, .port = port, .protocol = .tcp };
+}
+
+fn tcpPath(fp: u16, tp: u16) sim.Path {
+    return .{ .from = tcpEp(fp), .to = tcpEp(tp) };
+}
+
+/// A connection with an end still open.
+fn pickConn() ?u8 {
+    var cand: [max_conns]u8 = undefined;
+    var n: usize = 0;
+    for (M.conns, 0..) |k, ci| {
+        if (k.used and (k.ends[0].open or k.ends[1].open)) {
+            cand[n] = @intCast(ci);
+            n += 1;
+        }
+    }
+    if (n == 0) return null;
+    return cand[rand(n)];
+}
+
+fn findModelRule(kind: MRuleKind, from: u16, to: u16) ?usize {
+    for (M.rules[0..M.n_rules], 0..) |r, i| {
+        if (r.kind == kind and r.from == from and r.to == to) return i;
+    }
+    return null;
+}
+
+fn addModelRule(r: MRule) void {
+    M.rules[M.n_rules] = r;
+    M.n_rules += 1;
+    M.rules_ever = true;
+    M.rule_keys += 1;
+}
+
+fn ruleRoom() bool {
+    return M.n_rules < max_model_rules and M.rule_keys < max_rule_keys;
+}
+
+fn stepPartition() bool {
+    if (!ruleRoom()) return skip(.rule_limit);
+    const ci = pickConn() orelse return skip(.no_endpoint);
+    const fp, const tp = ports(&M.conns[ci], @intCast(rand(2)));
+    if (findModelRule(.partition, fp, tp) != null) return skip(.rule_exists);
+    sim.setPartition(tcpPath(fp, tp));
+    addModelRule(.{ .kind = .partition, .from = fp, .to = tp });
+    return true;
+}
+
+fn stepSilence() bool {
+    if (!ruleRoom()) return skip(.rule_limit);
+    const ci = pickConn() orelse return skip(.no_endpoint);
+    const port = M.conns[ci].ends[0].port;
+    if (findModelRule(.silence, port, 0) != null) return skip(.rule_exists);
+    sim.silence(tcpEp(port));
+    addModelRule(.{ .kind = .silence, .from = port, .to = 0 });
+    return true;
+}
+
+fn stepDelay() bool {
+    if (!ruleRoom()) return skip(.rule_limit);
+    const ci = pickConn() orelse return skip(.no_endpoint);
+    const fp, const tp = ports(&M.conns[ci], @intCast(rand(2)));
+    var delay: u64 = if (chance(70)) (1 + rand(300)) * us else 0;
+    const jit: u64 = if (chance(60)) (1 + rand(200)) * us else 0;
+    if (delay == 0 and jit == 0) delay = 50 * us;
+    sim.setImpairment(tcpPath(fp, tp), .{ .delay_ns = delay, .jitter_ns = jit });
+    // The sim replaces one already there, which becomes the newest.
+    if (findModelRule(.impairment, fp, tp)) |i| removeModelRule(i);
+    addModelRule(.{ .kind = .impairment, .from = fp, .to = tp, .delay = delay, .jitter = jit });
+    return true;
+}
+
+fn removeModelRule(i: usize) void {
+    std.mem.copyForwards(MRule, M.rules[i .. M.n_rules - 1], M.rules[i + 1 .. M.n_rules]);
+    M.n_rules -= 1;
+}
+
+/// Clears rule `i` in the sim and the model, checks the counts the sim
+/// returns against the model's, and releases what it held.
+fn clearRule(i: usize) void {
+    const r = M.rules[i];
+    const st = switch (r.kind) {
+        .partition => sim.healPartition(tcpPath(r.from, r.to)),
+        .silence => sim.unsilence(tcpEp(r.from)),
+        .impairment => sim.clearImpairment(tcpPath(r.from, r.to)),
+    };
+    if (st.matched != r.matched or st.delayed != r.delayed) fail("cleared {t} rule {d} -> {d}: sim matched {d} delayed {d}, model matched {d} delayed {d}", .{ r.kind, r.from, r.to, st.matched, st.delayed, r.matched, r.delayed });
+    M.c.rule_clears += 1;
+    if (r.kind == .impairment) {
+        for (M.wire.items) |w| {
+            const k = &M.conns[w.ci];
+            const fp, const tp = ports(k, w.dir);
+            if (w.own_delay and fp == r.from and tp == r.to) {
+                M.c.clear_delay_in_flight += 1;
+                break;
+            }
+        }
+    }
+    removeModelRule(i);
+    if (r.kind != .impairment) release();
+}
+
+fn stepClearRule() bool {
+    if (M.n_rules == 0) return skip(.no_rule);
+    clearRule(rand(M.n_rules));
+    return true;
+}
+
+fn stepFail() bool {
+    var cand: [2 * max_conns]struct { u8, u1 } = undefined;
+    var n: usize = 0;
+    for (M.conns, 0..) |k, ci| {
+        if (!k.used) continue;
+        for (k.ends, 0..) |e, side| {
+            if (e.open and e.failed == null and !e.reset_received) {
+                cand[n] = .{ @intCast(ci), @intCast(side) };
+                n += 1;
+            }
+        }
+    }
+    if (n == 0) return skip(.no_fail_target);
+    const ci, const side = cand[rand(n)];
+    const k = &M.conns[ci];
+    const e = &k.ends[side];
+    const how: sim.StreamFailure = if (chance(50)) .reset else .timed_out;
+    if (how == .timed_out) M.c.fail_timed_out += 1;
+    const rp = if (e.recv) |i| M.slots[i].state == .parked else false;
+    const sp = if (e.send) |i| M.slots[i].state == .parked else false;
+    if (rp and sp) {
+        M.c.fail_both_parked += 1;
+        M.fail_both_now = true;
+    } else if (rp) M.c.fail_recv_parked += 1 else if (sp) M.c.fail_send_parked += 1 else M.c.fail_none_parked += 1;
+    var ways = [2]bool{ false, false };
+    for (M.wire.items) |w| {
+        if (w.ci == ci) ways[w.dir] = true;
+    }
+    if (ways[0] and ways[1]) M.c.fail_both_ways += 1;
+    // The model's table (design 17.9).
+    e.failed = how;
+    if (discardHeldOutbound(ci, side, .failed_sender) > 0) M.c.fail_discards += 1;
+    const din = &k.dirs[other(side)];
+    if (din.owed_at != null) {
+        din.owed_at = null;
+        M.st.stale_credit += 1;
+    }
+    _ = discardUnread(ci, side, .failed_receiver);
+    wakeRecv(ci, side, .fail);
+    wakeSend(ci, side, .fail);
+    sim.failStream(e.fd, how);
+    pollOnce(0);
+    M.fail_both_now = false;
+    return true;
 }
 
 fn shutdown(how: os_net.ShutdownHow) bool {
@@ -1086,7 +1575,7 @@ fn shutdown(how: os_net.ShutdownHow) bool {
     const e = &k.ends[side];
     // The model's list first (design 17.8, shutdown).
     var want_err = false;
-    if (e.reset_received) {
+    if (e.reset_received or e.failed != null) {
         want_err = true;
         M.c.shut_unconnected += 1;
     } else {
@@ -1136,7 +1625,8 @@ fn close(abortive: bool) bool {
         e.linger0 = true;
     }
     // The model's close list (design 17.8).
-    const quiet = e.reset_received or e.rst_sent;
+    if (k.held[side].items.len > 0) M.c.close_while_held += 1;
+    const quiet = e.reset_received or e.rst_sent or e.failed != null;
     const had_unread = e.unread.items.len > 0;
     const rst = !quiet and (had_unread or e.linger0);
     const fin = !quiet and !rst and !e.fin_out;
@@ -1144,6 +1634,7 @@ fn close(abortive: bool) bool {
     if (rst) {
         e.rst_sent = true;
         M.c.close_rst += 1;
+        if (discardHeldOutbound(ci, side, .abort) > 0) M.c.abort_discards += 1;
         sendEntry(ci, side, .rst, 0, &.{}, 0);
     } else if (fin) {
         e.fin_out = true;
@@ -1324,15 +1815,21 @@ fn runStep(kind: StepKind) bool {
         .cancel => stepCancel(),
         .connect => connect(),
         .owed_close => stepOwedClose(),
+        .partition => stepPartition(),
+        .silence => stepSilence(),
+        .delay => stepDelay(),
+        .clear_rule => stepClearRule(),
+        .fail => stepFail(),
     };
 }
 
 fn pickStep() StepKind {
+    const weights = if (M.faults) &fault_weights else &step_weights;
     var total: u32 = 0;
-    for (step_weights) |w| total += w;
+    for (weights) |w| total += w;
     var r = M.rng.random().uintLessThan(u32, total);
-    for (step_weights, 0..) |w, i| {
-        if (r < w) return @fromBackingInt(@as(u4, @intCast(i)));
+    for (weights, 0..) |w, i| {
+        if (r < w) return @fromBackingInt(@as(u5, @intCast(i)));
         r -= w;
     }
     unreachable;
@@ -1345,11 +1842,16 @@ fn retirable(k: *const MConn, ci: usize) bool {
     for (M.wire.items) |w| {
         if (w.ci == ci) return false;
     }
+    if (k.held[0].items.len + k.held[1].items.len != 0) return false;
     return k.dirs[0].owed_at == null and k.dirs[1].owed_at == null;
 }
 
 fn checkState() void {
     var in_flight: usize = M.wire.items.len;
+    var held_data = false;
+    defer if (held_data) {
+        M.c.held_data_steps += 1;
+    };
     for (&M.conns, 0..) |*k, ci| {
         if (!k.used) continue;
         if (retirable(k, ci)) {
@@ -1360,13 +1862,15 @@ fn checkState() void {
             continue;
         }
         for (k.dirs) |d| in_flight += @intFromBool(d.owed_at != null);
+        in_flight += k.held[0].items.len + k.held[1].items.len;
         for (0..2) |side| {
             const s: u1 = @intCast(side);
             const e = &k.ends[s];
             const got = sim.testConnEnd(k.id, s == 1) orelse fail("connection {d} retired, and the model still has it", .{k.id});
             const phase: sim.StreamPhase = if (e.open) .est else .dead;
             if (got.phase != phase or got.fin_in != e.fin_in or got.fin_out != e.fin_out or got.rst_sent != e.rst_sent or got.reset_received != e.reset_received or
-                got.fin_before_reset != e.fin_before_reset or got.shut_rd != e.shut_rd or got.reset_reported != e.reset_reported or got.unread != e.unread.items.len)
+                got.fin_before_reset != e.fin_before_reset or got.shut_rd != e.shut_rd or got.reset_reported != e.reset_reported or got.unread != e.unread.items.len or
+                got.failed != e.failed or got.fail_reported != e.fail_reported)
             {
                 fail("connection {d} side {d}: sim {any}, model phase {t} fin_in {} fin_out {} rst_sent {} reset_received {} fin_before_reset {} shut_rd {} reset_reported {} unread {d}", .{ k.id, s, got, phase, e.fin_in, e.fin_out, e.rst_sent, e.reset_received, e.fin_before_reset, e.shut_rd, e.reset_reported, e.unread.items.len });
             }
@@ -1377,6 +1881,12 @@ fn checkState() void {
             for (M.wire.items) |w| {
                 if (w.ci == ci and w.dir == s and w.kind == .data) fl += w.bytes.len;
             }
+            var hb: u64 = 0;
+            for (k.held[s].items) |w| {
+                if (w.kind == .data) hb += w.bytes.len;
+            }
+            if (g.held != hb or g.held_entries != k.held[s].items.len) fail("connection {d} direction from side {d}: held sim {d} bytes in {d} entries, model {d} in {d}", .{ k.id, s, g.held, g.held_entries, hb, k.held[s].items.len });
+            if (hb > 0) held_data = true;
             if (g.window != d.window or g.admitted != d.admitted or g.credited != d.credited or g.read != d.read or g.reclaimed != d.reclaimed or
                 !std.mem.eql(u64, &g.discarded, &d.discarded) or g.in_flight != fl or g.unread != k.ends[other(s)].unread.items.len or
                 g.data_send_index != d.data_send_index or g.owed != (d.owed_at != null))
@@ -1389,6 +1899,15 @@ fn checkState() void {
     }
     const sim_n = sim.streamEntriesInFlight();
     if (sim_n != in_flight) fail("TCP entries in flight: sim {d}, model {d}", .{ sim_n, in_flight });
+    // Every landing time on the wire, in landing order (design 17.15 item
+    // 2): a delay, a jitter or a release that the model times otherwise
+    // fails here at the step that made it.
+    var dues: [4096]u64 = undefined;
+    const nd = sim.testTcpWireDues(&dues);
+    if (nd != M.wire.items.len) fail("TCP entries on the wire: sim {d}, model {d}", .{ nd, M.wire.items.len });
+    for (M.wire.items, dues[0..nd], 0..) |w, d, i| {
+        if (w.due != d) fail("wire entry {d} (connection {d}, direction {d}, {t}, sequence {d}): sim lands it at {d} ns, model at {d} ns", .{ i, w.conn_id, w.dir, w.kind, w.seq, d, w.due });
+    }
     checkStats();
 }
 
@@ -1402,12 +1921,13 @@ fn checkEndCalls(k: *const MConn, s: u1) void {
     M.c.readable_checks += 1;
     var sa: os_net.sockaddr.in = undefined;
     var len: os_net.socklen_t = @sizeOf(os_net.sockaddr.in);
+    const dead = e.reset_received or e.failed != null;
     if (os_net.getpeername(e.fd, @ptrCast(&sa), &len)) |_| {
-        if (e.reset_received) fail("getpeername on connection {d} side {d}: a peer, after a reset (want SocketUnconnected)", .{ k.id, s });
+        if (dead) fail("getpeername on connection {d} side {d}: a peer, after a reset or a failure (want SocketUnconnected)", .{ k.id, s });
         const ip: [4]u8 = @bitCast(sa.addr);
         if (!std.mem.eql(u8, &ip, &.{ 127, 0, 0, 1 }) or std.mem.bigToNative(u16, sa.port) != k.ends[other(s)].port) fail("getpeername on connection {d} side {d}: {any}:{d}, want 127.0.0.1:{d}", .{ k.id, s, ip, std.mem.bigToNative(u16, sa.port), k.ends[other(s)].port });
     } else |err| {
-        if (!e.reset_received or err != error.SocketUnconnected) fail("getpeername on connection {d} side {d}: {t} (reset received: {})", .{ k.id, s, err, e.reset_received });
+        if (!dead or err != error.SocketUnconnected) fail("getpeername on connection {d} side {d}: {t} (reset received: {}, failed: {})", .{ k.id, s, err, e.reset_received, e.failed != null });
         M.c.peer_unconnected += 1;
     }
     M.c.peer_checks += 1;
@@ -1419,6 +1939,7 @@ fn checkEndCalls(k: *const MConn, s: u1) void {
 /// (`syn_dropped_dead`, `refused`) stay 0: the model only joins a
 /// connection after its accept.
 fn checkStats() void {
+    if (sim.streamFaultDraws() != M.draws) fail("streamFaultDraws: sim {d}, model {d}", .{ sim.streamFaultDraws(), M.draws });
     const got = sim.streamStats();
     inline for (@typeInfo(sim.StreamStats).@"struct".field_names) |name| {
         if (!std.meta.eql(@field(got, name), @field(M.st, name))) fail("streamStats().{s}: sim {any}, model {any}", .{ name, @field(got, name), @field(M.st, name) });
@@ -1428,7 +1949,8 @@ fn checkStats() void {
 // ---- The end ----
 
 fn endProofs() void {
-    // Settle everything in flight first.
+    // Clear every rule (releasing what is held), then settle.
+    while (M.n_rules > 0) clearRule(M.n_rules - 1);
     var n: usize = 0;
     while (nextEvent() != null) : (n += 1) {
         if (n > 100000) fail("the wire did not drain", .{});
@@ -1442,7 +1964,7 @@ fn endProofs() void {
         switch (s.kind) {
             .recv => {
                 // A byte from the peer, if it can still send one.
-                if (!peer.open or peer.fin_out or peer.reset_received or peer.send != null or k.dirs[other(s.side)].room() == 0) continue;
+                if (!peer.open or peer.fin_out or peer.reset_received or peer.failed != null or peer.send != null or k.dirs[other(s.side)].room() == 0) continue;
                 submit(.send, s.ci, other(s.side), 1);
             },
             .send => {
@@ -1498,12 +2020,13 @@ fn closeEnd(k: *MConn, e: *MEnd) void {
     for (&M.conns, 0..) |*kk, ci| {
         if (kk != k) continue;
         const side: u1 = if (e == &kk.ends[0]) 0 else 1;
-        const quiet = e.reset_received or e.rst_sent;
+        const quiet = e.reset_received or e.rst_sent or e.failed != null;
         const rst = !quiet and (e.unread.items.len > 0 or e.linger0);
         const fin = !quiet and !rst and !e.fin_out;
         _ = discardUnread(@intCast(ci), side, .unread_at_close);
         if (rst) {
             e.rst_sent = true;
+            if (discardHeldOutbound(@intCast(ci), side, .abort) > 0) M.c.abort_discards += 1;
             sendEntry(@intCast(ci), side, .rst, 0, &.{}, 0);
         } else if (fin) {
             e.fin_out = true;
@@ -1540,6 +2063,12 @@ fn runSeed(seed_value: u64, steps: usize, profile: Profile, child: bool) Counts 
     M.np_text = "";
     M.expect_refusal = null;
     M.in_poll = false;
+    M.n_rules = 0;
+    M.rules_ever = false;
+    M.rule_keys = 0;
+    M.draws = 0;
+    M.faults = seed_value > n_seeds;
+    M.fail_both_now = false;
 
     sim.begin(seed_value);
     defer sim.end();
@@ -1598,6 +2127,8 @@ fn printCounts(c: Counts, profile: Profile, seeds: usize, steps: usize) void {
         std.debug.print("  step {s}: ran {d}, skipped {d}\n", .{ name, c.ran[i], c.skipped[i] });
     }
     std.debug.print("  skips: no endpoint {d}, op unresolved {d}, no parked op {d}, connection limit {d}, .fixed with a large window {d}, no owed_close shape {d}\n", .{ c.skip_no_endpoint, c.skip_unresolved, c.skip_no_parked, c.skip_conn_limit, c.skip_fixed_window, c.skip_no_owed_shape });
+    std.debug.print("  fault skips: rule limit {d}, rule exists {d}, no rule {d}, no failStream target {d}\n", .{ c.skip_rule_limit, c.skip_rule_exists, c.skip_no_rule, c.skip_no_fail_target });
+    inline for (fault_floor_names) |name| std.debug.print("  {s}: {d}\n", .{ name, @field(c, name) });
     const info = @typeInfo(Counts).@"struct";
     inline for (info.field_names, info.field_types) |name, T| {
         if (comptime T == u64 and !std.mem.startsWith(u8, name, "skip_")) std.debug.print("  {s}: {d}\n", .{ name, @field(c, name) });
@@ -1610,7 +2141,26 @@ fn printCounts(c: Counts, profile: Profile, seeds: usize, steps: usize) void {
 
 /// The counts that must not be 0 over a profile's seeds: a run where one
 /// is 0 did not test what it claims.
+/// Slice 3's counts, each of its own case (seeds 17 to 32).
+const fault_floor_names = .{
+    "held_send",             "held_landing",          "released",         "coalesced",       "held_fin",         "held_rst",
+    "held_credit",           "held_data_steps",       "abort_discards",   "fail_discards",   "close_while_held", "stall_released",
+    "held_delayed_released", "clear_delay_in_flight", "released_to_dead", "delayed",         "jitter_draws",     "fail_recv_parked",
+    "fail_send_parked",      "fail_both_parked",      "fail_none_parked", "fail_first_recv", "fail_first_send",  "fail_both_ways",
+    "fail_timed_out",        "dropped_failed",        "rule_clears",
+};
+
 fn floors(c: Counts, profile: Profile) void {
+    // Every zero count is printed before the child fails, so one run names
+    // them all (a mutant that zeroes several counts shows each floor).
+    var zero: usize = 0;
+    inline for (fault_floor_names) |name| {
+        if (@field(c, name) == 0) {
+            std.debug.print("stream model: count {s} is 0 over the seeds of profile {t}: the run did not test it\n", .{ name, profile });
+            zero += 1;
+        }
+    }
+    if (zero != 0) fail("{d} of slice 3's counts are 0 over the seeds of profile {t} (listed above)", .{ zero, profile });
     const req = .{
         "send_admitted",    "send_partial",     "send_zero",     "send_parked",      "send_epipe",       "send_reset",
         "recv_data",        "recv_eof",         "recv_reset",    "recv_parked",      "closed_op",        "cancel_recv",
@@ -1631,8 +2181,8 @@ fn floors(c: Counts, profile: Profile) void {
     // parks); a receive is never woken by data's room (credit, grow) or by
     // `.send` (row 19), and a send never by data or a FIN (row 5).
     const need = [2][]const Wake{
-        &.{ .data, .fin, .rst, .shut_both, .close },
-        &.{ .rst, .credit, .grow, .shut_send, .shut_both, .close },
+        &.{ .data, .fin, .rst, .shut_both, .close, .fail },
+        &.{ .rst, .credit, .grow, .shut_send, .shut_both, .close, .fail },
     };
     for (need, 0..) |list, op| {
         for (list) |w| {
@@ -1662,8 +2212,8 @@ test "sim: stream op model: connections under random sends, receives, shutdowns,
         sim.childDone(child_name);
         return;
     }
-    for (1..n_seeds + 1) |s| total.add(runSeed(s, steps, profile, true));
-    printCounts(total, profile, n_seeds, steps);
+    for (1..2 * n_seeds + 1) |s| total.add(runSeed(s, steps, profile, true));
+    printCounts(total, profile, 2 * n_seeds, steps);
     if (std.c.getenv("ZIO_STREAM_MODEL_STEPS") == null) floors(total, profile);
     sim.childDone(child_name);
 }
