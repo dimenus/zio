@@ -957,10 +957,25 @@ the mutants in its commits.
 ### Next: phase 2 (faults and replay)
 
 - **Phase 2** (section 12): faults, counters, validation, promises 2 and 3.
-  The design check is section 16 (sitting 19). Nothing of phase 2 is built
-  yet: the owner answers section 16's open points first. The earlier note
-  here, that a delayed landing would trip the check in `pushDueAt`, was
-  wrong; section 16, point 1, has why.
+  The design check is section 16 (sitting 19); the owner's answers came
+  with sitting 20: keep the `pushDueAt` check (a delay moves the landing,
+  not the wake) and test the delayed wake; silence by endpoint; NAT
+  rebinding stays t-4100, not in this phase; and one call that checks every
+  rule of a run matched a datagram (`requireEveryRuleMatched`, a panic).
+- **Slice 1 (sitting 20): built.** The rules (impairment with loss and
+  burst, partition, silence), the draw, the counts by cause and per rule,
+  the trace and wire digest records, `requireEveryRuleMatched`, and every
+  misuse refusal. Protocol: the comment above `pub const Endpoint` in
+  `src/sim.zig`. Tests: the filter `sim: net faults` (10 behaviour tests,
+  18 refusals) and the promise 1 pin `sim: dgram trace: datagram runs with
+  no fault rule keep ...` (its values measured at 33b95ca). Two of the
+  tests are their own oracles: the loss test recomputes every drop from
+  its own copy of the draw formula, and the records test hashes the
+  records it expects and compares that with `wireDigest()`. Mutants:
+  `zio-sim6-tools/mut/20-s1.json` (56, all killed).
+- **Slices 2 to 4 are next** (section 12): delay, jitter, the order clamp,
+  reorder and duplication with the delayed-wake tests; the op model; then
+  promise 3.
 - Open and filed: t-4096 (zero-length receive on an empty sim pipe), t-4098
   (the op model's holes above).
 - **For hotseat, not zio:** ENet's receive returns 0 for an empty datagram,

@@ -18,10 +18,10 @@ pub const EventKind = enum(u8) {
     cq_pop = 4,
     io_complete = 5,
     preempt = 6,
-    /// A datagram reached its landing time (`land`): landed or dropped.
-    /// `a`: the source port, and the outcome in bits 16-23 (0 landed,
-    /// 1 no socket, 2 the receive queue was full). `b`: the destination port
-    /// in the high 16 bits, the length in the low 16 (at most 65507).
+    /// A datagram reached its landing time (`land`), landed or dropped, or
+    /// a fault rule dropped it at its send. `a`: the source port, and the
+    /// outcome (`LandOutcome`) in bits 16-23. `b`: the destination port in
+    /// the high 16 bits, the length in the low 16 (at most 65507).
     dgram = 7,
 };
 
@@ -539,6 +539,7 @@ pub fn stateDigest() u64 {
         h.update(buf[0..13]);
     }
     if (net_used) digestNet(&h);
+    if (rule_history_len != 0) digestFaults(&h);
     return h.final();
 }
 
@@ -1337,6 +1338,10 @@ fn resetNet() void {
     wire_seq = 0;
     net_used = false;
     wire_hasher = std.hash.Wyhash.init(0);
+    rules_len = 0;
+    rule_history_len = 0;
+    fault_stats = .{};
+    fault_draws = 0;
 }
 
 /// Frees every socket and every datagram still on the wire, at `end`.
@@ -1519,6 +1524,18 @@ pub fn dgramSend(fd: i32, src: []const []const u8, to: Ip4, from: ?[4]u8) error{
     for (src) |sl| {
         @memcpy(bytes[at..][0..sl.len], sl);
         at += sl.len;
+    }
+    if (rules_len != 0) {
+        const src_addr: Ip4 = .{ .ip = src_ip, .port = d.local.port };
+        if (faultAtSend(wire_seq, src_addr, to)) |outcome| {
+            // The sender succeeded; the datagram is recorded at its send
+            // time, bytes and all, and never reaches the wire.
+            recordLanding(.{ .seq = wire_seq, .from = src_addr, .to = to, .bytes = bytes, .due_at = clock_ns }, outcome);
+            net_alloc.free(bytes);
+            wire_seq += 1;
+            d.stats.sent += 1;
+            return total;
+        }
     }
     const entry: WireDatagram = .{
         .seq = wire_seq,
@@ -1849,7 +1866,21 @@ fn receiverOf(to: Ip4) ?*Dgram {
     return wildcard;
 }
 
-const LandOutcome = enum(u8) { landed = 0, no_socket = 1, rcvbuf = 2 };
+/// What happened to a datagram, in the trace and the wire digest. 0 to 2
+/// are phase 1's, recorded at landing. 3 to 6 are drops by a fault rule at
+/// the send, recorded at the send time; 7 and 8 are drops by a rule in
+/// force at the landing, recorded at the landing (design section 5).
+const LandOutcome = enum(u8) {
+    landed = 0,
+    no_socket = 1,
+    rcvbuf = 2,
+    lost = 3,
+    lost_burst = 4,
+    partitioned = 5,
+    silenced = 6,
+    partitioned_in_flight = 7,
+    silenced_in_flight = 8,
+};
 
 /// Records a datagram at its landing time in the trace and the wire digest.
 fn recordLanding(w: WireDatagram, outcome: LandOutcome) void {
@@ -1875,6 +1906,12 @@ pub fn wireDigest() u64 {
 }
 
 fn land(w: WireDatagram) void {
+    if (rules_len != 0) {
+        if (faultInFlight(w.from, w.to)) |outcome| {
+            recordLanding(w, outcome);
+            return;
+        }
+    }
     const d = receiverOf(w.to) orelse {
         dropped_no_socket += 1;
         recordLanding(w, .no_socket);
@@ -1962,6 +1999,479 @@ fn isFlowHead(rest: []const WireDatagram, k: usize) bool {
         if (sameFlow(w, rest[k])) return false;
     }
     return true;
+}
+
+// ---- Datagram faults (sim network design, section 5; phase 2) ----
+//
+// A test sets fault rules during a run, from a task, at the virtual time
+// that task runs; they act on datagrams sent (and landing) from then on.
+// `begin` starts a run with no rule. Every call is on the sim thread, during
+// a run. The sender of a faulted datagram succeeds, as a kernel's does.
+//
+// Rules, of three kinds:
+// - An impairment (`setImpairment`) on a `Path`: loss and burst loss. Among
+//   the impairments whose path matches a datagram, only the one set most
+//   recently acts ("last set wins"). Setting one on a path that has one
+//   replaces it, resets its burst to the good state, and makes it the most
+//   recent.
+// - A partition (`setPartition`) drops every datagram on its path, one
+//   direction (`Path.reversed` gives the other).
+// - A silence (`silence`) drops every datagram from or to its endpoint:
+//   one socket (an exact address and port), a socket bound to the wildcard
+//   (`.{ .port = p }`), or a host that the test gave its own 127/8 address
+//   (`.{ .ip = a }`).
+// Partitions and silences are outside "last set wins": any one that matches
+// drops, whatever impairment was set after it.
+//
+// A datagram meets the rules twice:
+// 1. At its send (`faultAtSend`), once its source is known: a silence of its
+//    source or destination drops it (`silenced_at_send`), else a partition of
+//    its flow (`partitioned_at_send`), else the acting impairment: its burst
+//    state moves (good to bad with `enter_ppm`, bad to good with
+//    `leave_ppm`) and in the bad state the datagram is lost (`lost_burst`);
+//    else `loss_ppm` loses it (`lost`). The burst state is the rule's, shared
+//    by every flow it matches: a link has one bad period.
+// 2. At its landing (`faultInFlight`, the first harvest at or after its
+//    time): a silence or partition in force then that matches it drops it
+//    (`silenced_in_flight`, `partitioned_in_flight`). A link that goes down
+//    loses what is in it.
+// When several drop rules match, a silence acts before a partition, and of
+// one kind the most recent acts. Each drop is in the trace and the wire
+// digest (`LandOutcome` 3 to 8). Rule changes are not: a rule that acts on
+// nothing leaves both unchanged (promise 2). The state digest covers the
+// rules, the counts and the draws of a run that set a rule.
+//
+// Counts: `netFaultStats` per cause for the run; per rule, `matched` (sends
+// whose flow its path matched while it was in force, acting or not; for a
+// drop rule also datagrams it matched at landing) and `dropped` (what it
+// dropped). `clearImpairment`, `healPartition` and `unsilence` return the
+// rule's counts; `requireEveryRuleMatched` checks every rule of the run.
+//
+// Draws (`faultDraw`) never touch the run's RNG, and a field that cannot
+// change the outcome draws nothing (`netFaultDraws` counts them).
+//
+// Misuse panics, naming the call: a call outside a run or off the sim
+// thread; ppm over 1_000_000; a burst whose `enter_ppm` or `leave_ppm` is 0
+// (a burst that never starts or never ends: that is `setPartition`); an
+// endpoint address outside 127/8, 0.0.0.0 included, or port 0; an
+// impairment with every field at its default (`clearImpairment` removes);
+// clearing, healing or unsilencing a rule that is not there; a second
+// partition or silence of an equal path or endpoint; more than `max_rules`
+// rules in force, or `max_rule_history` distinct rules in a run.
+
+/// Matches a datagram's source or destination. null matches any value. `ip`
+/// is in 127/8; `port` is not 0.
+pub const Endpoint = struct {
+    ip: ?[4]u8 = null,
+    port: ?u16 = null,
+
+    fn matches(e: Endpoint, a: Ip4) bool {
+        if (e.ip) |ip| {
+            if (!std.mem.eql(u8, &ip, &a.ip)) return false;
+        }
+        if (e.port) |p| {
+            if (p != a.port) return false;
+        }
+        return true;
+    }
+};
+
+/// One direction: datagrams from `from` to `to`. `.{}` matches every
+/// datagram.
+pub const Path = struct {
+    from: Endpoint = .{},
+    to: Endpoint = .{},
+
+    pub fn reversed(p: Path) Path {
+        return .{ .from = p.to, .to = p.from };
+    }
+
+    fn matches(p: Path, from: Ip4, to: Ip4) bool {
+        return p.from.matches(from) and p.to.matches(to);
+    }
+};
+
+/// Gilbert loss: in the bad state every datagram is lost. Mean burst length
+/// is `1_000_000 / leave_ppm` datagrams that the rule acts on.
+pub const Burst = struct { enter_ppm: u32, leave_ppm: u32 };
+
+pub const Impairment = struct {
+    /// Independent loss, per million datagrams.
+    loss_ppm: u32 = 0,
+    burst: ?Burst = null,
+};
+
+pub const RuleStats = struct {
+    matched: u64 = 0,
+    dropped: u64 = 0,
+};
+
+/// The run's faulted datagrams, by cause.
+pub const NetFaultStats = struct {
+    lost: u64 = 0,
+    lost_burst: u64 = 0,
+    partitioned_at_send: u64 = 0,
+    partitioned_in_flight: u64 = 0,
+    silenced_at_send: u64 = 0,
+    silenced_in_flight: u64 = 0,
+};
+
+pub const max_rules = 64;
+pub const max_rule_history = 256;
+
+const RuleKind = enum(u8) { impairment = 1, partition = 2, silence = 3 };
+
+/// A rule's identity: its kind and what it matches. One rule per key.
+const RuleKey = union(RuleKind) {
+    impairment: Path,
+    partition: Path,
+    silence: Endpoint,
+
+    fn eql(a: RuleKey, b: RuleKey) bool {
+        return std.meta.eql(a, b);
+    }
+
+    fn matches(k: RuleKey, from: Ip4, to: Ip4) bool {
+        return switch (k) {
+            .impairment, .partition => |p| p.matches(from, to),
+            .silence => |e| e.matches(from) or e.matches(to),
+        };
+    }
+};
+
+const Rule = struct {
+    key: RuleKey,
+    /// The impairment's settings, and whether its burst is in the bad state.
+    /// Only an impairment's are read; a drop rule keeps the defaults.
+    imp: Impairment = .{},
+    bad: bool = false,
+    stats: RuleStats = .{},
+    /// Its entry in `rule_history`.
+    hist: usize,
+};
+
+/// Rules in force, oldest first: the last matching impairment acts.
+var rules: [max_rules]Rule = undefined;
+var rules_len: usize = 0;
+
+/// Every distinct rule key set in this run, with what it matched across all
+/// the times it was in force (`requireEveryRuleMatched`).
+const HistoryEntry = struct { key: RuleKey, matched: u64, first_set_ns: u64 };
+var rule_history: [max_rule_history]HistoryEntry = undefined;
+var rule_history_len: usize = 0;
+
+var fault_stats: NetFaultStats = .{};
+var fault_draws: u64 = 0;
+
+pub fn netFaultStats() NetFaultStats {
+    return fault_stats;
+}
+
+/// How many fault draws this run made (design section 7, promise 2).
+pub fn netFaultDraws() u64 {
+    return fault_draws;
+}
+
+/// The purposes of the draws for one datagram.
+const DrawPurpose = enum(u64) { burst = 1, loss = 2 };
+
+/// SplitMix64's output function.
+fn mix64(x: u64) u64 {
+    var z = x;
+    z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+    z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+    return z ^ (z >> 31);
+}
+
+/// One fault draw, for the datagram with send number `send_no` (the run's
+/// count of datagrams sent before it, from 0) and a purpose:
+///
+///     base = mix64(seed ^ 0x6e65745f6661756c)
+///     draw = mix64(base +% (send_no *% 8 +% purpose) *% 0x9e3779b97f4a7c15)
+///
+/// That is SplitMix64's output number `8 * send_no + purpose` from the state
+/// `base`. It reads no state but the seed, so the run's RNG is never drawn
+/// for a fault, and a model can compute the same value with its own code.
+fn faultDraw(send_no: u64, purpose: DrawPurpose) u64 {
+    fault_draws += 1;
+    const base = mix64(current_seed ^ 0x6e65745f6661756c);
+    return mix64(base +% (send_no *% 8 +% @backingInt(purpose)) *% 0x9e3779b97f4a7c15);
+}
+
+/// Whether an event of `ppm` per million happens. Draws only when the answer
+/// is not fixed: 0 never happens, 1_000_000 always does.
+fn happens(ppm: u32, send_no: u64, purpose: DrawPurpose) bool {
+    if (ppm == 0) return false;
+    if (ppm >= 1_000_000) return true;
+    return faultDraw(send_no, purpose) % 1_000_000 < ppm;
+}
+
+fn countMatched(r: *Rule) void {
+    r.stats.matched += 1;
+    rule_history[r.hist].matched += 1;
+}
+
+/// The most recent drop rule of `kind` in force that matches the flow.
+fn dropRule(kind: RuleKind, from: Ip4, to: Ip4) ?*Rule {
+    var i = rules_len;
+    while (i > 0) {
+        i -= 1;
+        if (rules[i].key == kind and rules[i].key.matches(from, to)) return &rules[i];
+    }
+    return null;
+}
+
+/// The fault rules at a datagram's send. Null: it goes on the wire.
+fn faultAtSend(send_no: u64, from: Ip4, to: Ip4) ?LandOutcome {
+    for (rules[0..rules_len]) |*r| {
+        if (r.key.matches(from, to)) countMatched(r);
+    }
+    if (dropRule(.silence, from, to)) |r| {
+        r.stats.dropped += 1;
+        fault_stats.silenced_at_send += 1;
+        return .silenced;
+    }
+    if (dropRule(.partition, from, to)) |r| {
+        r.stats.dropped += 1;
+        fault_stats.partitioned_at_send += 1;
+        return .partitioned;
+    }
+    const r = dropRule(.impairment, from, to) orelse return null;
+    if (r.imp.burst) |b| {
+        if (r.bad) {
+            if (happens(b.leave_ppm, send_no, .burst)) r.bad = false;
+        } else {
+            if (happens(b.enter_ppm, send_no, .burst)) r.bad = true;
+        }
+        if (r.bad) {
+            r.stats.dropped += 1;
+            fault_stats.lost_burst += 1;
+            return .lost_burst;
+        }
+    }
+    if (happens(r.imp.loss_ppm, send_no, .loss)) {
+        r.stats.dropped += 1;
+        fault_stats.lost += 1;
+        return .lost;
+    }
+    return null;
+}
+
+/// The drop rules at a datagram's landing. Every drop rule that matches it
+/// was set after its send (one in force then would have dropped it), so
+/// counting it as matched here counts no datagram twice for one rule.
+fn faultInFlight(from: Ip4, to: Ip4) ?LandOutcome {
+    for (rules[0..rules_len]) |*r| {
+        if (r.key != .impairment and r.key.matches(from, to)) countMatched(r);
+    }
+    if (dropRule(.silence, from, to)) |r| {
+        r.stats.dropped += 1;
+        fault_stats.silenced_in_flight += 1;
+        return .silenced_in_flight;
+    }
+    if (dropRule(.partition, from, to)) |r| {
+        r.stats.dropped += 1;
+        fault_stats.partitioned_in_flight += 1;
+        return .partitioned_in_flight;
+    }
+    return null;
+}
+
+fn faultCall(comptime what: []const u8) void {
+    refuseOtherThread("sim." ++ what);
+    if (!begun) panic("sim: " ++ what ++ " outside a sim run", .{});
+}
+
+fn checkEndpoint(comptime what: []const u8, e: Endpoint) void {
+    if (e.ip) |ip| {
+        if (ip[0] != 127) panic("sim: " ++ what ++ ": the address {d}.{d}.{d}.{d} is not in 127.0.0.0/8 (a socket bound to 0.0.0.0 is matched by its port alone)", .{ ip[0], ip[1], ip[2], ip[3] });
+    }
+    if (e.port) |p| {
+        if (p == 0) panic("sim: " ++ what ++ ": port 0 matches no datagram", .{});
+    }
+}
+
+fn checkPath(comptime what: []const u8, p: Path) void {
+    checkEndpoint(what, p.from);
+    checkEndpoint(what, p.to);
+}
+
+fn checkPpm(comptime what: []const u8, comptime field: []const u8, ppm: u32) void {
+    if (ppm > 1_000_000) panic("sim: " ++ what ++ ": " ++ field ++ " {d} is over 1000000", .{ppm});
+}
+
+fn findRule(key: RuleKey) ?usize {
+    for (rules[0..rules_len], 0..) |r, i| {
+        if (r.key.eql(key)) return i;
+    }
+    return null;
+}
+
+fn removeRule(i: usize) RuleStats {
+    const st = rules[i].stats;
+    std.mem.copyForwards(Rule, rules[i .. rules_len - 1], rules[i + 1 .. rules_len]);
+    rules_len -= 1;
+    return st;
+}
+
+fn addRule(comptime what: []const u8, key: RuleKey, imp: Impairment) void {
+    if (rules_len == max_rules) panic("sim: " ++ what ++ ": {d} fault rules are in force, the most a run holds", .{max_rules});
+    const hist = for (rule_history[0..rule_history_len], 0..) |h, i| {
+        if (h.key.eql(key)) break i;
+    } else blk: {
+        if (rule_history_len == max_rule_history) panic("sim: " ++ what ++ ": {d} distinct fault rules were set in this run, the most it records", .{max_rule_history});
+        rule_history[rule_history_len] = .{ .key = key, .matched = 0, .first_set_ns = clock_ns };
+        rule_history_len += 1;
+        break :blk rule_history_len - 1;
+    };
+    rules[rules_len] = .{ .key = key, .imp = imp, .hist = hist };
+    rules_len += 1;
+}
+
+/// Sets the impairment of `path`, replacing one already there (its burst
+/// starts good again) and making it the most recently set.
+pub fn setImpairment(path: Path, imp: Impairment) void {
+    faultCall("setImpairment");
+    checkPath("setImpairment", path);
+    checkPpm("setImpairment", "loss_ppm", imp.loss_ppm);
+    if (imp.burst) |b| {
+        checkPpm("setImpairment", "burst.enter_ppm", b.enter_ppm);
+        checkPpm("setImpairment", "burst.leave_ppm", b.leave_ppm);
+        if (b.enter_ppm == 0) panic("sim: setImpairment: a burst with enter_ppm 0 never starts", .{});
+        if (b.leave_ppm == 0) panic("sim: setImpairment: a burst with leave_ppm 0 never ends (that is setPartition)", .{});
+    }
+    if (std.meta.eql(imp, Impairment{})) panic("sim: setImpairment with every field at its default: clearImpairment removes an impairment", .{});
+    if (findRule(.{ .impairment = path })) |i| _ = removeRule(i);
+    addRule("setImpairment", .{ .impairment = path }, imp);
+}
+
+/// Removes the impairment of `path` and returns its counts.
+pub fn clearImpairment(path: Path) RuleStats {
+    faultCall("clearImpairment");
+    const i = findRule(.{ .impairment = path }) orelse panic("sim: clearImpairment of a path that has no impairment", .{});
+    return removeRule(i);
+}
+
+/// Drops every datagram on `path` (one direction), at send and in flight.
+pub fn setPartition(path: Path) void {
+    faultCall("setPartition");
+    checkPath("setPartition", path);
+    if (findRule(.{ .partition = path }) != null) panic("sim: setPartition of a path that is already partitioned", .{});
+    addRule("setPartition", .{ .partition = path }, .{});
+}
+
+pub fn healPartition(path: Path) RuleStats {
+    faultCall("healPartition");
+    const i = findRule(.{ .partition = path }) orelse panic("sim: healPartition of a path that is not partitioned", .{});
+    return removeRule(i);
+}
+
+/// Drops every datagram from or to `ep`, at send and in flight.
+pub fn silence(ep: Endpoint) void {
+    faultCall("silence");
+    checkEndpoint("silence", ep);
+    if (findRule(.{ .silence = ep }) != null) panic("sim: silence of an endpoint that is already silenced", .{});
+    addRule("silence", .{ .silence = ep }, .{});
+}
+
+pub fn unsilence(ep: Endpoint) RuleStats {
+    faultCall("unsilence");
+    const i = findRule(.{ .silence = ep }) orelse panic("sim: unsilence of an endpoint that is not silenced", .{});
+    return removeRule(i);
+}
+
+fn writeEndpoint(w: *std.Io.Writer, e: Endpoint) !void {
+    if (e.ip) |ip| try w.print("{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) else try w.writeByte('*');
+    if (e.port) |p| try w.print(":{d}", .{p}) else try w.writeAll(":*");
+}
+
+/// Panics, naming each one, unless every fault rule set in this run matched
+/// at least one datagram while it was in force (counted over every time its
+/// path was set, cleared or not). A rule that matched nothing is usually a
+/// wrong address in the test. A panic, not a returned list: a caller that
+/// forgets to check a list would pass, and this exists to make that loud.
+pub fn requireEveryRuleMatched() void {
+    faultCall("requireEveryRuleMatched");
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var n: usize = 0;
+    for (rule_history[0..rule_history_len]) |h| {
+        if (h.matched != 0) continue;
+        n += 1;
+        // A full buffer cuts the list; the count before it stays exact.
+        describeRule(&w, h, n == 1) catch {};
+    }
+    if (n != 0) panic("sim: {d} fault rules matched no datagram in this run: {s}", .{ n, w.buffered() });
+}
+
+fn describeRule(w: *std.Io.Writer, h: HistoryEntry, first: bool) !void {
+    if (!first) try w.writeAll("; ");
+    switch (h.key) {
+        .impairment, .partition => |p| {
+            try w.print("{t} from ", .{h.key});
+            try writeEndpoint(w, p.from);
+            try w.writeAll(" to ");
+            try writeEndpoint(w, p.to);
+        },
+        .silence => |e| {
+            try w.writeAll("silence of ");
+            try writeEndpoint(w, e);
+        },
+    }
+    try w.print(" (first set at {d} ns)", .{h.first_set_ns});
+}
+
+fn hashEndpoint(h: *std.hash.Wyhash, e: Endpoint) void {
+    var b: [7]u8 = @splat(0);
+    b[0] = @as(u8, @intFromBool(e.ip != null)) | (@as(u8, @intFromBool(e.port != null)) << 1);
+    if (e.ip) |ip| @memcpy(b[1..5], &ip);
+    if (e.port) |p| std.mem.writeInt(u16, b[5..7], p, .little);
+    h.update(&b);
+}
+
+fn hashRuleKey(h: *std.hash.Wyhash, k: RuleKey) void {
+    h.update(&.{@backingInt(k)});
+    switch (k) {
+        .impairment, .partition => |p| {
+            hashEndpoint(h, p.from);
+            hashEndpoint(h, p.to);
+        },
+        .silence => |e| hashEndpoint(h, e),
+    }
+}
+
+/// The fault rules in `stateDigest`, for a run that set one: the rules in
+/// force in their order with their settings, burst states and counts; every
+/// rule of the run with what it matched; the counts by cause; the draws.
+fn digestFaults(h: *std.hash.Wyhash) void {
+    var b: [8]u8 = undefined;
+    for (rules[0..rules_len]) |r| {
+        hashRuleKey(h, r.key);
+        var e: [30]u8 = @splat(0);
+        std.mem.writeInt(u32, e[0..4], r.imp.loss_ppm, .little);
+        if (r.imp.burst) |bu| {
+            e[4] = 1;
+            std.mem.writeInt(u32, e[5..9], bu.enter_ppm, .little);
+            std.mem.writeInt(u32, e[9..13], bu.leave_ppm, .little);
+        }
+        e[13] = @intFromBool(r.bad);
+        std.mem.writeInt(u64, e[14..22], r.stats.matched, .little);
+        std.mem.writeInt(u64, e[22..30], r.stats.dropped, .little);
+        h.update(&e);
+    }
+    for (rule_history[0..rule_history_len]) |hist| {
+        hashRuleKey(h, hist.key);
+        std.mem.writeInt(u64, &b, hist.matched, .little);
+        h.update(&b);
+        std.mem.writeInt(u64, &b, hist.first_set_ns, .little);
+        h.update(&b);
+    }
+    inline for (comptime std.meta.fieldNames(NetFaultStats)) |name| {
+        std.mem.writeInt(u64, &b, @field(fault_stats, name), .little);
+        h.update(&b);
+    }
+    std.mem.writeInt(u64, &b, fault_draws, .little);
+    h.update(&b);
 }
 
 pub fn mutantOmitTimeoutRecheck() bool {
@@ -6505,6 +7015,9 @@ test "sim: dgram trace: a run with no datagram socket keeps the trace and state 
 
 const dg_wire = struct {
     var flip = false;
+    /// Fault rules set before the sends, for promise 2. None of them acts.
+    const Rules = enum { none, set_clear, unmatched };
+    var rules_before: Rules = .none;
     var transcript: [256]u8 = undefined;
     var transcript_len: usize = 0;
     const Out = struct { wire: u64, trace: u64, state: u64 };
@@ -6524,6 +7037,22 @@ const dg_wire = struct {
         transcript_len = 0;
         var h = try dg.runtime.spawn(evFirst, .{rx});
         try dg.rt_mod.sleep(.fromMilliseconds(1));
+        switch (rules_before) {
+            .none => {},
+            .set_clear => {
+                setImpairment(.{}, .{ .loss_ppm = 500_000, .burst = .{ .enter_ppm = 10, .leave_ppm = 10 } });
+                setPartition(.{});
+                silence(.{});
+                _ = clearImpairment(.{});
+                _ = healPartition(.{});
+                _ = unsilence(.{});
+            },
+            .unmatched => {
+                setImpairment(.{ .to = .{ .port = 7999 } }, .{ .loss_ppm = 500_000 });
+                setPartition(.{ .from = .{ .port = 7998 } });
+                silence(.{ .ip = .{ 127, 0, 0, 99 } });
+            },
+        }
         for (0..4) |k| {
             for (senders, 0..) |fd, i| {
                 var p: [6]u8 = .{ 'd', @intCast('0' + i), @intCast('0' + k), 'x', 'y', 'z' };
@@ -6555,6 +7084,15 @@ const dg_wire = struct {
 
     fn run(seed_value: u64, flip_byte: bool) !Out {
         flip = flip_byte;
+        rules_before = .none;
+        try dg.run(seed_value, body);
+        return out;
+    }
+
+    fn runRules(seed_value: u64, r: Rules) !Out {
+        flip = false;
+        rules_before = r;
+        defer rules_before = .none;
         try dg.run(seed_value, body);
         return out;
     }
@@ -6602,6 +7140,54 @@ test "sim: dgram trace: a landing is a trace event: interleaves that differ give
         }
     }
     try std.testing.expect(pairs_with_different_orders > 0);
+}
+
+/// A datagram workload whose landings take every phase 1 outcome: two land,
+/// two find the receive queue full, one finds no socket. Pinned below.
+const dg_drops = struct {
+    const Out = struct { wire: u64, trace: u64, state: u64 };
+    var out: Out = undefined;
+
+    fn body() !void {
+        const rx = try dg.open();
+        try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 7000));
+        // Two 10-byte datagrams cost 2 * (10 + 256) = 532 bytes; a third does not fit.
+        try dg.setInt(rx, sys.SOL.SOCKET, sys.SO.RCVBUF, 600);
+        const tx = try dg.open();
+        try dg.bindTo(tx, dg.addr(127, 0, 0, 1, 7100));
+        for (0..4) |k| {
+            const p: [10]u8 = @splat(@intCast('a' + k));
+            _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 7000), null, &p);
+        }
+        _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 7999), null, "nobody");
+        try dg.settle();
+        var buf: [16]u8 = undefined;
+        var got: usize = 0;
+        while (dg.recvInto(rx, &.{&buf})) |_| got += 1 else |err| if (err != error.WouldBlock) return err;
+        if (got != 2 or datagramStats(rx).dropped_rcvbuf != 2 or datagramsDroppedNoSocket() != 1) return error.WrongOutcomes;
+        out = .{ .wire = wireDigest(), .trace = traceHash(), .state = stateDigest() };
+    }
+
+    fn run(seed_value: u64) !Out {
+        try dg.run(seed_value, body);
+        return out;
+    }
+};
+
+// Measured at 33b95ca, before any fault code existed (3 of 3 runs gave
+// these). A run that sets no fault rule must keep them: promise 1 of design
+// section 7, for datagram runs. The pipe-only pins are in "a run with no
+// datagram socket keeps ...".
+test "sim: dgram trace: datagram runs with no fault rule keep the trace, state and wire digests they had at 33b95ca" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    const w = try dg_wire.run(9, false);
+    const d = try dg_drops.run(2);
+    try std.testing.expectEqual(@as(u64, 0xb95f842cbcbc9534), w.wire);
+    try std.testing.expectEqual(@as(u64, 0x4e7eaa6bc33a0140), w.trace);
+    try std.testing.expectEqual(@as(u64, 0xe99b17b275d61903), w.state);
+    try std.testing.expectEqual(@as(u64, 0x5bd00146b45c77d0), d.wire);
+    try std.testing.expectEqual(@as(u64, 0xcc75045db683d758), d.trace);
+    try std.testing.expectEqual(@as(u64, 0xfd06f5dc797433e9), d.state);
 }
 
 test "sim: dgram trace: ten fresh processes with the heap moved give one transcript, wire digest, trace and state digest" {
@@ -7046,4 +7632,726 @@ test "sim: exits refuse: File.fromFd(sim fd).close() in a loop callback, through
             try r3.rt.sleep(.fromMilliseconds(5));
         }
     }.body);
+}
+
+// ---- Phase 2, slice 1: fault rules, drops, counts and records (design section 5) ----
+
+const nf = struct {
+    fn ep(d: u8, port: u16) Endpoint {
+        return .{ .ip = .{ 127, 0, 0, d }, .port = port };
+    }
+
+    fn sock(d: u8, port: u16) !i32 {
+        const fd = try dg.open();
+        try dg.bindTo(fd, dg.addr(127, 0, 0, d, port));
+        return fd;
+    }
+
+    /// Sends datagram number `k` (4 bytes) from `fd` to 127.0.0.`d`:`port`.
+    fn send(fd: i32, d: u8, port: u16, k: u32) !void {
+        var p: [4]u8 = undefined;
+        std.mem.writeInt(u32, &p, k, .little);
+        _ = try dg.sendFrom(fd, dg.addr(127, 0, 0, d, port), null, &p);
+    }
+
+    /// Takes everything queued on `fd`: the numbers, in order, into `out`.
+    fn drain(fd: i32, out: []u32) !usize {
+        var n: usize = 0;
+        var buf: [8]u8 = undefined;
+        while (dg.recvInto(fd, &.{&buf})) |got| {
+            if (got.info.len != 4) return error.NotANumberedDatagram;
+            out[n] = std.mem.readInt(u32, buf[0..4], .little);
+            n += 1;
+        } else |err| if (err != error.WouldBlock) return err;
+        return n;
+    }
+
+    fn count(fd: i32) !usize {
+        var out: [1100]u32 = undefined;
+        return drain(fd, &out);
+    }
+
+    fn noOtherCause(st: NetFaultStats, comptime keep: []const []const u8) !void {
+        inline for (comptime std.meta.fieldNames(NetFaultStats)) |name| {
+            const kept = comptime for (keep) |k| {
+                if (std.mem.eql(u8, k, name)) break true;
+            } else false;
+            if (!kept and @field(st, name) != 0) {
+                std.debug.print("{s} = {d}, expected 0\n", .{ name, @field(st, name) });
+                return error.UnexpectedCause;
+            }
+        }
+    }
+};
+
+const nf_silence = struct {
+    fn body() !void {
+        const a = try nf.sock(1, 7000);
+        const b = try nf.sock(1, 7001);
+        const c = try nf.sock(1, 7002);
+        silence(nf.ep(1, 7001));
+        for (0..3) |k| try nf.send(a, 1, 7001, @intCast(k));
+        for (0..2) |k| try nf.send(b, 1, 7000, @intCast(k));
+        for (0..4) |k| try nf.send(a, 1, 7002, @intCast(k));
+        try nf.send(c, 1, 7000, 9);
+        try dg.settle();
+        try std.testing.expectEqual(@as(usize, 0), try nf.count(b));
+        var got: [8]u32 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), try nf.drain(a, &got));
+        try std.testing.expectEqual(@as(u32, 9), got[0]);
+        try std.testing.expectEqual(@as(usize, 4), try nf.count(c));
+        const st = netFaultStats();
+        try std.testing.expectEqual(@as(u64, 5), st.silenced_at_send);
+        try nf.noOtherCause(st, &.{"silenced_at_send"});
+        try std.testing.expectEqual(@as(u64, 0), netFaultDraws());
+        // The sender succeeded for every datagram, dropped or not.
+        try std.testing.expectEqual(@as(u64, 7), datagramStats(a).sent);
+        const rs = unsilence(nf.ep(1, 7001));
+        try std.testing.expectEqual(RuleStats{ .matched = 5, .dropped = 5 }, rs);
+        try nf.send(a, 1, 7001, 7);
+        try dg.settle();
+        try std.testing.expectEqual(@as(usize, 1), try nf.count(b));
+    }
+};
+
+test "sim: net faults: a silence of an exact endpoint drops what it sends and what is sent to it, counts each, and unsilence ends it" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, nf_silence.body);
+}
+
+const nf_silence_forms = struct {
+    fn body() !void {
+        const a = try nf.sock(1, 7000);
+        const b = try nf.sock(1, 7001);
+        const w = try dg.open();
+        try dg.bindTo(w, dg.addr(0, 0, 0, 0, 7010));
+        silence(.{ .port = 7010 });
+        try nf.send(a, 1, 7010, 1);
+        try nf.send(a, 3, 7010, 2);
+        try nf.send(w, 1, 7000, 3);
+        const h1 = try nf.sock(5, 7020);
+        const h2 = try nf.sock(5, 7021);
+        silence(.{ .ip = .{ 127, 0, 0, 5 } });
+        try nf.send(a, 5, 7020, 4);
+        try nf.send(a, 5, 7021, 5);
+        try nf.send(h1, 1, 7000, 6);
+        try nf.send(a, 1, 7001, 7);
+        try dg.settle();
+        try std.testing.expectEqual(@as(usize, 0), try nf.count(w));
+        try std.testing.expectEqual(@as(usize, 0), try nf.count(h1));
+        try std.testing.expectEqual(@as(usize, 0), try nf.count(h2));
+        try std.testing.expectEqual(@as(usize, 0), try nf.count(a));
+        try std.testing.expectEqual(@as(usize, 1), try nf.count(b));
+        try std.testing.expectEqual(@as(u64, 6), netFaultStats().silenced_at_send);
+        try std.testing.expectEqual(RuleStats{ .matched = 3, .dropped = 3 }, unsilence(.{ .port = 7010 }));
+        try std.testing.expectEqual(RuleStats{ .matched = 3, .dropped = 3 }, unsilence(.{ .ip = .{ 127, 0, 0, 5 } }));
+    }
+};
+
+test "sim: net faults: a silence by port alone covers a socket bound to the wildcard, and by address alone a whole host" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, nf_silence_forms.body);
+}
+
+const nf_partition = struct {
+    fn body() !void {
+        const a = try nf.sock(1, 7000);
+        const b = try nf.sock(1, 7001);
+        const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
+        setPartition(ab);
+        for (0..2) |k| try nf.send(a, 1, 7001, @intCast(k));
+        for (0..2) |k| try nf.send(b, 1, 7000, @intCast(k));
+        try dg.settle();
+        try std.testing.expectEqual(@as(usize, 0), try nf.count(b));
+        try std.testing.expectEqual(@as(usize, 2), try nf.count(a));
+        setPartition(ab.reversed());
+        try nf.send(b, 1, 7000, 5);
+        try nf.send(a, 1, 7001, 6);
+        try dg.settle();
+        try std.testing.expectEqual(@as(usize, 0), try nf.count(a));
+        try std.testing.expectEqual(@as(usize, 0), try nf.count(b));
+        try std.testing.expectEqual(RuleStats{ .matched = 3, .dropped = 3 }, healPartition(ab));
+        try std.testing.expectEqual(RuleStats{ .matched = 1, .dropped = 1 }, healPartition(ab.reversed()));
+        try nf.send(a, 1, 7001, 7);
+        try nf.send(b, 1, 7000, 8);
+        try dg.settle();
+        try std.testing.expectEqual(@as(usize, 1), try nf.count(a));
+        try std.testing.expectEqual(@as(usize, 1), try nf.count(b));
+        try std.testing.expectEqual(@as(u64, 4), netFaultStats().partitioned_at_send);
+        try nf.noOtherCause(netFaultStats(), &.{"partitioned_at_send"});
+    }
+};
+
+test "sim: net faults: a partition drops one direction only, its reversed path the other, and heal restores both" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, nf_partition.body);
+}
+
+const nf_in_flight = struct {
+    fn body() !void {
+        const a = try nf.sock(1, 7000);
+        const b = try nf.sock(1, 7001);
+        const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
+        // On the wire when the partition starts: dropped at landing.
+        try nf.send(a, 1, 7001, 1);
+        setPartition(ab);
+        try dg.settle();
+        try std.testing.expectEqual(@as(usize, 0), try nf.count(b));
+        try std.testing.expectEqual(RuleStats{ .matched = 1, .dropped = 1 }, healPartition(ab));
+        // A partition set and healed while it is on the wire: it lands.
+        try nf.send(a, 1, 7001, 2);
+        setPartition(ab);
+        try std.testing.expectEqual(RuleStats{}, healPartition(ab));
+        try dg.settle();
+        try std.testing.expectEqual(@as(usize, 1), try nf.count(b));
+        // The same for a silence, of the sender this time.
+        try nf.send(a, 1, 7001, 3);
+        silence(nf.ep(1, 7000));
+        try dg.settle();
+        try std.testing.expectEqual(@as(usize, 0), try nf.count(b));
+        try std.testing.expectEqual(RuleStats{ .matched = 1, .dropped = 1 }, unsilence(nf.ep(1, 7000)));
+        const st = netFaultStats();
+        try std.testing.expectEqual(@as(u64, 1), st.partitioned_in_flight);
+        try std.testing.expectEqual(@as(u64, 1), st.silenced_in_flight);
+        try nf.noOtherCause(st, &.{ "partitioned_in_flight", "silenced_in_flight" });
+    }
+};
+
+test "sim: net faults: a partition or silence that starts while a datagram is on the wire drops it at landing, and one healed before landing lets it land" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, nf_in_flight.body);
+}
+
+/// The test's own copy of the draw formula in `faultDraw`'s doc comment,
+/// and of the Gilbert rule of design section 5. It calls nothing of the sim.
+const nf_model = struct {
+    fn mix(x: u64) u64 {
+        var z = x;
+        z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+        z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+        return z ^ (z >> 31);
+    }
+
+    var draws: u64 = 0;
+
+    fn draw(seed_value: u64, send_no: u64, purpose: u64) u64 {
+        draws += 1;
+        return mix(mix(seed_value ^ 0x6e65745f6661756c) +% (send_no *% 8 +% purpose) *% 0x9e3779b97f4a7c15);
+    }
+
+    fn hit(seed_value: u64, ppm: u32, send_no: u64, purpose: u64) bool {
+        if (ppm == 0) return false;
+        if (ppm >= 1_000_000) return true;
+        return draw(seed_value, send_no, purpose) % 1_000_000 < ppm;
+    }
+};
+
+const nf_loss = struct {
+    const seed_value: u64 = 11;
+    const n: u32 = 2000;
+    const imp: Impairment = .{ .loss_ppm = 300_000, .burst = .{ .enter_ppm = 50_000, .leave_ppm = 250_000 } };
+    var landed: [n]bool = undefined;
+
+    fn body() !void {
+        const a = try nf.sock(1, 7000);
+        const b = try nf.sock(1, 7001);
+        const c = try nf.sock(1, 7002);
+        setImpairment(.{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) }, imp);
+        landed = @splat(false);
+        var k: u32 = 0;
+        while (k < n) {
+            // Sends draw nothing from the run's RNG, faulted or not.
+            const before = rng.s;
+            var j: u32 = 0;
+            while (j < 100) : (j += 1) {
+                try nf.send(a, 1, 7001, k + j); // send number 2(k+j)
+                try nf.send(a, 1, 7002, k + j); // 2(k+j)+1, no rule
+            }
+            if (!std.mem.eql(u64, &before, &rng.s)) return error.FaultDrewTheRunRng;
+            try dg.settle();
+            var got: [100]u32 = undefined;
+            for (got[0..try nf.drain(b, &got)]) |x| landed[x] = true;
+            try std.testing.expectEqual(@as(usize, 100), try nf.count(c));
+            k += 100;
+        }
+    }
+};
+
+test "sim: net faults: loss and burst loss drop exactly the datagrams the test's own copy of the draw formula predicts, and draw nothing from the run's RNG" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(nf_loss.seed_value, nf_loss.body);
+    nf_model.draws = 0;
+    var bad = false;
+    var lost: u64 = 0;
+    var lost_burst: u64 = 0;
+    const b = nf_loss.imp.burst.?;
+    for (0..nf_loss.n) |k| {
+        const send_no: u64 = 2 * k;
+        if (bad) {
+            if (nf_model.hit(nf_loss.seed_value, b.leave_ppm, send_no, 1)) bad = false;
+        } else {
+            if (nf_model.hit(nf_loss.seed_value, b.enter_ppm, send_no, 1)) bad = true;
+        }
+        const want_landed = if (bad) blk: {
+            lost_burst += 1;
+            break :blk false;
+        } else if (nf_model.hit(nf_loss.seed_value, nf_loss.imp.loss_ppm, send_no, 2)) blk: {
+            lost += 1;
+            break :blk false;
+        } else true;
+        if (want_landed != nf_loss.landed[k]) {
+            std.debug.print("datagram {d}: model says landed={}, the sim {}\n", .{ k, want_landed, nf_loss.landed[k] });
+            return error.ModelDiffers;
+        }
+    }
+    // Both causes happened often enough to mean something.
+    try std.testing.expect(lost > 200 and lost_burst > 200);
+    const st = netFaultStats();
+    try std.testing.expectEqual(lost, st.lost);
+    try std.testing.expectEqual(lost_burst, st.lost_burst);
+    try nf.noOtherCause(st, &.{ "lost", "lost_burst" });
+    try std.testing.expectEqual(nf_model.draws, netFaultDraws());
+    std.debug.print("loss model: {d} sent, {d} lost, {d} lost in bursts, {d} draws\n", .{ nf_loss.n, lost, lost_burst, nf_model.draws });
+}
+
+const nf_last_wins = struct {
+    fn body() !void {
+        const a = try nf.sock(1, 7000);
+        const b = try nf.sock(1, 7001);
+        const c = try nf.sock(1, 7002);
+        const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
+        // Everything lost, then a narrower rule that loses nothing it can
+        // see: a burst that alternates, bad on the first datagram, good on
+        // the next (enter and leave at 1000000 draw nothing).
+        setImpairment(.{}, .{ .loss_ppm = 1_000_000 });
+        setImpairment(ab, .{ .burst = .{ .enter_ppm = 1_000_000, .leave_ppm = 1_000_000 } });
+        for (0..4) |k| try nf.send(a, 1, 7001, @intCast(k)); // bad, good, bad, good
+        for (0..2) |k| try nf.send(a, 1, 7002, @intCast(k)); // the wide rule
+        try dg.settle();
+        var got: [8]u32 = undefined;
+        try std.testing.expectEqual(@as(usize, 2), try nf.drain(b, &got));
+        try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, got[0..2]);
+        try std.testing.expectEqual(@as(usize, 0), try nf.count(c));
+        // After one more datagram the burst is bad; setting the rule again
+        // starts it good, so the next datagram is lost (good to bad), not
+        // landed (bad to good).
+        try nf.send(a, 1, 7001, 4);
+        setImpairment(ab, .{ .burst = .{ .enter_ppm = 1_000_000, .leave_ppm = 1_000_000 } });
+        try nf.send(a, 1, 7001, 5);
+        try dg.settle();
+        try std.testing.expectEqual(@as(usize, 0), try nf.count(b));
+        // The wide rule set again is the most recent: it acts on a to b too.
+        setImpairment(.{}, .{ .loss_ppm = 1_000_000 });
+        try nf.send(a, 1, 7001, 6);
+        try nf.send(a, 1, 7001, 7);
+        try dg.settle();
+        try std.testing.expectEqual(@as(usize, 0), try nf.count(b));
+        // The wide rule was replaced: its counts are of the last setting,
+        // which matched the two datagrams sent since.
+        try std.testing.expectEqual(RuleStats{ .matched = 2, .dropped = 2 }, clearImpairment(.{}));
+        // The narrow rule matched 2 since it was set again, and dropped 1 of
+        // them; the other was dropped by the wide rule.
+        try std.testing.expectEqual(RuleStats{ .matched = 3, .dropped = 1 }, clearImpairment(ab));
+        try std.testing.expectEqual(@as(u64, 0), netFaultDraws());
+    }
+};
+
+test "sim: net faults: the most recently set impairment acts, setting a path again resets its burst, and every matching rule counts the datagram" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, nf_last_wins.body);
+}
+
+test "sim: net faults: a run with no rule, one with rules set and cleared before any send, and one with rules that match nothing draw nothing and give one trace and wire digest" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    const none = try dg_wire.runRules(9, .none);
+    try std.testing.expectEqual(@as(u64, 0), netFaultDraws());
+    const set_clear = try dg_wire.runRules(9, .set_clear);
+    try std.testing.expectEqual(@as(u64, 0), netFaultDraws());
+    const unmatched = try dg_wire.runRules(9, .unmatched);
+    try std.testing.expectEqual(@as(u64, 0), netFaultDraws());
+    try std.testing.expectEqual(none.trace, set_clear.trace);
+    try std.testing.expectEqual(none.wire, set_clear.wire);
+    try std.testing.expectEqual(none.trace, unmatched.trace);
+    try std.testing.expectEqual(none.wire, unmatched.wire);
+    // The rules are in the state digest, and only there.
+    try std.testing.expect(none.state != set_clear.state);
+    try std.testing.expect(none.state != unmatched.state);
+}
+
+const nf_records = struct {
+    const Variant = enum { none, partition_at_send, silence_at_send, partition_in_flight, silence_in_flight, loss_at_send, burst_at_send };
+    var variant: Variant = .none;
+    const Out = struct { wire: u64, trace: u64, state: u64 };
+    var out: Out = undefined;
+    /// The test's own wire digest of what it expects, from the record
+    /// format of `recordLanding`'s doc: time, source, destination, outcome
+    /// code, length, then the bytes.
+    var expect_hasher: std.hash.Wyhash = undefined;
+
+    fn expectRecord(at: u64, k: u32, code: u8) void {
+        var h: [25]u8 = undefined;
+        std.mem.writeInt(u64, h[0..8], at, .little);
+        @memcpy(h[8..12], &[4]u8{ 127, 0, 0, 1 });
+        std.mem.writeInt(u16, h[12..14], 7000, .little);
+        @memcpy(h[14..18], &[4]u8{ 127, 0, 0, 1 });
+        std.mem.writeInt(u16, h[18..20], 7001, .little);
+        h[20] = code;
+        std.mem.writeInt(u32, h[21..25], 4, .little);
+        expect_hasher.update(&h);
+        var p: [4]u8 = undefined;
+        std.mem.writeInt(u32, &p, k, .little);
+        expect_hasher.update(&p);
+    }
+
+    fn body() !void {
+        expect_hasher = std.hash.Wyhash.init(0);
+        const lat = wire_latency_ns;
+        const a = try nf.sock(1, 7000);
+        const b = try nf.sock(1, 7001);
+        const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
+        const t0 = clockNs();
+        try nf.send(a, 1, 7001, 0);
+        try nf.send(a, 1, 7001, 1);
+        expectRecord(t0 + lat, 0, 0);
+        expectRecord(t0 + lat, 1, 0);
+        // Both land before any rule, so only datagram 2 can be dropped.
+        try dg.settle();
+        const t2 = clockNs();
+        switch (variant) {
+            .none => {
+                try nf.send(a, 1, 7001, 2);
+                expectRecord(t2 + lat, 2, 0);
+            },
+            .partition_at_send => {
+                setPartition(ab);
+                try nf.send(a, 1, 7001, 2);
+                _ = healPartition(ab);
+                expectRecord(t2, 2, 5);
+            },
+            .silence_at_send => {
+                silence(nf.ep(1, 7001));
+                try nf.send(a, 1, 7001, 2);
+                _ = unsilence(nf.ep(1, 7001));
+                expectRecord(t2, 2, 6);
+            },
+            .partition_in_flight => {
+                try nf.send(a, 1, 7001, 2);
+                setPartition(ab);
+                try dg.settle();
+                _ = healPartition(ab);
+                expectRecord(t2 + lat, 2, 7);
+            },
+            .silence_in_flight => {
+                try nf.send(a, 1, 7001, 2);
+                silence(nf.ep(1, 7001));
+                try dg.settle();
+                _ = unsilence(nf.ep(1, 7001));
+                expectRecord(t2 + lat, 2, 8);
+            },
+            .loss_at_send => {
+                setImpairment(ab, .{ .loss_ppm = 1_000_000 });
+                try nf.send(a, 1, 7001, 2);
+                _ = clearImpairment(ab);
+                expectRecord(t2, 2, 3);
+            },
+            .burst_at_send => {
+                setImpairment(ab, .{ .burst = .{ .enter_ppm = 1_000_000, .leave_ppm = 1 } });
+                try nf.send(a, 1, 7001, 2);
+                _ = clearImpairment(ab);
+                expectRecord(t2, 2, 4);
+            },
+        }
+        const t3 = clockNs();
+        try nf.send(a, 1, 7001, 3);
+        expectRecord(t3 + lat, 3, 0);
+        try dg.settle();
+        const want: usize = if (variant == .none) 4 else 3;
+        try std.testing.expectEqual(want, try nf.count(b));
+        try std.testing.expectEqual(expect_hasher.final(), wireDigest());
+        out = .{ .wire = wireDigest(), .trace = traceHash(), .state = stateDigest() };
+    }
+
+    fn run(v: Variant) !Out {
+        variant = v;
+        try dg.run(3, body);
+        return out;
+    }
+};
+
+test "sim: net faults: each drop is in the trace and the wire digest with its cause and time, as the test's own digest of the expected records says, and the same seed gives the same digests" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    const vs = comptime std.enums.values(nf_records.Variant);
+    var outs: [vs.len]nf_records.Out = undefined;
+    for (vs, 0..) |v, i| {
+        outs[i] = try nf_records.run(v);
+        try std.testing.expectEqual(outs[i], try nf_records.run(v));
+    }
+    // Every pair of variants differs in the wire digest and in the trace:
+    // the cause and the time of the drop are both recorded. (The partition
+    // set and healed in flight differs in time from the one at send.)
+    for (outs, 0..) |x, i| {
+        for (outs[i + 1 ..], i + 1..) |y, j| {
+            if (x.wire == y.wire or x.trace == y.trace) {
+                std.debug.print("variants {t} and {t} give one wire digest or trace\n", .{ vs[i], vs[j] });
+                return error.SameDigest;
+            }
+        }
+    }
+}
+
+const nf_matched = struct {
+    fn body() !void {
+        const a = try nf.sock(1, 7000);
+        _ = try nf.sock(1, 7001);
+        const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
+        // Matched at send, then cleared.
+        setImpairment(ab, .{ .loss_ppm = 1_000_000 });
+        try nf.send(a, 1, 7001, 0);
+        _ = clearImpairment(ab);
+        // Set twice: the first time matched nothing, the second time did.
+        silence(nf.ep(1, 7001));
+        _ = unsilence(nf.ep(1, 7001));
+        silence(nf.ep(1, 7001));
+        try nf.send(a, 1, 7001, 1);
+        // Matched only in flight.
+        try nf.send(a, 1, 7002, 2);
+        setPartition(.{ .to = nf.ep(1, 7002) });
+        try dg.settle();
+        requireEveryRuleMatched();
+    }
+};
+
+test "sim: net faults: requireEveryRuleMatched passes when every rule of the run matched, cleared ones and ones that matched only in flight included" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, nf_matched.body);
+}
+
+test "sim: net faults refuse: requireEveryRuleMatched with a cleared rule and a rule in force that matched nothing" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: net faults refuse: requireEveryRuleMatched with a cleared rule and a rule in force that matched nothing", "sim: 2 fault rules matched no datagram in this run: impairment from 127.0.0.1:7000 to 127.0.0.1:7999 (first set at 0 ns); partition from *:* to *:7998 (first set at 0 ns)", struct {
+        fn body() !void {
+            begin(1);
+            setImpairment(.{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7999) }, .{ .loss_ppm = 10 });
+            _ = clearImpairment(.{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7999) });
+            setPartition(.{ .to = .{ .port = 7998 } });
+            silence(.{ .port = 7997 });
+            const fd = try dg.open();
+            try dg.bindTo(fd, dg.addr(127, 0, 0, 1, 7997));
+            _ = try dg.sendFrom(fd, dg.addr(127, 0, 0, 1, 7996), null, "x");
+            requireEveryRuleMatched();
+        }
+    }.body);
+}
+
+// Misuse of the fault API panics with a message (design section 5).
+const nf_misuse = struct {
+    fn inRun() void {
+        begin(1);
+    }
+};
+
+test "sim: net faults refuse: a rule outside a sim run" {
+    try refusal("sim: net faults refuse: a rule outside a sim run", "sim: setPartition outside a sim run", struct {
+        fn body() !void {
+            setPartition(.{});
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: a rule from another thread" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: net faults refuse: a rule from another thread", "sim: sim.silence" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(struct {
+                fn f() void {
+                    silence(.{});
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: loss_ppm over 1000000" {
+    try refusal("sim: net faults refuse: loss_ppm over 1000000", "sim: setImpairment: loss_ppm 1000001 is over 1000000", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            setImpairment(.{}, .{ .loss_ppm = 1_000_001 });
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: burst enter_ppm over 1000000" {
+    try refusal("sim: net faults refuse: burst enter_ppm over 1000000", "sim: setImpairment: burst.enter_ppm 2000000 is over 1000000", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            setImpairment(.{}, .{ .burst = .{ .enter_ppm = 2_000_000, .leave_ppm = 1 } });
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: burst leave_ppm over 1000000" {
+    try refusal("sim: net faults refuse: burst leave_ppm over 1000000", "sim: setImpairment: burst.leave_ppm 1000001 is over 1000000", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            setImpairment(.{}, .{ .burst = .{ .enter_ppm = 1, .leave_ppm = 1_000_001 } });
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: a burst that never starts" {
+    try refusal("sim: net faults refuse: a burst that never starts", "sim: setImpairment: a burst with enter_ppm 0 never starts", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            setImpairment(.{}, .{ .burst = .{ .enter_ppm = 0, .leave_ppm = 5 } });
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: a burst that never ends" {
+    try refusal("sim: net faults refuse: a burst that never ends", "sim: setImpairment: a burst with leave_ppm 0 never ends", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            setImpairment(.{}, .{ .burst = .{ .enter_ppm = 5, .leave_ppm = 0 } });
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: an impairment with every field at its default" {
+    try refusal("sim: net faults refuse: an impairment with every field at its default", "sim: setImpairment with every field at its default", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            setImpairment(.{ .to = .{ .port = 7000 } }, .{});
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: an address outside 127/8" {
+    try refusal("sim: net faults refuse: an address outside 127/8", "sim: setPartition: the address 10.0.0.1 is not in 127.0.0.0/8", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            setPartition(.{ .to = .{ .ip = .{ 10, 0, 0, 1 } } });
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: the wildcard address 0.0.0.0 in an endpoint" {
+    try refusal("sim: net faults refuse: the wildcard address 0.0.0.0 in an endpoint", "sim: silence: the address 0.0.0.0 is not in 127.0.0.0/8 (a socket bound to 0.0.0.0 is matched by its port alone)", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            silence(.{ .ip = .{ 0, 0, 0, 0 }, .port = 7000 });
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: port 0 in an endpoint" {
+    try refusal("sim: net faults refuse: port 0 in an endpoint", "sim: setImpairment: port 0 matches no datagram", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            setImpairment(.{ .from = .{ .port = 0 } }, .{ .loss_ppm = 5 });
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: clearImpairment of a path with none" {
+    try refusal("sim: net faults refuse: clearImpairment of a path with none", "sim: clearImpairment of a path that has no impairment", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            setImpairment(.{ .to = .{ .port = 7000 } }, .{ .loss_ppm = 5 });
+            _ = clearImpairment(.{ .to = .{ .port = 7001 } });
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: healPartition of a path that is not partitioned" {
+    try refusal("sim: net faults refuse: healPartition of a path that is not partitioned", "sim: healPartition of a path that is not partitioned", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            const p: Path = .{ .from = .{ .port = 7000 }, .to = .{ .port = 7001 } };
+            setPartition(p);
+            _ = healPartition(p.reversed());
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: unsilence of an endpoint that is not silenced" {
+    try refusal("sim: net faults refuse: unsilence of an endpoint that is not silenced", "sim: unsilence of an endpoint that is not silenced", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            silence(.{ .port = 7000 });
+            _ = unsilence(.{ .ip = .{ 127, 0, 0, 1 }, .port = 7000 });
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: a second partition of one path" {
+    try refusal("sim: net faults refuse: a second partition of one path", "sim: setPartition of a path that is already partitioned", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            setPartition(.{ .to = .{ .port = 7000 } });
+            setPartition(.{ .to = .{ .port = 7000 } });
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: a second silence of one endpoint" {
+    try refusal("sim: net faults refuse: a second silence of one endpoint", "sim: silence of an endpoint that is already silenced", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            silence(.{ .port = 7000 });
+            silence(.{ .port = 7000 });
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: more rules in force than the table holds" {
+    try refusal("sim: net faults refuse: more rules in force than the table holds", "sim: setPartition: 64 fault rules are in force, the most a run holds", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            var p: u16 = 1;
+            while (p <= max_rules + 1) : (p += 1) setPartition(.{ .to = .{ .port = p } });
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: more distinct rules in a run than it records" {
+    try refusal("sim: net faults refuse: more distinct rules in a run than it records", "sim: silence: 256 distinct fault rules were set in this run, the most it records", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            var p: u16 = 1;
+            while (p <= max_rule_history + 1) : (p += 1) {
+                silence(.{ .port = p });
+                _ = unsilence(.{ .port = p });
+            }
+        }
+    }.body);
+}
+
+const nf_drop_order = struct {
+    fn body() !void {
+        const a = try nf.sock(1, 7000);
+        _ = try nf.sock(1, 7001);
+        const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
+        // Two partitions match: the most recent drops and is counted.
+        setPartition(.{});
+        setPartition(ab);
+        try nf.send(a, 1, 7001, 0);
+        // A silence set before a partition still acts first.
+        _ = healPartition(ab);
+        silence(nf.ep(1, 7001));
+        setPartition(ab);
+        try nf.send(a, 1, 7001, 1);
+        try dg.settle();
+        const st = netFaultStats();
+        try std.testing.expectEqual(@as(u64, 1), st.partitioned_at_send);
+        try std.testing.expectEqual(@as(u64, 1), st.silenced_at_send);
+        try std.testing.expectEqual(RuleStats{ .matched = 1, .dropped = 0 }, healPartition(ab));
+        try std.testing.expectEqual(RuleStats{ .matched = 1, .dropped = 1 }, unsilence(nf.ep(1, 7001)));
+        try std.testing.expectEqual(RuleStats{ .matched = 2, .dropped = 0 }, healPartition(.{}));
+    }
+};
+
+test "sim: net faults: a silence drops before a partition, and of two partitions the most recent drops; every matching rule counts the datagram" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, nf_drop_order.body);
 }
