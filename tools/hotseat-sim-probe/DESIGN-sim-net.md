@@ -1000,9 +1000,19 @@ the mutants in its commits.
   model's own FAIL line; the address mutant needed rules on 127.0.0.2,
   which holds no socket). Full prediction held for every fault; nothing
   falls back to conservation only.
-- **Slice 4 is next** (section 12): promise 3, a faulted workload in ten
-  fresh processes with the heap moved, and one changed rule giving
-  another digest.
+- **Slice 4 (sitting 20): built.** Promise 3: `sim: net faults: ten fresh
+  processes with the heap moved give one transcript, wire digest, trace,
+  state digest and fault counts for a faulted run` (every kind of fault,
+  set by a controller task at virtual times; the same line on macOS and
+  Linux). Sensitivity: `sim: net faults: a faulted run repeats in one
+  process, and one changed rule or another seed gives another wire digest,
+  trace and transcript`, where one more nanosecond of delay leaves the
+  transcript and counts equal and only the wire digest differs. Mutants:
+  `mut/20-s4.json` (4, all killed; a draw that reads a heap address is
+  caught only by the fresh processes).
+- **Phase 2 is built.** Not done in it, by decision: NAT rebinding
+  (t-4100). Still open from phase 1: t-4096, t-4098 (the op model's
+  holes; flows sharing a landing instant are still kept out of it).
 - Open and filed: t-4096 (zero-length receive on an empty sim pipe), t-4098
   (the op model's holes above).
 - **For hotseat, not zio:** ENet's receive returns 0 for an empty datagram,

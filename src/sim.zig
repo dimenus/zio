@@ -8785,3 +8785,182 @@ test "sim: net faults refuse: a delay and a jitter each under the limit whose su
         }
     }.body);
 }
+
+// ---- Phase 2, slice 4: faulted runs replay (design section 7, promise 3) ----
+
+/// Three senders to one wildcard receiver under every kind of fault, set
+/// and changed by a controller task at virtual times: an impairment with
+/// loss, burst, delay, jitter, reorder and duplication on everything to
+/// port 7000; a partition of sender 2 for 2 ms; a silence of sender 0 from
+/// 3 ms on. An ev receive takes the first datagram to land; the receiver
+/// writes its own transcript of the rest: the source port's low byte, the
+/// length, and the bytes.
+const dg_faulted = struct {
+    const Variant = enum { base, partition_earlier, delay_one_ns_more };
+    var variant: Variant = .base;
+    var transcript: [2048]u8 = undefined;
+    var transcript_len: usize = 0;
+    const Out = struct { wire: u64, trace: u64, state: u64, stats: NetFaultStats };
+    var out: Out = undefined;
+    var senders: [3]i32 = undefined;
+
+    fn body() !void {
+        const rx = try dg.open();
+        try dg.bindTo(rx, dg.addr(0, 0, 0, 0, 7000));
+        try dg.os_net.enableDestinationAddress(rx);
+        for (&senders, 0..) |*fd, i| fd.* = try nf.sock(1, @intCast(7100 + i));
+        transcript_len = 0;
+        const delay: u64 = std.time.ns_per_ms + @as(u64, @intFromBool(variant == .delay_one_ns_more));
+        setImpairment(.{ .to = .{ .port = 7000 } }, .{
+            .loss_ppm = 150_000,
+            .burst = .{ .enter_ppm = 80_000, .leave_ppm = 400_000 },
+            .delay_ns = delay,
+            .jitter_ns = 2 * std.time.ns_per_ms,
+            .reorder = true,
+            .dup_ppm = 300_000,
+        });
+        var first = try dg.runtime.spawn(evFirst, .{rx});
+        var ctl = try dg.runtime.spawn(controller, .{});
+        for (0..40) |k| {
+            for (senders, 0..) |fd, i| {
+                var p: [5]u8 = .{ 'f', @intCast('0' + i), @intCast(k), 'x', 'y' };
+                _ = try dg.sendFrom(fd, dg.addr(127, 0, 0, @intCast(1 + i), 7000), null, p[0 .. 3 + k % 3]);
+            }
+            try dg.rt_mod.sleep(.fromNanoseconds(150_000));
+        }
+        try ctl.join();
+        try dg.rt_mod.sleep(.fromMilliseconds(10));
+        try first.join();
+        var buf: [16]u8 = undefined;
+        while (dg.recvInto(rx, &.{&buf})) |got| {
+            note(@truncate(got.from.port), buf[0..got.info.len]);
+        } else |err| if (err != error.WouldBlock) return err;
+        _ = unsilence(nf.ep(1, 7100));
+        _ = clearImpairment(.{ .to = .{ .port = 7000 } });
+        out = .{ .wire = wireDigest(), .trace = traceHash(), .state = stateDigest(), .stats = netFaultStats() };
+    }
+
+    fn controller() !void {
+        const start: u64 = if (variant == .partition_earlier) 600_000 else 1_500_000;
+        try dg.rt_mod.sleep(.fromNanoseconds(start));
+        const p2: Path = .{ .from = nf.ep(1, 7102) };
+        setPartition(p2);
+        try dg.rt_mod.sleep(.fromNanoseconds(3_000_000 - start));
+        silence(nf.ep(1, 7100));
+        try dg.rt_mod.sleep(.fromNanoseconds(500_000));
+        _ = healPartition(p2);
+    }
+
+    fn evFirst(rx: i32) !void {
+        var buf: [16]u8 = undefined;
+        const got = try dg.evRecvFrom(rx, &buf);
+        note(@truncate(got.from.port), buf[0..got.len]);
+    }
+
+    fn note(port_low: u8, bytes: []const u8) void {
+        transcript[transcript_len] = port_low;
+        transcript[transcript_len + 1] = @intCast(bytes.len);
+        @memcpy(transcript[transcript_len + 2 ..][0..bytes.len], bytes);
+        transcript_len += 2 + bytes.len;
+    }
+
+    fn run(seed_value: u64, v: Variant) !Out {
+        variant = v;
+        try dg.run(seed_value, body);
+        return out;
+    }
+};
+
+test "sim: net faults: a faulted run repeats in one process, and one changed rule or another seed gives another wire digest, trace and transcript" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    const base = try dg_faulted.run(9, .base);
+    var base_t: [2048]u8 = undefined;
+    const bt = base_t[0..dg_faulted.transcript_len];
+    @memcpy(bt, dg_faulted.transcript[0..dg_faulted.transcript_len]);
+    // Every kind of fault acted in it.
+    const st = base.stats;
+    inline for (.{ "lost", "lost_burst", "partitioned_at_send", "silenced_at_send", "duplicated", "delayed", "overtaking" }) |name| {
+        if (@field(st, name) == 0) {
+            std.debug.print("{s} is 0 in the faulted workload\n", .{name});
+            return error.FaultNeverActed;
+        }
+    }
+    try std.testing.expectEqual(base, try dg_faulted.run(9, .base));
+    try std.testing.expectEqualSlices(u8, bt, dg_faulted.transcript[0..dg_faulted.transcript_len]);
+    for ([_]struct { u64, dg_faulted.Variant }{ .{ 9, .partition_earlier }, .{ 10, .base } }) |c| {
+        const o = try dg_faulted.run(c[0], c[1]);
+        if (o.wire == base.wire or o.trace == base.trace or std.mem.eql(u8, bt, dg_faulted.transcript[0..dg_faulted.transcript_len])) {
+            std.debug.print("seed {d}, {t}: the same wire digest, trace or transcript as the base run\n", .{ c[0], c[1] });
+            return error.SameDigest;
+        }
+    }
+    // One more nanosecond of delay moves every landing and changes nothing
+    // a receiver sees: the same transcript and counts. Only the wire
+    // digest, which hashes each landing's time, can tell the runs apart.
+    const later = try dg_faulted.run(9, .delay_one_ns_more);
+    try std.testing.expectEqualSlices(u8, bt, dg_faulted.transcript[0..dg_faulted.transcript_len]);
+    try std.testing.expectEqual(base.stats, later.stats);
+    if (later.wire == base.wire) {
+        std.debug.print("one more nanosecond of delay: the same wire digest\n", .{});
+        return error.SameDigest;
+    }
+    std.debug.print("faulted workload: transcript {d} bytes, stats {any}\n", .{ bt.len, st });
+}
+
+test "sim: net faults: ten fresh processes with the heap moved give one transcript, wire digest, trace, state digest and fault counts for a faulted run" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    const name = "sim: net faults: ten fresh processes with the heap moved give one transcript, wire digest, trace, state digest and fault counts for a faulted run";
+    if (isDeathChild()) {
+        noCoreDump();
+        const shift = std.fmt.parseInt(usize, std.mem.span(std.c.getenv("ZIO_SIM_HEAP_SHIFT") orelse "0"), 10) catch 0;
+        if (shift > 0) _ = try std.heap.page_allocator.alloc(u8, shift * 4096 + 7);
+        const o = try dg_faulted.run(9, .base);
+        var line_buf: [8192]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&line_buf);
+        try w.print("sim-faulted: wire={x:0>16} trace={x:0>16} state={x:0>16}", .{ o.wire, o.trace, o.state });
+        inline for (comptime std.meta.fieldNames(NetFaultStats)) |f| try w.print(" {s}={d}", .{ f, @field(o.stats, f) });
+        try w.writeAll(" transcript=");
+        for (dg_faulted.transcript[0..dg_faulted.transcript_len]) |b| try w.print("{x:0>2}", .{b});
+        try w.writeByte('\n');
+        _ = std.c.write(2, w.buffered().ptr, w.buffered().len);
+        childDone(name);
+        return;
+    }
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_len = try std.process.executablePath(io, &exe_buf);
+    var first: ?[]u8 = null;
+    defer if (first) |f| gpa.free(f);
+    var k: usize = 1;
+    while (k <= 10) : (k += 1) {
+        var env: std.process.Environ.Map = .init(gpa);
+        defer env.deinit();
+        if (std.c.getenv("PATH")) |path| try env.put("PATH", std.mem.span(path));
+        try env.put("TEST_FILTER", name);
+        try env.put(death_child_env, "1");
+        var shift_buf: [16]u8 = undefined;
+        try env.put("ZIO_SIM_HEAP_SHIFT", try std.fmt.bufPrint(&shift_buf, "{d}", .{k * 13}));
+        const res = try std.process.run(gpa, io, .{
+            .argv = &.{exe_buf[0..exe_len]},
+            .environ_map = &env,
+            .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } },
+        });
+        defer gpa.free(res.stdout);
+        defer gpa.free(res.stderr);
+        try checkDoneMarkers(name, res.stderr);
+        const at = std.mem.indexOf(u8, res.stderr, "sim-faulted: ") orelse return error.NoLine;
+        const end_at = std.mem.indexOfScalarPos(u8, res.stderr, at, '\n') orelse return error.NoLine;
+        const got = res.stderr[at..end_at];
+        if (first) |f| {
+            if (!std.mem.eql(u8, f, got)) {
+                std.debug.print("child {d}: {s}\nchild 1: {s}\n", .{ k, got, f });
+                return error.ChildrenDiffer;
+            }
+        } else first = try gpa.dupe(u8, got);
+    }
+    // The transcript is not empty: datagrams landed in it.
+    const t_at = (std.mem.indexOf(u8, first.?, "transcript=") orelse return error.NoTranscript) + "transcript=".len;
+    try std.testing.expect(first.?.len - t_at > 100);
+    std.debug.print("10 children: {s}\n", .{first.?[0..@min(first.?.len, 400)]});
+}
