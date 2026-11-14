@@ -479,19 +479,35 @@ The scripts the gates below use are beside them, in `zio-sim6-tools/` there
   `wireDigest()`; the datagram table in `stateDigest` only for a run that
   opened a socket. Two pipe-only probes' hashes are pinned, so promise 1 is a
   test now, not only starh2's gate.
+- **The native-exit refusals (ed2ecee):** `sim.refuseSimFd(@src(), fd)` first
+  in each fd-taking function of `src/os/` without a sim branch (75 lines, 7
+  imports); `src/sim_exits_test.zig` fails the build when one is missing. Its
+  rules and hand lists are in its header comment; the cost against upstream is
+  in ed2ecee's message.
 
-### Next (phase 1, in this order)
+### Next (phase 1): the C bridge in both builds, then close the seven groups
 
-1. **The native-exit refusals (section 3),** with the script that lists every
-   fd-taking function in `src/os/` and a verdict per caller. Known gap: the
-   layer's `close` on a sim **pipe** fd still reaches the kernel (EBADF is
-   `unreachable` there). A proposal, not yet decided: put the refusal in each
-   fd-taking function of `src/os/` itself (behind `comptime sim.compiled_in`,
-   so a build without sim is unchanged), which makes every caller safe at
-   once, and replace the one-off script with a test that reads `src/os/*.zig`
-   through `@embedFile` and fails when a `pub fn` that takes an fd has neither
-   the refusal nor a sim branch. Then a new exit cannot be added without it.
-2. **The C-bridge tests in both builds, and the seven acceptance groups.**
+Where each acceptance group of section 11 stands (each item names the commit
+whose tests cover it):
+
+| group | covered now, at the Zig level | still needed |
+|---|---|---|
+| 1 cross-interface | layer to ev and ev to layer, bytes, sources, two buffers each way (da0b4e1) | the same from C |
+| 2 bridge semantics | non-blocking read back, WouldBlock, empty datagram, truncation consumes, unsupported option, ENet-shaped host creation (1dab14f, ec6ec37) | from C, with ENet's return codes: 0, -2, -1, `ENET_SOCKET_WAIT_INTERRUPT` |
+| 3 addressing | all five items (1dab14f) | none |
+| 4 readiness | all six items (1dab14f, da0b4e1) | none |
+| 5 limits | all four items (ec6ec37) | none |
+| 6 isolation and replay | all seven items (da0b4e1, 31783f6, ed2ecee, the starh2 gate) | none |
+| 7 parity | the source-address case (4812568); the layer's metadata tests run against real sockets on macOS and Linux (1dab14f) | the same C bridge against the real layer, same return values |
+
+So what is left is one tiny C file, an ENet-shaped bridge over the layer
+(`_create`, `_bind`, `_get_address`, `_set_option`, `_get_option`, `_send`,
+`_receive`, `_wait`, `_destroy`, and `socketset_select`), returning ENet's
+codes (section 3.2). It calls the layer through `export fn` shims that only a
+test build compiles. The same C tests run against the sim (a sim build, in a
+run) and against real loopback sockets (a build without sim): groups 1, 2 and
+7 through C. Not done: how the test step compiles a C file (build.zig has no C
+sources in its test step today) is the first thing to settle.
 
 ### Decided by the design's owner (2026-11-14, after reports 6-8)
 
@@ -501,7 +517,8 @@ The scripts the gates below use are beside them, in `zio-sim6-tools/` there
   not modelled panics;** `IP_TTL` is not modelled (sections 6 and 8).
 - **The native-exit refusals go inside each fd-taking function of
   `src/os/`,** one helper call first in the body, nothing else changed in
-  those files, with a structural test that fails toward noise (step 1 below).
+  those files, with a structural test that fails toward noise (done in
+  ed2ecee).
 
 ### How to run things
 
@@ -518,8 +535,10 @@ The scripts the gates below use are beside them, in `zio-sim6-tools/` there
   Build `zig build test -Dtarget=aarch64-linux -Demit-test-bin=true --prefix
   <dir>` (with and without `-Dsim=true -Dscheduling=pinned`) and run it in
   colima as the memory note `linux-io-uring-tests-on-mac` says
-  (`TEST_FILTER=<one substring>`). `-Dtarget=x86_64-windows` compiles the
-  Windows test binary.
+  (`TEST_FILTER=<one substring>`). The structural test reads `src/os/` from
+  the working directory, so copy `src/os` into the image beside the binary
+  (`/work/src/os`). `-Dtarget=x86_64-windows` compiles the Windows test
+  binary.
 - **Unchanged without sim:** `textcmp.sh <base commit> <src dir> <label>`
   builds the eight examples ReleaseFast from the base and from the src dir at
   one path, and compares `__TEXT,__text`. When they differ,
