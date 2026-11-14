@@ -154,6 +154,31 @@ var due: [max_due]Due = undefined;
 var due_len: usize = 0;
 var next_io_id: u32 = 0;
 
+/// The loop group of this run's loops: claimed by the first loop that
+/// submits or harvests sim I/O (`claimLoopGroup`), cleared at `begin`.
+var run_loop_group: ?*const anyopaque = null;
+
+/// A sim run has one loop group. The live table and the due list are the
+/// run's, not a loop's: every loop's harvest takes every due op and finishes
+/// it through its own state, so a loop of a second group would take ops
+/// submitted on the first, and their completions would never reach the loop
+/// that submitted them (round 4 of the outside review, finding 1; older than
+/// the sim network: it happens with pipe ops at 3417a77). One Runtime has one
+/// group for all its executors (`Runtime.loop_group`), and a sim runtime is
+/// one or two executors with the main one; a second group comes only from a
+/// second Runtime, or an `ev.Loop` of its own, in the same run. Neither
+/// works today (two runtimes deadlock before a datagram reaches a task), so
+/// a second group refuses here instead of scoping the tables per group: at
+/// a sim Runtime's init (`Runtime.initStatic`), and at a loop's first submit
+/// or harvest.
+pub fn claimLoopGroup(group: *const anyopaque, comptime what: []const u8) void {
+    const g = run_loop_group orelse {
+        run_loop_group = group;
+        return;
+    };
+    if (g != group) panic("sim: a sim run has one loop group: " ++ what ++ " (a second Runtime, or an ev.Loop of its own, in one run); a second group's harvest would take the first group's ops and finish them on the wrong loop", .{});
+}
+
 const LiveOp = struct {
     c: *anyopaque,
     id: u32,
@@ -353,6 +378,7 @@ fn refuse(comptime msg: []const u8, args: anytype) noreturn {
 }
 
 fn resetIo() void {
+    run_loop_group = null;
     ends = @splat(.{});
     due_len = 0;
     next_io_id = 0;
@@ -5912,6 +5938,97 @@ const pipe_zero_room = struct {
 test "sim: pipe: a receive with no room on a full pipe does not wake the send parked on it, and one with room does" {
     if (comptime !compiled_in) return error.SkipZigTest;
     for (1..9) |s| try dg.run(s, pipe_zero_room.body);
+}
+
+/// Round 4 of the outside review, finding 1: the due list is the sim's, not a
+/// loop's, so a loop's harvest takes every due op, also one submitted on a
+/// loop of another LoopGroup, and finishes it through its own state. Two
+/// bare loops A and B (each its own group): an op submitted on B with no
+/// callback, then A polled. Before the refusal, A took the completion into
+/// its own dispatched queue and B never saw it.
+const two_groups = struct {
+    const Loop = @import("ev/loop.zig").Loop;
+
+    fn run(comptime pipe: bool) !void {
+        begin(1);
+        defer end();
+        var a: Loop = undefined;
+        var b: Loop = undefined;
+        try a.init(.{});
+        defer {
+            a.bindThread();
+            a.deinit();
+        }
+        try b.init(.{});
+        defer {
+            b.bindThread();
+            b.deinit();
+        }
+        var poll_op: dg.ev.NetPoll = undefined;
+        var send_op: dg.ev.NetSend = undefined;
+        var iov: [1]dg.os_net.iovec_const = undefined;
+        const c = if (pipe) blk: {
+            const fds = pipePair();
+            send_op = dg.ev.NetSend.init(fds[1], .fromSlice("x", &iov), .{});
+            break :blk &send_op.c;
+        } else blk: {
+            const fd = try dg.open();
+            poll_op = dg.ev.NetPoll.init(fd, .send);
+            break :blk &poll_op.c;
+        };
+        b.bindThread();
+        b.add(c);
+        a.bindThread();
+        try a.poll(.fromMilliseconds(10));
+        const took = a.nextDispatched();
+        b.bindThread();
+        try b.poll(.fromMilliseconds(10));
+        const got = b.nextDispatched();
+        std.debug.print("loop A's dispatched queue: {s}; loop B's: {s}\n", .{ if (took == c) "the op submitted on B" else "nothing", if (got == c) "its own op" else "nothing" });
+        return error.NoRefusal;
+    }
+};
+
+test "sim: refuses a loop of a second loop group polling in one run, which would take a datagram op submitted on the first" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: refuses a loop of a second loop group polling in one run, which would take a datagram op submitted on the first", "sim: a sim run has one loop group", struct {
+        fn body() !void {
+            try two_groups.run(false);
+        }
+    }.body);
+}
+
+test "sim: refuses a loop of a second loop group polling in one run, which would take a pipe op submitted on the first" {
+    try refusal("sim: refuses a loop of a second loop group polling in one run, which would take a pipe op submitted on the first", "sim: a sim run has one loop group", struct {
+        fn body() !void {
+            try two_groups.run(true);
+        }
+    }.body);
+}
+
+test "sim: refuses two Runtimes in one sim run" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: refuses two Runtimes in one sim run", "sim: a sim run has one loop group", struct {
+        var got: usize = 0;
+        fn exchange() !void {
+            const rx = try dg.open();
+            try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 7100));
+            const tx = try dg.open();
+            _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 7100), null, "hi");
+            var buf: [8]u8 = undefined;
+            got = (try dg.evRecvFrom(rx, &buf)).len;
+        }
+        fn body() !void {
+            begin(1);
+            var o: dg.rt_mod.RuntimeOptions = .{ .executors = .exact(1), .thread_pool = .{ .max_threads = 0 } };
+            o.stack_pool.shrink_interval = .zero;
+            const rt1 = try dg.rt_mod.Runtime.init(std.heap.page_allocator, o);
+            const rt2 = try dg.rt_mod.Runtime.init(std.heap.page_allocator, o);
+            _ = rt2;
+            var h = try rt1.spawn(exchange, .{});
+            try h.join();
+        }
+    }.body);
 }
 
 test "sim: pipe refuses: a second ev receive on an end whose receive is woken and not yet harvested" {

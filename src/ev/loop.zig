@@ -1770,6 +1770,7 @@ pub const Loop = struct {
     /// otherwise the op parks on the pipe. A real fd never gets here: during
     /// a run that is input at a real time, so it refuses.
     fn submitSimIo(self: *Loop, c: *Completion) void {
+        sim.claimLoopGroup(self.loop_group, "a loop of another group submitted an op");
         if (simOpHandle(c)) |h| {
             if (!sim.isSimFd(h)) sim.panic("sim: a real fd {d} reached sim op {s} during a run", .{ h, @tagName(c.op) });
             if (sim.isDgramFd(h)) return submitSimDgram(c);
@@ -1958,6 +1959,7 @@ pub const Loop = struct {
     /// Sim: complete every simulated op whose due time has come, in a
     /// seeded order.
     fn harvestSimIo(self: *Loop) void {
+        sim.claimLoopGroup(self.loop_group, "a loop of another group polled");
         var buf: [sim.max_due]sim.TakenDue = undefined;
         const n = sim.takeDue(&buf);
         var i: usize = 0;

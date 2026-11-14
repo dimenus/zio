@@ -2272,6 +2272,9 @@ pub const Runtime = struct {
             if (options.metrics_log_interval.value > 0) {
                 @panic("sim: metrics_log_interval would start a real monitor thread");
             }
+            // All its executors' loops share `self.loop_group`; a second
+            // Runtime in the run refuses here (`sim.claimLoopGroup`).
+            sim.claimLoopGroup(&self.loop_group, "a second Runtime was initialized");
         }
 
         self.* = .{
