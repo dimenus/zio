@@ -673,6 +673,10 @@ fn pushDueKind(c: *anyopaque, kind: DueKind, id: u32) void {
 fn pushDueAt(c: *anyopaque, kind: DueKind, id: u32, at: u64) void {
     if (due_len >= max_due) panic("sim: I/O due list full", .{});
     if (due_len >= live_len) panic("sim: {d} ops due but only {d} live: an op is due twice, or due without an id", .{ due_len + 1, live_len });
+    // A datagram op due later than now would wait in the list while tasks
+    // run, and one of them could close its socket and reuse the number
+    // before the harvest. See `wakeParked`.
+    if ((kind == .dgram or kind == .dgram_closed) and at != clock_ns) panic("sim: a datagram op made due at {d} ns, not now ({d} ns)", .{ at, clock_ns });
     due[due_len] = .{
         .c = c,
         .due_at = at,
@@ -1685,6 +1689,15 @@ fn land(w: WireDatagram) void {
     wakeParked(d);
 }
 
+/// A landing makes the op parked on its socket due now. Landings happen only
+/// in `landDue`, at the start of `takeDue`, and that same call takes every
+/// op due by now, so the harvest runs this op before any task can close the
+/// socket or reuse its number: the op only ever sees the socket it parked
+/// on. A close that comes first wakes it as `dgram_closed` instead. So a due
+/// datagram op is never in the future (`pushDueAt` checks it), and no sim
+/// path needs a socket generation. Test: `sim: dgram ev: an op woken by a
+/// landing, with its socket closed and its number reused near that time,
+/// ...`.
 fn wakeParked(d: *Dgram) void {
     const p = d.parked orelse return;
     d.parked = null;
@@ -4866,6 +4879,119 @@ const dg_wide = struct {
 test "sim: dgram ev: 64 sockets, each with a parked receive, all woken at one virtual time" {
     if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
     try dg.run(3, dg_wide.body);
+}
+
+/// The owner's case after finding 2: an op parked on socket A is woken by a
+/// datagram landing, and a task closes A, maybe opens a socket that takes
+/// A's number, and maybe sends that one a datagram, all near the landing's
+/// virtual time. The old op must end with A's datagram, or
+/// FileDescriptorNotASocket, soon; never with the new socket's datagram, and
+/// never by waiting on the new socket.
+const dg_land_close = struct {
+    const Kind = enum { recv, poll };
+    const Outcome = enum { got_old, not_a_socket };
+    var kind: Kind = .recv;
+    /// When the closer acts, from the send of A's datagram.
+    var close_after_ns: u64 = 0;
+    var reuse = true;
+    var send_new = true;
+    var a: i32 = 0;
+    var tx: i32 = 0;
+    var outcome: ?Outcome = null;
+    var done_at: u64 = 0;
+
+    fn waiter() !void {
+        var buf: [8]u8 = undefined;
+        switch (kind) {
+            .recv => if (dg.evRecvFrom(a, &buf)) |r| {
+                if (!std.mem.eql(u8, buf[0..r.len], "old")) {
+                    std.debug.print("the receive got \"{s}\"\n", .{buf[0..r.len]});
+                    return error.GotAnotherSocketsDatagram;
+                }
+                outcome = .got_old;
+            } else |err| switch (err) {
+                error.FileDescriptorNotASocket => outcome = .not_a_socket,
+                else => return err,
+            },
+            .poll => if (dg.evPoll(a, .recv)) |_| {
+                outcome = .got_old;
+            } else |err| switch (err) {
+                error.FileDescriptorNotASocket => outcome = .not_a_socket,
+                else => return err,
+            },
+        }
+        done_at = clock_ns;
+    }
+
+    fn closer() !void {
+        try dg.rt_mod.sleep(.fromNanoseconds(close_after_ns));
+        dg.os_net.close(a);
+        if (!reuse) return;
+        const b = try dg.open();
+        if (b != a) return error.NumberNotReused;
+        try dg.bindTo(b, dg.addr(127, 0, 0, 1, 7000));
+    }
+
+    fn body() !void {
+        outcome = null;
+        a = try dg.open();
+        try dg.bindTo(a, dg.addr(127, 0, 0, 1, 7000));
+        tx = try dg.open();
+        try dg.bindTo(tx, dg.addr(127, 0, 0, 1, 7100));
+        var w = try dg.runtime.spawn(waiter, .{});
+        try dg.rt_mod.sleep(.fromMilliseconds(1));
+        const landing = clock_ns + wire_latency_ns;
+        _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 7000), null, "old");
+        var c = try dg.runtime.spawn(closer, .{});
+        // Late: the new socket's datagram lands well after A's.
+        try dg.rt_mod.sleep(.fromMilliseconds(5));
+        const late = clock_ns;
+        if (send_new and reuse) _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 7000), null, "new");
+        try dg.rt_mod.sleep(.fromMilliseconds(1));
+        try c.join();
+        // An op wrongly left parked on the new socket ends here, late.
+        if (reuse) dg.os_net.close(a);
+        try w.join();
+        dg.os_net.close(tx);
+        if (done_at >= late) {
+            std.debug.print("the old op ended at {d} ns, after the late mark {d} (A's datagram landed at {d})\n", .{ done_at, late, landing });
+            return error.OldOpOutlivedTheClose;
+        }
+        // Each op ended once, and nothing is left.
+        try std.testing.expectEqual(@as(usize, 0), live_len);
+        try std.testing.expectEqual(@as(usize, 0), due_len);
+    }
+};
+
+test "sim: dgram ev: an op woken by a landing, with its socket closed and its number reused near that time, ends with its own datagram or FileDescriptorNotASocket" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    const T = dg_land_close;
+    var seen: [2][2]usize = .{ .{ 0, 0 }, .{ 0, 0 } };
+    var runs: usize = 0;
+    for ([_]T.Kind{ .recv, .poll }) |k| {
+        for ([_]bool{ true, false }) |reuse| {
+            for ([_]bool{ true, false }) |send_new| {
+                if (!reuse and send_new) continue;
+                for ([_]u64{ wire_latency_ns - 1, wire_latency_ns, wire_latency_ns + 1 }) |after| {
+                    for (1..11) |s| {
+                        T.kind = k;
+                        T.reuse = reuse;
+                        T.send_new = send_new;
+                        T.close_after_ns = after;
+                        dg.run(s, T.body) catch |err| {
+                            std.debug.print("{t}, reuse {}, new datagram {}, close {d} ns after the send, seed {d}: {t}\n", .{ k, reuse, send_new, after, s, err });
+                            return err;
+                        };
+                        seen[@backingInt(k)][@backingInt(T.outcome.?)] += 1;
+                        runs += 1;
+                    }
+                }
+            }
+        }
+    }
+    std.debug.print("{d} runs; receive: {d} got A's datagram, {d} FileDescriptorNotASocket; poll: {d} readable, {d} FileDescriptorNotASocket\n", .{ runs, seen[0][0], seen[0][1], seen[1][0], seen[1][1] });
+    // Both sides of the close were reached, for both kinds of op.
+    for (seen) |row| for (row) |n| try std.testing.expect(n > 0);
 }
 
 test "sim: dgram ev: close wakes an ev receive parked on the socket" {
