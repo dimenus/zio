@@ -244,6 +244,7 @@ pub const timedWait = waitTimeout;
 /// condition.signal();
 /// ```
 pub fn signal(self: *Condition) void {
+    @import("../sim.zig").refuseOtherThread("Condition.signal");
     if (self.wait_queue.pop()) |wait_node| {
         Waiter.fromNode(wait_node).signal();
     }
@@ -265,6 +266,7 @@ pub fn signal(self: *Condition) void {
 /// condition.broadcast();
 /// ```
 pub fn broadcast(self: *Condition) void {
+    @import("../sim.zig").refuseOtherThread("Condition.broadcast");
     while (self.wait_queue.pop()) |wait_node| {
         Waiter.fromNode(wait_node).signal();
     }

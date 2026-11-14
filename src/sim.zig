@@ -153,6 +153,7 @@ pub const Preempt = struct {
 var preempt: Preempt = .{ .one_in = 0, .min_ns = 0, .max_ns = 0 };
 
 pub fn setPreempt(p: Preempt) void {
+    refuseOtherThread("sim.setPreempt");
     if (p.one_in != 0 and (p.min_ns == 0 or p.max_ns < p.min_ns)) {
         panic("sim: setPreempt needs 0 < min_ns <= max_ns", .{});
     }
@@ -210,23 +211,37 @@ fn threadKey() u64 {
     return @as(u64, @intCast(std.Thread.getCurrentId())) + 1;
 }
 
-/// Under sim, every zio operation runs on the thread that called `begin`:
-/// one thread is what makes a run replay from its seed. A task wake, or a
-/// change to a primitive that a task can see later (`Event.set`, a mutex
-/// taken), made by another thread lands at a real time the seed does not
-/// choose, so once `begin` ran it panics here. The callers check whether or
-/// not a task waits at that moment: a refusal that fired only when one
-/// waits would itself depend on timing.
+/// The rule, for a sim run (from `begin` to `end`): every public zio
+/// operation that changes state a task can later see runs on the thread that
+/// called `begin`, and is checked at its entry, before its first write. A
+/// change made by another thread lands at a real time the seed does not
+/// choose, so the run would stop being a function of its seed. The check is
+/// made whether or not a task waits at that moment: a refusal that fired only
+/// when one waits would itself depend on timing.
 ///
-/// Called at the entry of `Executor.scheduleTask`, `LoopState.requestWake`,
-/// `Event.set`/`reset`, `Mutex.tryLock`/`unlock` (so every primitive built on
-/// the zio mutex: channels, semaphores, conditions, barriers),
-/// `Futex.wake`, `Future.set` and `ev.Async.notify`. Not covered: plain
-/// atomics a program shares with a thread, and C code; the simulator cannot
-/// see those. Compiled out without sim.
+/// Each such operation either calls `refuseOtherThread` first, or makes its
+/// first write through one that does (`RwLock.tryLock` through
+/// `Mutex.tryLock`; channels, semaphores, barriers through their mutex; every
+/// blocking wait through the waiter it creates, `Waiter.Direct.init`). Not
+/// covered, and out of the rule: read-only operations; operations whose own
+/// contract already requires the loop's thread in every build (`Loop.add`,
+/// `Loop.poll`, `Loop.cancel`, ...); plain atomics a program shares with a
+/// thread; C code. The simulator cannot see the last two. Compiled out
+/// without sim.
+///
+/// The entry points and the reasoning for each public function are in the
+/// commit that added this list (t-4085 round 3).
 pub inline fn refuseOtherThread(comptime what: []const u8) void {
     if (comptime !compiled_in) return;
     checkSimThread(what);
+}
+
+/// For what a run refuses on every thread, the sim thread included: input
+/// that arrives at a real time (OS signals, a pool worker's completion).
+pub inline fn refuseDuringRun(comptime what: []const u8) void {
+    if (comptime !compiled_in) return;
+    if (sim_thread.load(.acquire) == 0) return;
+    refuse("sim: " ++ what ++ " during a sim run", .{});
 }
 
 fn checkSimThread(comptime what: []const u8) void {
@@ -234,7 +249,20 @@ fn checkSimThread(comptime what: []const u8) void {
     if (owner == 0 or owner == threadKey()) return;
     // No TRACE_HASH: the hasher belongs to the sim thread, which may be
     // updating it right now. The seed is enough to replay.
-    std.debug.panic("sim: {s} from a thread that is not the sim thread (the one that called sim.begin) SEED={d}", .{ what, current_seed });
+    refuse("sim: " ++ what ++ " from a thread that is not the sim thread (the one that called sim.begin)", .{});
+}
+
+/// Writes the line to fd 2 itself before panicking. A program whose
+/// `std_options_debug_io` is `zio.debug_io` prints panics through zio's
+/// stderr lock, which is a zio mutex, and so is refused on this thread too:
+/// the panic would then print nothing at all.
+fn refuse(comptime msg: []const u8, args: anytype) noreturn {
+    var buf: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, msg ++ " SEED={d}\n", args ++ .{current_seed}) catch msg ++ "\n";
+    if (comptime builtin.link_libc and builtin.os.tag != .windows) {
+        _ = std.c.write(2, line.ptr, line.len);
+    }
+    std.debug.panic("{s}", .{line[0 .. line.len - 1]});
 }
 
 fn resetIo() void {
@@ -245,12 +273,14 @@ fn resetIo() void {
 }
 
 pub fn end() void {
+    refuseOtherThread("sim.end");
     sim_thread.store(0, .release);
     begun = false;
     clock_routed = true;
 }
 
 pub fn setClockRouted(routed: bool) void {
+    refuseOtherThread("sim.setClockRouted");
     clock_routed = routed;
 }
 
@@ -455,6 +485,7 @@ fn allocEnd() u8 {
 /// Bidirectional pair (socketpair shape). No kernel fd.
 pub fn pipePair() [2]i32 {
     if (comptime !compiled_in) unreachable;
+    refuseOtherThread("sim.pipePair");
     if (!begun) panic("sim: pipePair before begin", .{});
     const a = allocEnd();
     const b = allocEnd();
@@ -547,6 +578,7 @@ pub const IoSubmit = union(enum) {
 /// Arm send faults on `fd`'s sends. Replaces any earlier setting.
 pub fn setSendFaults(fd: i32, faults: SendFaults) void {
     if (comptime !compiled_in) unreachable;
+    refuseOtherThread("sim.setSendFaults");
     const i = endIndex(fd) orelse panic("sim: setSendFaults on an unknown fd {d}", .{fd});
     ends[i].faults = faults;
 }
@@ -1041,10 +1073,34 @@ fn expectChildPanics(comptime test_name: []const u8, comptime want: []const u8) 
         .signal => |s| s == .ABRT,
         else => false,
     };
-    if (!died or std.mem.indexOf(u8, res.stderr, want) == null) {
+    if (!died or !hasPanicLine(res.stderr, want)) {
         std.debug.print("child of \"{s}\": term {any}, wanted SIGABRT and \"{s}\"; stderr:\n{s}\n", .{ test_name, res.term, want, res.stderr });
         return error.ChildDidNotPanic;
     }
+}
+
+/// Whether a line of `stderr` is the panic itself saying `want`: the line
+/// `refuse` writes, or `thread <n> panic: <want>`. A plain substring match is
+/// not enough: a panic's stack trace prints source lines, and the test's own
+/// line holds `want` as a literal, so any other panic would match it.
+fn hasPanicLine(stderr: []const u8, want: []const u8) bool {
+    var it = std.mem.splitScalar(u8, stderr, '\n');
+    while (it.next()) |raw| {
+        var line = raw;
+        if (std.mem.startsWith(u8, line, "thread ")) {
+            const at = std.mem.indexOf(u8, line, " panic: ") orelse continue;
+            line = line[at + " panic: ".len ..];
+        }
+        if (std.mem.startsWith(u8, line, want)) return true;
+    }
+    return false;
+}
+
+test "sim: hasPanicLine matches the panic, not a source line in its trace" {
+    const want = "sim: Event.set from a thread";
+    try std.testing.expect(hasPanicLine("thread 7 panic: sim: Event.set from a thread that is not\n", want));
+    try std.testing.expect(hasPanicLine("x\nsim: Event.set from a thread that is not SEED=1\n", want));
+    try std.testing.expect(!hasPanicLine("thread 7 panic: sim: deadlock clock_ns=0\n    try refusal(\"t\", \"sim: Event.set from a thread\", struct {\n", want));
 }
 
 const death = struct {
@@ -1195,4 +1251,632 @@ test "sim: every task parked with only the shrink timer pending is a deadlock, t
     if (comptime !compiled_in) return error.SkipZigTest;
     if (!isDeathChild()) return expectChildPanics("sim: every task parked with only the shrink timer pending is a deadlock, two executors", "sim: deadlock clock_ns=0");
     try deadlockChild(2);
+}
+
+// ---- Runs that must end normally (round 3) ----
+
+/// Like `expectChildPanics`, for a run that must end normally: the child
+/// must exit 0 within 30 s.
+fn expectChildSucceeds(comptime test_name: []const u8) !void {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_len = try std.process.executablePath(io, &exe_buf);
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    if (std.c.getenv("PATH")) |path| try env.put("PATH", std.mem.span(path));
+    try env.put("TEST_FILTER", test_name);
+    try env.put(death_child_env, "1");
+    const res = try std.process.run(gpa, io, .{
+        .argv = &.{exe_buf[0..exe_len]},
+        .environ_map = &env,
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } },
+    });
+    defer gpa.free(res.stdout);
+    defer gpa.free(res.stderr);
+    switch (res.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    std.debug.print("child of \"{s}\": term {any}, wanted exit 0; stderr:\n{s}\n", .{ test_name, res.term, res.stderr });
+    return error.ChildFailed;
+}
+
+/// A1 (round 3): a callback on executor 1 notifies an async handle on
+/// executor 0 after `simPollAll` already polled executor 0. That handle's
+/// callback releases the parked task. Nothing is ready and no task timer is
+/// armed at that moment, but loop 0 has a wake pending: not a deadlock.
+const cross_loop = struct {
+    const Loop = @import("ev/loop.zig").Loop;
+    const Completion = @import("ev/completion.zig").Completion;
+    const Async = @import("ev/completion.zig").Async;
+    const Timer = @import("ev/completion.zig").Timer;
+    const Event = @import("sync/Event.zig");
+    const rt_mod = @import("runtime.zig");
+
+    var ev: Event = .init;
+    var async_h: Async = undefined;
+    var timer: Timer = undefined;
+
+    fn onAsync(_: *Loop, _: *Completion) void {
+        ev.set();
+    }
+
+    fn onTimer(_: *Loop, _: *Completion) void {
+        async_h.notify();
+    }
+
+    fn waiter() void {
+        async_h.c.callback = onAsync;
+        rt_mod.getCurrentExecutor().loop.add(&async_h.c);
+        ev.wait() catch {};
+    }
+
+    fn arm() void {
+        rt_mod.sleep(.fromMilliseconds(10)) catch {};
+        timer.c.callback = onTimer;
+        rt_mod.getCurrentExecutor().loop.add(&timer.c);
+    }
+
+    fn runSeed(seed_value: u64, shrink_timer: bool) !void {
+        begin(seed_value);
+        defer end();
+        ev = .init;
+        async_h = Async.init();
+        timer = Timer.init(.{ .duration = .zero });
+        var o: rt_mod.RuntimeOptions = .{
+            .executors = .exact(2),
+            .thread_pool = .{ .max_threads = 0 },
+        };
+        // Without it no timer is armed at all, and the mux reaches its last
+        // deadlock check instead of the shrink-timer one.
+        if (!shrink_timer) o.stack_pool.shrink_interval = .zero;
+        const rt = try rt_mod.Runtime.init(std.heap.page_allocator, o);
+        defer rt.deinit();
+        var w = try rt.spawnInto(.{ .executor = 0 }, waiter, .{});
+        var a = try rt.spawnInto(.{ .executor = 1 }, arm, .{});
+        a.join();
+        w.join();
+    }
+};
+
+test "sim: a wake left pending on a loop already polled is not a deadlock, two executors" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildSucceeds("sim: a wake left pending on a loop already polled is not a deadlock, two executors");
+    noCoreDump();
+    var s: u64 = 1;
+    while (s <= 20) : (s += 1) try cross_loop.runSeed(s, true);
+}
+
+test "sim: a wake left pending on a loop already polled is not a deadlock, two executors, no timer at all" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildSucceeds("sim: a wake left pending on a loop already polled is not a deadlock, two executors, no timer at all");
+    noCoreDump();
+    var s: u64 = 1;
+    while (s <= 20) : (s += 1) try cross_loop.runSeed(s, false);
+}
+
+/// The same cross-loop wake with a task timer armed elsewhere (a 1 s sleep
+/// on executor 1): the pending wake must be handled at the time it was made,
+/// not after the clock jumps to the other timer.
+const cross_loop_timed = struct {
+    const rt_mod = @import("runtime.zig");
+    var woke_at_ns: u64 = 0;
+
+    fn waiter() void {
+        cross_loop.waiter();
+        woke_at_ns = clockNs();
+    }
+
+    fn sleeper() void {
+        rt_mod.sleep(.fromSeconds(1)) catch {};
+    }
+
+    fn runSeed(seed_value: u64) !void {
+        begin(seed_value);
+        defer end();
+        cross_loop.ev = .init;
+        cross_loop.async_h = cross_loop.Async.init();
+        cross_loop.timer = cross_loop.Timer.init(.{ .duration = .zero });
+        woke_at_ns = 0;
+        const rt = try rt_mod.Runtime.init(std.heap.page_allocator, .{
+            .executors = .exact(2),
+            .thread_pool = .{ .max_threads = 0 },
+        });
+        defer rt.deinit();
+        var w = try rt.spawnInto(.{ .executor = 0 }, waiter, .{});
+        var a = try rt.spawnInto(.{ .executor = 1 }, cross_loop.arm, .{});
+        var s = try rt.spawnInto(.{ .executor = 1 }, sleeper, .{});
+        a.join();
+        w.join();
+        s.join();
+        if (woke_at_ns != 10 * std.time.ns_per_ms) {
+            std.debug.print("seed {d}: the waiter woke at virtual {d} ns, wanted 10 ms\n", .{ seed_value, woke_at_ns });
+            return error.WokeLate;
+        }
+    }
+};
+
+test "sim: a wake left pending on a loop already polled is handled before the clock moves, two executors" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildSucceeds("sim: a wake left pending on a loop already polled is handled before the clock moves, two executors");
+    noCoreDump();
+    var s: u64 = 1;
+    while (s <= 20) : (s += 1) try cross_loop_timed.runSeed(s);
+}
+
+// ---- Round 3 refusals: one test per new check ----
+
+const other_thread_msg = " from a thread that is not the sim thread";
+
+/// One refusal test: the child runs `body` after starting a run, and must
+/// die with `want` on stderr.
+fn refusal(comptime test_name: []const u8, comptime want: []const u8, comptime body: fn () anyerror!void) !void {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanics(test_name, want);
+    noCoreDump();
+    try body();
+}
+
+const r3 = struct {
+    const RwLock = @import("sync/RwLock.zig");
+    const Recursive = @import("sync/Mutex.zig").Recursive;
+    const Condition = @import("sync/Condition.zig");
+    const Event = @import("sync/Event.zig");
+    const Group = @import("group.zig").Group;
+    const Timer = @import("ev/completion.zig").Timer;
+    const Waiter = @import("common.zig").Waiter;
+    const Signal = @import("signal.zig").Signal;
+    const rt_mod = @import("runtime.zig");
+
+    var rw: RwLock = .init;
+    var rec: Recursive = .init;
+    var cond: Condition = .init;
+    var group: Group = .init;
+    var timer: Timer = undefined;
+    var ev: Event = .init;
+    var rt: *rt_mod.Runtime = undefined;
+
+    fn up() !void {
+        rt = try death.up(1);
+    }
+
+    fn other(comptime f: fn () void) !void {
+        try death.onOtherThread(f, .{});
+    }
+
+    fn waitForever() void {
+        ev.wait() catch {};
+    }
+
+    fn noopRet() void {}
+};
+
+test "sim: refuses RwLock.lock from another thread" {
+    try refusal("sim: refuses RwLock.lock from another thread", "sim: RwLock.lock" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(struct {
+                fn f() void {
+                    r3.rw.lock() catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses RwLock.lockUncancelable from another thread" {
+    try refusal("sim: refuses RwLock.lockUncancelable from another thread", "sim: RwLock.lockUncancelable" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(struct {
+                fn f() void {
+                    r3.rw.lockUncancelable();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses RwLock.unlock from another thread" {
+    try refusal("sim: refuses RwLock.unlock from another thread", "sim: RwLock.unlock" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r3.rw.lockUncancelable();
+            try r3.other(struct {
+                fn f() void {
+                    r3.rw.unlock();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses RwLock.tryLockShared from another thread, uncontended" {
+    try refusal("sim: refuses RwLock.tryLockShared from another thread, uncontended", "sim: RwLock.tryLockShared" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(struct {
+                fn f() void {
+                    _ = r3.rw.tryLockShared();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses RwLock.lockShared from another thread, uncontended" {
+    try refusal("sim: refuses RwLock.lockShared from another thread, uncontended", "sim: RwLock.lockShared" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(struct {
+                fn f() void {
+                    r3.rw.lockShared() catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses RwLock.lockSharedUncancelable from another thread, uncontended" {
+    try refusal("sim: refuses RwLock.lockSharedUncancelable from another thread, uncontended", "sim: RwLock.lockSharedUncancelable" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(struct {
+                fn f() void {
+                    r3.rw.lockSharedUncancelable();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses RwLock.unlockShared from another thread, with no writer waiting" {
+    try refusal("sim: refuses RwLock.unlockShared from another thread, with no writer waiting", "sim: RwLock.unlockShared" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r3.rw.lockSharedUncancelable();
+            try r3.other(struct {
+                fn f() void {
+                    r3.rw.unlockShared();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Mutex.Recursive.unlock from another thread" {
+    try refusal("sim: refuses Mutex.Recursive.unlock from another thread", "sim: Mutex.Recursive.unlock" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r3.rec.lockUncancelable();
+            r3.rec.lockUncancelable();
+            try r3.other(struct {
+                fn f() void {
+                    r3.rec.unlock();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Condition.signal from another thread, with no task waiting" {
+    try refusal("sim: refuses Condition.signal from another thread, with no task waiting", "sim: Condition.signal" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(struct {
+                fn f() void {
+                    r3.cond.signal();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Condition.broadcast from another thread, with no task waiting" {
+    try refusal("sim: refuses Condition.broadcast from another thread, with no task waiting", "sim: Condition.broadcast" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(struct {
+                fn f() void {
+                    r3.cond.broadcast();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Loop.setTimer from another thread" {
+    try refusal("sim: refuses Loop.setTimer from another thread", "sim: Loop.setTimer" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r3.timer = r3.Timer.init(.{ .duration = .fromSeconds(1) });
+            try r3.other(struct {
+                fn f() void {
+                    r3.rt.main_executor.loop.setTimer(&r3.timer, .{ .duration = .fromSeconds(2) });
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Loop.rearmTimer from another thread" {
+    try refusal("sim: refuses Loop.rearmTimer from another thread", "sim: Loop.rearmTimer" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r3.timer = r3.Timer.init(.{ .duration = .fromSeconds(1) });
+            try r3.other(struct {
+                fn f() void {
+                    _ = r3.rt.main_executor.loop.rearmTimer(&r3.timer, .{ .duration = .fromSeconds(2) });
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Loop.clearTimer from another thread" {
+    try refusal("sim: refuses Loop.clearTimer from another thread", "sim: Loop.clearTimer" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r3.timer = r3.Timer.init(.{ .duration = .fromSeconds(1) });
+            r3.rt.main_executor.loop.setTimer(&r3.timer, .{ .duration = .fromSeconds(1) });
+            try r3.other(struct {
+                fn f() void {
+                    _ = r3.rt.main_executor.loop.clearTimer(&r3.timer);
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Timer.extend from another thread" {
+    try refusal("sim: refuses Timer.extend from another thread", "sim: Timer.extend" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r3.timer = r3.Timer.init(.{ .duration = .fromSeconds(1) });
+            r3.rt.main_executor.loop.setTimer(&r3.timer, .{ .duration = .fromSeconds(1) });
+            try r3.other(struct {
+                fn f() void {
+                    _ = r3.timer.extend(.fromNanoseconds(5 * std.time.ns_per_s));
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Group.setFailed from another thread" {
+    try refusal("sim: refuses Group.setFailed from another thread", "sim: Group.setFailed" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(struct {
+                fn f() void {
+                    r3.group.setFailed();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Group.setCanceled from another thread" {
+    try refusal("sim: refuses Group.setCanceled from another thread", "sim: Group.setCanceled" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(struct {
+                fn f() void {
+                    r3.group.setCanceled();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Group.setFailFast from another thread" {
+    try refusal("sim: refuses Group.setFailFast from another thread", "sim: Group.setFailFast" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(struct {
+                fn f() void {
+                    r3.group.setFailFast();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+const r3_task = struct {
+    var handle: rt_mod.JoinHandle(void) = undefined;
+    const rt_mod = @import("runtime.zig");
+};
+
+test "sim: refuses a task cancel request from another thread (JoinHandle.requestCancel)" {
+    try refusal("sim: refuses a task cancel request from another thread (JoinHandle.requestCancel)", "sim: AnyTask.requestCancel" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r3_task.handle = try r3.rt.spawn(r3.waitForever, .{});
+            try r3.rt.yield();
+            try r3.other(struct {
+                fn f() void {
+                    r3_task.handle.requestCancel();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses a task cancel from another thread (CancelHandle.cancel)" {
+    try refusal("sim: refuses a task cancel from another thread (CancelHandle.cancel)", "sim: AnyTask.cancel" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r3_task.handle = try r3.rt.spawn(r3.waitForever, .{});
+            try r3.rt.yield();
+            try r3.other(struct {
+                fn f() void {
+                    r3_task.handle.cancelHandle().cancel();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses releasing a finished task's handle from another thread (JoinHandle.detach)" {
+    try refusal("sim: refuses releasing a finished task's handle from another thread (JoinHandle.detach)", "sim: Awaitable.release" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r3_task.handle = try r3.rt.spawn(r3.noopRet, .{});
+            while (!r3_task.handle.hasResult()) try r3.rt.yield();
+            try r3.other(struct {
+                fn f() void {
+                    r3_task.handle.detach();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses a blocking wait from another thread" {
+    try refusal("sim: refuses a blocking wait from another thread", "sim: a wait" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(struct {
+                fn f() void {
+                    r3.ev.wait() catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Runtime.init from another thread" {
+    try refusal("sim: refuses Runtime.init from another thread", "sim: Runtime.init" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(struct {
+                fn f() void {
+                    _ = r3.rt_mod.Runtime.init(std.heap.page_allocator, .{ .executors = .exact(1), .thread_pool = .{ .max_threads = 0 } }) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses sim.end from another thread" {
+    try refusal("sim: refuses sim.end from another thread", "sim: sim.end" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(end);
+        }
+    }.body);
+}
+
+test "sim: refuses sim.setPreempt from another thread" {
+    try refusal("sim: refuses sim.setPreempt from another thread", "sim: sim.setPreempt" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(struct {
+                fn f() void {
+                    setPreempt(.{ .one_in = 2, .min_ns = 1, .max_ns = 2 });
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses sim.setClockRouted from another thread" {
+    try refusal("sim: refuses sim.setClockRouted from another thread", "sim: sim.setClockRouted" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(struct {
+                fn f() void {
+                    setClockRouted(false);
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses sim.pipePair from another thread" {
+    try refusal("sim: refuses sim.pipePair from another thread", "sim: sim.pipePair" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            try r3.other(struct {
+                fn f() void {
+                    _ = pipePair();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+const r3_fd = struct {
+    var fd: i32 = 0;
+};
+
+test "sim: refuses sim.setSendFaults from another thread" {
+    try refusal("sim: refuses sim.setSendFaults from another thread", "sim: sim.setSendFaults" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r3_fd.fd = pipePair()[0];
+            try r3.other(struct {
+                fn f() void {
+                    setSendFaults(r3_fd.fd, .{ .short_max = 3 });
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Signal.init during a run" {
+    try refusal("sim: refuses Signal.init during a run", "sim: Signal.init (a real OS signal arrives at a real time) during a sim run", struct {
+        fn body() !void {
+            try r3.up();
+            var sig = try r3.Signal.init(.user1);
+            sig.deinit();
+        }
+    }.body);
+}
+
+const r3_sig = struct {
+    var sig: r3.Signal = undefined;
+};
+
+test "sim: refuses Signal.wait during a run, for a signal registered before it" {
+    try refusal("sim: refuses Signal.wait during a run, for a signal registered before it", "sim: Signal.wait (a real OS signal arrives at a real time) during a sim run", struct {
+        fn body() !void {
+            r3_sig.sig = try r3.Signal.init(.user1);
+            try r3.up();
+            r3_sig.sig.wait() catch {};
+        }
+    }.body);
+}
+
+test "sim: refuses Signal.waitTimeout during a run, for a signal registered before it" {
+    try refusal("sim: refuses Signal.waitTimeout during a run, for a signal registered before it", "sim: Signal.waitTimeout (a real OS signal arrives at a real time) during a sim run", struct {
+        fn body() !void {
+            r3_sig.sig = try r3.Signal.init(.user1);
+            try r3.up();
+            r3_sig.sig.waitTimeout(.fromNanoseconds(std.time.ns_per_s)) catch {};
+        }
+    }.body);
+}
+
+test "sim: refuses Signal.asyncWait during a run, for a signal registered before it" {
+    try refusal("sim: refuses Signal.asyncWait during a run, for a signal registered before it", "sim: Signal.asyncWait (a real OS signal arrives at a real time) during a sim run", struct {
+        fn body() !void {
+            r3_sig.sig = try r3.Signal.init(.user1);
+            try r3.up();
+            var w: r3.Waiter = .init();
+            _ = r3_sig.sig.asyncWait(&w);
+        }
+    }.body);
+}
+
+test "sim: refuses thread-pool work on a worker thread during a run" {
+    try refusal("sim: refuses thread-pool work on a worker thread during a run", "sim: thread-pool work on a worker thread (set thread_pool.max_threads = 0) during a sim run", struct {
+        fn body() !void {
+            begin(1);
+            const rt = try r3.rt_mod.Runtime.init(std.heap.page_allocator, .{ .executors = .exact(1) });
+            _ = rt;
+            @import("common.zig").blockInPlace(r3.noopRet, .{});
+        }
+    }.body);
 }

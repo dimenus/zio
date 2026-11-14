@@ -193,6 +193,8 @@ pub const Waiter = struct {
             // Waitable, not current: inside a no-suspend region the wait
             // must block the thread, not park the task.
             if (getWaitableTaskOrNull()) |task| return .{ .tag = .task, .payload = .{ .task = .init(task, kind) } };
+            // A thread waiter is about to join a queue a task can pop.
+            @import("sim.zig").refuseOtherThread("a wait");
             return .{ .tag = .thread, .payload = .{ .thread = .init() } };
         }
     };

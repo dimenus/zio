@@ -64,6 +64,7 @@ pub const Group = struct {
     /// TODO: Wake waiters immediately when this bit transitions from unset to set.
     /// Currently waiters only wake when counter reaches zero.
     pub fn setFailed(self: *Group) void {
+        @import("sim.zig").refuseOtherThread("Group.setFailed");
         const state_ptr = self.getState();
         var state = @atomicLoad(u32, state_ptr, .acquire);
         while (true) {
@@ -83,6 +84,7 @@ pub const Group = struct {
     /// TODO: Wake waiters immediately when this bit transitions from unset to set.
     /// Currently waiters only wake when counter reaches zero.
     pub fn setCanceled(self: *Group) void {
+        @import("sim.zig").refuseOtherThread("Group.setCanceled");
         const state_ptr = self.getState();
         var state = @atomicLoad(u32, state_ptr, .acquire);
         while (true) {
@@ -103,6 +105,7 @@ pub const Group = struct {
     /// The unified counter+flags state makes this feasible - setFailed/setCanceled
     /// just need to check fail_fast and wake waiters when the bit transitions.
     pub fn setFailFast(self: *Group) void {
+        @import("sim.zig").refuseOtherThread("Group.setFailFast");
         _ = @atomicRmw(u32, self.getState(), .Or, fail_fast_bit, .acq_rel);
     }
 

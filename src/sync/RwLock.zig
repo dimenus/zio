@@ -80,6 +80,7 @@ pub fn tryLock(self: *RwLock) bool {
 ///
 /// Returns `error.Canceled` if the task is cancelled while waiting.
 pub fn lock(self: *RwLock) Cancelable!void {
+    @import("../sim.zig").refuseOtherThread("RwLock.lock");
     _ = @atomicRmw(usize, &self.state, .Add, writer, .seq_cst);
     self.mutex.lock() catch |err| {
         _ = @atomicRmw(usize, &self.state, .Sub, writer, .seq_cst);
@@ -109,6 +110,7 @@ pub fn lock(self: *RwLock) Cancelable!void {
 /// This is useful for cleanup operations where exclusive access is required
 /// regardless of cancellation.
 pub fn lockUncancelable(self: *RwLock) void {
+    @import("../sim.zig").refuseOtherThread("RwLock.lockUncancelable");
     _ = @atomicRmw(usize, &self.state, .Add, writer, .seq_cst);
     self.mutex.lockUncancelable();
 
@@ -122,6 +124,7 @@ pub fn lockUncancelable(self: *RwLock) void {
 ///
 /// It is undefined behavior to call this without holding the write lock.
 pub fn unlock(self: *RwLock) void {
+    @import("../sim.zig").refuseOtherThread("RwLock.unlock");
     _ = @atomicRmw(usize, &self.state, .And, ~is_writing, .seq_cst);
     self.mutex.unlock();
 }
@@ -130,6 +133,7 @@ pub fn unlock(self: *RwLock) void {
 /// Returns `true` if the lock was successfully acquired, `false` if it
 /// is currently held by a writer.
 pub fn tryLockShared(self: *RwLock) bool {
+    @import("../sim.zig").refuseOtherThread("RwLock.tryLockShared");
     const state = @atomicLoad(usize, &self.state, .seq_cst);
     if (state & (is_writing | writer_mask) == 0) {
         _ = @cmpxchgStrong(
@@ -158,6 +162,7 @@ pub fn tryLockShared(self: *RwLock) bool {
 ///
 /// Returns `error.Canceled` if the task is cancelled while waiting.
 pub fn lockShared(self: *RwLock) Cancelable!void {
+    @import("../sim.zig").refuseOtherThread("RwLock.lockShared");
     var state = @atomicLoad(usize, &self.state, .seq_cst);
     while (state & (is_writing | writer_mask) == 0) {
         state = @cmpxchgWeak(
@@ -181,6 +186,7 @@ pub fn lockShared(self: *RwLock) Cancelable!void {
 /// acquisition. This is useful for cleanup operations that need read access
 /// regardless of cancellation.
 pub fn lockSharedUncancelable(self: *RwLock) void {
+    @import("../sim.zig").refuseOtherThread("RwLock.lockSharedUncancelable");
     var state = @atomicLoad(usize, &self.state, .seq_cst);
     while (state & (is_writing | writer_mask) == 0) {
         state = @cmpxchgWeak(
@@ -202,6 +208,7 @@ pub fn lockSharedUncancelable(self: *RwLock) void {
 ///
 /// It is undefined behavior to call this without holding a read lock.
 pub fn unlockShared(self: *RwLock) void {
+    @import("../sim.zig").refuseOtherThread("RwLock.unlockShared");
     const state = @atomicRmw(usize, &self.state, .Sub, reader, .seq_cst);
 
     if ((state & reader_mask == reader) and (state & is_writing != 0)) {

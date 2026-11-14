@@ -621,6 +621,7 @@ pub const AnyTask = struct {
     /// Like `cancel`, but a no-op once a user cancellation was requested, so any
     /// number of callers can request it without queueing more errors.
     pub fn requestCancel(self: *AnyTask) void {
+        @import("sim.zig").refuseOtherThread("AnyTask.requestCancel");
         var current = self.canceled_status.load(.acquire);
         while (true) {
             var status: CanceledStatus = @bitCast(current);
@@ -639,6 +640,7 @@ pub const AnyTask = struct {
 
     /// Cancel this task by setting canceled status and waking it if suspended.
     pub fn cancel(self: *AnyTask) void {
+        @import("sim.zig").refuseOtherThread("AnyTask.cancel");
         if (self.setCanceled(.user) != null) {
             self.wake();
         }

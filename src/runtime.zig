@@ -1115,7 +1115,10 @@ pub const Executor = struct {
             for (execs) |e| {
                 if (e.loop.simHasTaskTimer()) task_timer = true;
             }
-            if (!task_timer) sim.deadlock();
+            if (!task_timer) {
+                if (!simAllQuiescent(execs)) return;
+                sim.deadlock();
+            }
         }
         if (sim.nextDueIoRemaining()) |io| {
             const t = Duration.fromNanoseconds(io);
@@ -1125,6 +1128,7 @@ pub const Executor = struct {
             }
         }
         if (min_t) |t| {
+            if (t.value > 0 and !simAllQuiescent(execs)) return;
             // Drive the wait through Loop.poll so the post-wait snapshot
             // refresh is the same statement production uses after backend.poll.
             simBind(owner);
@@ -1139,7 +1143,24 @@ pub const Executor = struct {
             simBind(home);
             return;
         }
+        // Not reached: with no timer and no simulated I/O to come, the
+        // shrink-timer check above has already decided.
         sim.deadlock();
+    }
+
+    /// `simPollAll` polls the loops in order, so a callback on a later loop
+    /// can leave work on an earlier one (an async notify, a cancel, a
+    /// completion). Until every loop is quiescent the step must neither move
+    /// the clock (the work would run late) nor call a deadlock (the work can
+    /// still make a task ready); returning makes the caller step again,
+    /// which polls every loop with `.zero`. Checked only at those two
+    /// decisions, so a step that does neither keeps the order of seeded
+    /// picks it had before (starh2's dst-zio trace hashes).
+    fn simAllQuiescent(execs: []*Executor) bool {
+        for (execs) |e| {
+            if (!e.loop.simQuiescent()) return false;
+        }
+        return true;
     }
 
     pub const RunMode = enum {
@@ -2240,6 +2261,8 @@ pub const Runtime = struct {
 
         if (comptime zio_options.sim) {
             const sim = @import("sim.zig");
+            // Its executors and loops would belong to this thread.
+            sim.refuseOtherThread("Runtime.init");
             if (!sim.isBegun()) @panic("sim: begin() before Runtime.init");
             // The step functions hold ready executors in a [2] array, and
             // logical workers are stepped from the main executor's run.

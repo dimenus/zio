@@ -666,6 +666,21 @@ pub const Loop = struct {
         return false;
     }
 
+    /// Sim: nothing waits to be processed here: no wake request (a
+    /// cross-loop async notify or cancel lands as a bit), no finished or pool
+    /// completion, no dispatched callback, no queued cross-loop cancel. A
+    /// `poll(.zero)` of a loop that is not quiescent can make a task ready, so
+    /// `Executor.simMuxStep` must not call the run a deadlock while any loop
+    /// is not quiescent.
+    pub fn simQuiescent(self: *Loop) bool {
+        if (comptime !zio_options.sim) unreachable;
+        return self.state.wake_requested.load(.acquire) & LoopState.wake_mask == 0 and
+            self.state.completions.empty() and
+            self.state.work_completions.empty() and
+            self.state.dispatched.empty() and
+            self.cancel_queue.load(.acquire) == null;
+    }
+
     /// Sim: earliest pending timer remaining, or null. Does not fire.
     pub fn peekNextTimeout(self: *Loop) ?Duration {
         var next: ?Duration = null;
@@ -765,6 +780,7 @@ pub const Loop = struct {
 
     /// Set or reset a timer with a new timeout (works immediately, no completion required)
     pub fn setTimer(self: *Loop, timer: *Timer, timeout: Timeout) void {
+        sim.refuseOtherThread("Loop.setTimer");
         self.state.lockTimers();
         defer self.state.unlockTimers();
         const st = timer.c.loadState();
@@ -797,6 +813,7 @@ pub const Loop = struct {
     /// it untouched, otherwise; `clearTimer` and `setTimer` then do the same
     /// in two steps.
     pub fn rearmTimer(self: *Loop, timer: *Timer, timeout: Timeout) bool {
+        sim.refuseOtherThread("Loop.rearmTimer");
         self.state.lockTimers();
         defer self.state.unlockTimers();
         // First, so this lock is the one that covers the fields read below.
@@ -820,6 +837,7 @@ pub const Loop = struct {
     /// has run or is still to run, and both the timer and whatever its
     /// `userdata` points at must stay alive until it does.
     pub fn clearTimer(self: *Loop, timer: *Timer) bool {
+        sim.refuseOtherThread("Loop.clearTimer");
         self.state.lockTimers();
         defer self.state.unlockTimers();
         const st = timer.c.loadState();

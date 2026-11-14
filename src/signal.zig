@@ -256,6 +256,7 @@ pub const Signal = struct {
     ///
     /// Returns error.TooManySignalHandlers if MAX_HANDLERS (32) concurrent watchers are already registered.
     pub fn init(kind: SignalKind) !Signal {
+        @import("sim.zig").refuseDuringRun("Signal.init (a real OS signal arrives at a real time)");
         const entry = try registry.install(kind);
         return .{ .kind = kind, .entry = entry };
     }
@@ -278,6 +279,7 @@ pub const Signal = struct {
     ///
     /// Returns error.Canceled if the task is cancelled while waiting (including due to timeout expiry).
     pub fn wait(self: *Signal) Cancelable!void {
+        @import("sim.zig").refuseDuringRun("Signal.wait (a real OS signal arrives at a real time)");
         // Check if we already have pending signals
         if (self.entry.counter.swap(0, .acquire) > 0) {
             return;
@@ -318,6 +320,7 @@ pub const Signal = struct {
     /// Arguments:
     /// - timeout: Timeout
     pub fn waitTimeout(self: *Signal, timeout: Timeout) (Timeoutable || Cancelable)!void {
+        @import("sim.zig").refuseDuringRun("Signal.waitTimeout (a real OS signal arrives at a real time)");
         // Check if we already have pending signals
         if (self.entry.counter.swap(0, .acquire) > 0) {
             return;
@@ -360,6 +363,7 @@ pub const Signal = struct {
     /// claims the select if one already was.
     /// This is part of the Future protocol for select().
     pub fn asyncWait(self: *Signal, waiter: *Waiter) common.AsyncWaitState {
+        @import("sim.zig").refuseDuringRun("Signal.asyncWait (a real OS signal arrives at a real time)");
         // Unhook any previous registration so a re-poll never
         // double-registers; one that is already gone was popped and signaled
         // by the handler without a claim. A direct waiter is never

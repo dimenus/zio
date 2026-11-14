@@ -624,6 +624,7 @@ pub const Timer = struct {
     /// A cancel requested before this but not yet processed still wins: the
     /// extension succeeds and the timer completes with `error.Canceled`.
     pub fn extend(timer: *Timer, deadline: Timestamp) bool {
+        sim.refuseOtherThread("Timer.extend");
         if (!can_extend) return false;
         var w = timer.extended.load(.monotonic);
         while (true) {

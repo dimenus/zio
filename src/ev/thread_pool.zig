@@ -195,6 +195,9 @@ pub const ThreadPool = struct {
             return;
         }
 
+        // Inline (above) runs on the calling thread and is deterministic; a
+        // worker thread finishes at a real time.
+        @import("../sim.zig").refuseDuringRun("thread-pool work on a worker thread (set thread_pool.max_threads = 0)");
         self.queue_mutex.lock();
         if (self.shutdown) {
             // Pool is shutting down: drop the work without running it or

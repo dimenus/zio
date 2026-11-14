@@ -155,6 +155,7 @@ pub fn lockUncancelable(self: *Recursive) void {
 /// It is undefined behavior if the current task/thread does not hold the lock,
 /// or if `unlock()` is called more times than `lock()`.
 pub fn unlock(self: *Recursive) void {
+    @import("../../sim.zig").refuseOtherThread("Mutex.Recursive.unlock");
     std.debug.assert(self.count > 0);
     self.count -= 1;
 

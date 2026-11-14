@@ -121,6 +121,7 @@ pub const Awaitable = struct {
 
     /// Release the awaitable, decrementing the reference count and destroying it if necessary.
     pub fn release(self: *Awaitable) void {
+        @import("sim.zig").refuseOtherThread("Awaitable.release");
         if (self.ref_count.decr()) self.destroy();
     }
 
