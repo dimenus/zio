@@ -6044,6 +6044,35 @@ test "sim: pipe refuses: a receive with MSG_TRUNC" {
     }.body);
 }
 
+// Round 2 of the outside review, F6: a real socket made before the run
+// is not a sim fd, so the layer's sendmsg takes the native path; an
+// SCM_RIGHTS message in it must not carry a sim fd to the kernel.
+const scm_probe = struct {
+    var pair: [2]c_int = .{ -1, -1 };
+    fn body() !void {
+        const p = pipePair();
+        const sc = std.posix.system;
+        var control: [64]u8 align(@alignOf(sc.cmsghdr)) = @splat(0);
+        const len = dg.os_net.cmsg_data_offset + @sizeOf(i32);
+        const hdr: sc.cmsghdr = .{ .len = @intCast(len), .level = sc.SOL.SOCKET, .type = sc.SCM.RIGHTS };
+        @memcpy(control[0..@sizeOf(sc.cmsghdr)], std.mem.asBytes(&hdr));
+        std.mem.writeInt(i32, control[dg.os_net.cmsg_data_offset..][0..4], p[0], builtin.cpu.arch.endian());
+        var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
+        const n = dg.os_net.sendmsg(pair[0], &iov, .{}, null, 0, control[0..std.mem.alignForward(usize, len, dg.os_net.cmsg_align)]);
+        std.debug.print("sendmsg on the real socket returned {any}\n", .{n});
+    }
+};
+
+test "sim: exits refuse: a sim fd in an SCM_RIGHTS message on a real socket" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime !compiled_in) return error.SkipZigTest;
+    const name = "sim: exits refuse: a sim fd in an SCM_RIGHTS message on a real socket";
+    if (!isDeathChild()) return expectChildPanics(name, "sim: sim fd 100000 reached the native exit os/net.zig sendmsg");
+    noCoreDump();
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.DGRAM, 0, &scm_probe.pair) != 0) return error.SocketPair;
+    try dg.run(1, scm_probe.body);
+}
+
 test "sim: exits refuse: a read of a sim fd" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     try refusal("sim: exits refuse: a read of a sim fd", "sim: sim fd 100000 reached the native exit os/fs.zig read", struct {

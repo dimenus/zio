@@ -1733,6 +1733,9 @@ pub fn sendmmsg(
     flags: SendFlags,
 ) SendError!u32 {
     sim.refuseSimFd(@src(), fd);
+    for (msgvec[0..vlen]) |m| {
+        if (m.hdr.control) |ctl| refuseSimFdsInControl(@src(), @as([*]const u8, @ptrCast(ctl))[0..m.hdr.controllen]);
+    }
     const sys_flags = sendFlagsToSys(flags);
 
     while (true) {
@@ -1765,6 +1768,7 @@ pub fn sendmsg(
         }
     }
 
+    if (control) |ctl| refuseSimFdsInControl(@src(), ctl);
     const sys_flags = sendFlagsToSys(flags);
 
     switch (builtin.os.tag) {
@@ -1945,6 +1949,29 @@ fn sourceAddressControl(buf: []align(@alignOf(posix.system.cmsghdr)) u8, from: [
 
 /// The destination address in a received control message, if one is there:
 /// `IP_PKTINFO`'s `ipi_addr`, or `IP_RECVDSTADDR`'s address.
+/// A sim fd in an `SCM_RIGHTS` message of an outgoing control buffer would
+/// reach the kernel through a real socket (one made before the run), so it
+/// refuses like any native exit (sim network design, section 3). `src` is
+/// the sending function's `@src()`. A malformed buffer is left to the kernel.
+/// Compiled out without sim.
+fn refuseSimFdsInControl(comptime src: std.builtin.SourceLocation, control: []const u8) void {
+    if (comptime !sim_layer) return;
+    const cmsghdr = posix.system.cmsghdr;
+    var offset: usize = 0;
+    while (offset + @sizeOf(cmsghdr) <= control.len) {
+        const hdr = std.mem.bytesToValue(cmsghdr, control[offset..][0..@sizeOf(cmsghdr)]);
+        if (hdr.len < cmsg_data_offset or hdr.len > control.len - offset) return;
+        if (hdr.level == posix.system.SOL.SOCKET and hdr.type == posix.system.SCM.RIGHTS) {
+            const data = control[offset + cmsg_data_offset .. offset + hdr.len];
+            var k: usize = 0;
+            while (k + @sizeOf(i32) <= data.len) : (k += @sizeOf(i32)) {
+                sim.refuseSimFd(src, std.mem.readInt(i32, data[k..][0..4], builtin.cpu.arch.endian()));
+            }
+        }
+        offset += std.mem.alignForward(usize, hdr.len, cmsg_align);
+    }
+}
+
 fn destinationFromControl(control: []const u8) ?[4]u8 {
     const cmsghdr = posix.system.cmsghdr;
     var offset: usize = 0;

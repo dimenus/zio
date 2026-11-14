@@ -26,8 +26,20 @@
 //
 // What it cannot see, listed by hand (`fd_carriers`) and tested by death
 // tests in `sim.zig`: an fd inside a struct or a slice (`pollfd`, `msghdr`,
-// `mmsghdr`, a control buffer). A function with such a parameter must be in
-// that list, or the test fails. Also outside its reach: direct syscalls made
+// `mmsghdr`, a parameter named `control`, which can hold SCM_RIGHTS fds). A
+// function with such a parameter must be in that list, or the test fails.
+//
+// Known limits, accepted (it is a check, not a proof):
+// - `non_fd_ints` is one list for all files. A future fd parameter given a
+//   listed name (`value`, `index`, ...) passes unseen.
+// - `simBranched` looks for the text of a sim branch in the body, not at
+//   control flow: a matching comment or a branch that does nothing passes.
+// - Aliases imported from another file and uses through reflection are not
+//   followed; only a value use in the function's own file is seen.
+// - A carrier that is not one of the type names above or named `control`
+//   (another struct, an opaque pointer, an ioctl argument) is "other".
+// - `extern_fds` and `fd_carriers` are checked by hand when listed; a later
+//   caller of a listed extern is not checked. Also outside its reach: direct syscalls made
 // by zio files outside `src/os/` (the backends, which never run under sim,
 // and tests), listed in the commit that added this file.
 
@@ -80,8 +92,13 @@ const not_fds = [_]struct { file: []const u8, func: []const u8, param: []const u
 const fd_carriers = [_]struct { file: []const u8, func: []const u8, covered_by: []const u8 }{
     .{ .file = "net.zig", .func = "poll", .covered_by = "simPoll: every fd in the set must be a sim fd or none; tests \"sim: dgram ev refuses: a poll that mixes sim and real fds\", \"sim: exits refuse: a poll set of sim pipe fds\"" },
     .{ .file = "net.zig", .func = "simPoll", .covered_by = "the sim branch of poll itself" },
-    .{ .file = "net.zig", .func = "recvmmsg", .covered_by = "its fd is refused first; the mmsghdr array holds buffers and addresses, not fds" },
-    .{ .file = "net.zig", .func = "sendmmsg", .covered_by = "its fd is refused first; the mmsghdr array holds buffers and addresses, not fds" },
+    .{ .file = "net.zig", .func = "recvmmsg", .covered_by = "its fd is refused first; incoming control data comes from the kernel" },
+    .{ .file = "net.zig", .func = "sendmmsg", .covered_by = "its fd is refused first, and refuseSimFdsInControl reads each message's SCM_RIGHTS fds" },
+    .{ .file = "net.zig", .func = "sendmsg", .covered_by = "its fd has a sim branch; refuseSimFdsInControl reads the control buffer's SCM_RIGHTS fds before the native call; test \"sim: exits refuse: a sim fd in an SCM_RIGHTS message on a real socket\"" },
+    .{ .file = "net.zig", .func = "recvmsg", .covered_by = "its fd has a sim branch; the control buffer is written by the kernel, so any fd in it is real" },
+    .{ .file = "net.zig", .func = "setReceivedFdsCloexec", .covered_by = "sets FD_CLOEXEC on fds the kernel just passed in a received control buffer: real fds" },
+    .{ .file = "net.zig", .func = "destinationFromControl", .covered_by = "reads an IP_PKTINFO or IP_RECVDSTADDR address, no fd" },
+    .{ .file = "net.zig", .func = "refuseSimFdsInControl", .covered_by = "it is the refusal for outgoing SCM_RIGHTS fds (sendmsg, sendmmsg); test \"sim: exits refuse: a sim fd in an SCM_RIGHTS message on a real socket\"" },
     .{ .file = "net.zig", .func = "recvmmsg_syscall", .covered_by = "called only by recvmmsg" },
     .{ .file = "net.zig", .func = "sendmmsg_syscall", .covered_by = "called only by sendmmsg" },
     .{ .file = "net.zig", .func = "sourceAddressControl", .covered_by = "builds an IP_PKTINFO message: an address, no fd" },
@@ -322,6 +339,8 @@ fn classify(file: []const u8, func: []const u8, p: Param) Kind {
     for ([_][]const u8{ "pollfd", "msghdr", "mmsghdr", "cmsghdr" }) |c| {
         if (std.mem.indexOf(u8, p.ty, c) != null) return .carrier;
     }
+    // A control buffer can hold SCM_RIGHTS fds.
+    if (std.mem.eql(u8, p.name, "control")) return .carrier;
     var fd_like = false;
     for (fd_names) |n| if (std.mem.eql(u8, p.name, n)) {
         fd_like = true;
