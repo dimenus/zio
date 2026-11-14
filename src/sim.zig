@@ -4284,6 +4284,42 @@ test "sim: dgram: a send with MSG_NOSIGNAL or MSG_DONTWAIT is accepted through s
     }.body);
 }
 
+test "sim: dgram refuses: recvmsg without a control buffer on a socket that asked for destination addresses" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: recvmsg without a control buffer on a socket that asked for destination addresses", "sim: recvmsg on sim fd 100032, which asked for destination addresses, is not simulated: use recvDatagram", struct {
+        fn body() !void {
+            try dg.run(1, struct {
+                fn inner() !void {
+                    const rx = try dg.open();
+                    try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 7000));
+                    try dg.os_net.enableDestinationAddress(rx);
+                    _ = try dg.sendFrom(rx, dg.addr(127, 0, 0, 1, 7000), null, "x");
+                    try dg.settle();
+                    var buf: [4]u8 = undefined;
+                    var iov = [1]dg.os_net.iovec{dg.os_net.iovecFromSlice(&buf)};
+                    const r = try dg.os_net.recvmsg(rx, &iov, .{}, null, null, null);
+                    std.debug.print("recvmsg returned len {d}, flags 0x{x}, controllen {d}\n", .{ r.len, r.flags, r.controllen });
+                }
+            }.inner);
+        }
+    }.body);
+}
+
+test "sim: dgram refuses: recvmsg with a control buffer on a socket that asked for destination addresses" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: recvmsg with a control buffer on a socket that asked for destination addresses", "sim: recvmsg on sim fd 100032, which asked for destination addresses, is not simulated: use recvDatagram", struct {
+        fn body() !void {
+            try r3.up();
+            const rx = try dg.open();
+            try dg.os_net.enableDestinationAddress(rx);
+            var buf: [4]u8 = undefined;
+            var ctl: [64]u8 = undefined;
+            var iov = [1]dg.os_net.iovec{dg.os_net.iovecFromSlice(&buf)};
+            _ = try dg.os_net.recvmsg(rx, &iov, .{ .dontwait = true }, null, null, &ctl);
+        }
+    }.body);
+}
+
 test "sim: dgram refuses: an IPv6 socket during a run" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     try refusal("sim: dgram refuses: an IPv6 socket during a run", "sim: socket(ipv6, dgram, ip) during a sim run", struct {

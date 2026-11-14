@@ -1547,9 +1547,12 @@ pub fn recvmsg(
     if (comptime sim_layer) {
         if (sim.isSimFd(fd)) {
             // The sim does not write control messages: `recvDatagram`
-            // carries the destination address as a typed value instead.
-            if (control != null and sim.dgramDestinationAddressEnabled(fd)) {
-                sim.panic("sim: recvmsg with a control buffer on sim fd {d}, which asked for destination addresses: use recvDatagram", .{fd});
+            // carries the destination address as a typed value instead. So
+            // on a socket that asked for it, recvmsg refuses, with or without
+            // a control buffer. Without one the kernels disagree (measured,
+            // 2026-11-14): Linux 6.8 sets MSG_CTRUNC, macOS 25.6 does not.
+            if (sim.dgramDestinationAddressEnabled(fd)) {
+                sim.panic("sim: recvmsg on sim fd {d}, which asked for destination addresses, is not simulated: use recvDatagram", .{fd});
             }
             const r = try simRecv(fd, buffers, flags);
             if (addr) |a| writeSimAddr(r.from, a, addr_len orelse sim.panic("sim: recvmsg with an address but no length", .{}));
