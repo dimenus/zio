@@ -277,6 +277,42 @@ test "sim: stream bytes: a read smaller than the unread bytes leaves the rest, b
     try run(1, null, partial.body);
 }
 
+/// The unread buffer moves its rest to the front once the read head is
+/// 4096 or more and past half of it (`copyOutUnread`). This reads past that
+/// point with bytes behind the head, then lands more behind the moved rest,
+/// and checks every byte and count after it.
+const compaction = struct {
+    fn body() !void {
+        const srv, const c, const s = try pair();
+        sim.setStreamChunking(c.socket.handle, .off);
+        var data: [9000]u8 = undefined;
+        fill(&data, 11);
+        try expectEqual(@as(usize, 6000), try c.write(data[0..6000], .none));
+        try rt_mod.sleep(.fromMicroseconds(L / us));
+        var buf: [9000]u8 = undefined;
+        // The head moves to 4096 of 6000: the 1904 behind it move.
+        try expectEqual(@as(usize, 4096), try s.read(buf[0..4096], .none));
+        try expectEqual(@as(usize, 1904), try os_net.bytesReadable(s.socket.handle));
+        try checkConserved();
+        // More bytes land behind the moved rest.
+        try expectEqual(@as(usize, 3000), try c.write(data[6000..], .none));
+        try rt_mod.sleep(.fromMicroseconds(L / us));
+        try expectEqual(@as(usize, 4904), try os_net.bytesReadable(s.socket.handle));
+        try checkConserved();
+        var got: usize = 4096;
+        while (got < data.len) got += try s.read(buf[got..], .none);
+        try expect(std.mem.eql(u8, &data, &buf));
+        try expectEqual(@as(usize, 0), try os_net.bytesReadable(s.socket.handle));
+        try checkConserved();
+        try t1.closeAll3(srv, c, s);
+    }
+};
+
+test "sim: stream bytes: a read that moves the unread rest to the front keeps every byte behind the head, and bytes that land after it follow in order" {
+    if (comptime skip) return error.SkipZigTest;
+    try run(1, null, compaction.body);
+}
+
 const peer_name = struct {
     fn peerOf(fd: i32) !sim.Ip4 {
         var sa: os_net.sockaddr.in = undefined;

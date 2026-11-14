@@ -1765,8 +1765,12 @@ not ACKed separately.
   (Sitting 29's first text named the receiver's own direction, which a
   closed receiver always makes terminal: that contradicted the line
   above.)
-- When a credit lands, `credited = max(credited, count)`, which is
-  idempotent. If room appears, a parked send is woken.
+- When a credit lands, `credited = count`. A direction's credits land in
+  the order they left (the order rule above, and 17.9's release keeps
+  it), and a credit leaves only after a read or a release since the last
+  one, so each count is larger than the one before. A count that is not
+  larger is an invariant panic (sitting 30; revision 3 said `max`, which
+  would hide a broken order). If room appears, a parked send is woken.
 - Held credits of one direction coalesce to the newest. That is
   equivalent: both are cumulative, and they would land in order.
 - A partition of the reverse direction holds the credits, so the sender
@@ -1804,7 +1808,7 @@ The causes are named:
 - `after_reset`: data that lands after a reset was received;
 - `listener_closed`.
 
-Credit is applied exactly once per landing, by `max`. Once a direction is
+Credit is applied exactly once per landing; counts only grow (17.7). Once a direction is
 **terminal** (its sender is dead or failed, or its sender has received an
 RST), its window accounting ends: no more admission is possible, and a
 credit that lands later is dropped and counted (`stale_credit`). It
@@ -2053,8 +2057,8 @@ departs (17.7).
 **A credit lands at X:**
 1. X's sending direction is terminal, or X is dead or failed: dropped
    (`stale_credit`).
-2. Otherwise: `credited` is raised, and a parked send is woken if room
-   appears.
+2. Otherwise: `credited` is set to the count, which must be larger
+   (17.7), and a parked send is woken if room appears.
 
 **Entries are handled at their landing, never by counting sends**
 (requirement C). The first send after a peer closed succeeds, because

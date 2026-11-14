@@ -3765,7 +3765,14 @@ fn landCredit(ci: u16, at: Side, count: u64) StreamOutcome {
     }
     const d = &k.dirs[@backingInt(at)];
     if (count > d.admitted) panic("sim: a credit of {d} on connection {d} is past the {d} bytes admitted (an invariant)", .{ count, k.id, d.admitted });
-    d.credited = @max(d.credited, count);
+    // A direction's credits land in the order they left: no entry lands
+    // before the one sent before it in its direction (design 17.7), and a
+    // release of held entries keeps that order (17.9). A credit leaves only
+    // after a read or a window release of at least one byte since the last
+    // one left, so each carries a larger count. A count that is not larger
+    // means that order broke: a panic, not a silent max.
+    if (count <= d.credited) panic("sim: a credit of {d} on connection {d} landed after one of {d}: credits land in the order they left, each with a larger count (an invariant)", .{ count, k.id, d.credited });
+    d.credited = count;
     stream_stats.credits_landed += 1;
     if (x.phase == .est and d.room() > 0) wakeSend(x.slot);
     return .landed;
