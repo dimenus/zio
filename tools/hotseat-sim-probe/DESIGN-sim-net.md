@@ -317,6 +317,16 @@ option, and hotseat's bridge will not; `IP_TTL` is not modelled.
   already satisfied, and 0 with no change is the true answer. Reading it
   stays not modelled (below). **If phase 2 adds a send-side limit, `SO_SNDBUF`
   must be modelled for real then.**
+- **A socket with the destination-address option on cannot use `recvmsg`
+  in a sim run:** not the layer's `recvmsg`, not the ev op `NetRecvMsg`,
+  and not `Socket.receiveMsg`, with or without a control buffer. It panics
+  and names `recvDatagram`, which returns the destination as a value. The
+  kernels disagree on the case with no control buffer (Linux 6.8 sets
+  `MSG_CTRUNC`, macOS 25.6 does not; measured, see 2e951b2), and the sim
+  does not model a host-dependent flag. `recvDatagram` does not suspend, so
+  an async typed receive (an ev op that returns the destination as a value)
+  will be added when a consumer needs one. zio's own code never turns the
+  option on; only a caller does.
 - hotseat's Darwin tests that need a 1-byte `SO_SNDBUF` to get `EMSGSIZE`
   stay real-socket tests. Under sim the option is accepted with no effect,
   and their sends would succeed. Send pressure is not modelled (section 10).
