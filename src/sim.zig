@@ -3063,6 +3063,15 @@ pub fn testSetNextConnId(id: u32) void {
     next_conn_id = id;
 }
 
+/// Moves the TCP port counter of this run, to reach the top of the range in
+/// a test.
+pub fn testSetNextTcpPort(port: u16) void {
+    if (comptime !builtin.is_test) @compileError("testSetNextTcpPort is for tests");
+    if (!begun) panic("sim: testSetNextTcpPort outside a run", .{});
+    if (port < first_ephemeral_port) panic("sim: testSetNextTcpPort({d}): below the ephemeral range", .{port});
+    tcp_next_port = port;
+}
+
 /// Live `S-prov` and `S-queued` endpoints of listener `fd`.
 pub fn testListenerCount(fd: i32) usize {
     if (comptime !builtin.is_test) @compileError("testListenerCount is for tests");

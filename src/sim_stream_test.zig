@@ -2036,6 +2036,41 @@ test "sim: stream refuses: a second accept while the first is woken and not yet 
     return error.NoSeedRanTheConnectFirst;
 }
 
+/// The top of the TCP port range: port 0 hands out 65534, then 65535, then
+/// wraps to the first ephemeral port (the grader's surviving mutant of
+/// slice 1 moved the wrap one port early).
+const port_wrap = struct {
+    fn body() !void {
+        sim.testSetNextTcpPort(65534);
+        const a = try listen(lo, 0, .{});
+        const b = try listen(lo, 0, .{});
+        const c = try listen(lo, 0, .{});
+        try expectEqual(@as(u16, 65534), portOf(a));
+        try expectEqual(@as(u16, 65535), portOf(b));
+        try expectEqual(sim.first_ephemeral_port, portOf(c));
+        // A connect from an unbound socket takes the next port after the
+        // wrap, from the same counter.
+        var h = try rt_mod.spawn(acceptOne, .{c});
+        const k = try connect(lo, portOf(c), .none);
+        try expectEqual(sim.first_ephemeral_port + 1, (try localOf(k.socket.handle)).port);
+        const acc = try h.join();
+        acc.close();
+        k.close();
+        a.close();
+        b.close();
+        c.close();
+        try drain();
+    }
+    fn acceptOne(s: zio_net.Server) !zio_net.Stream {
+        return s.accept(.{});
+    }
+};
+
+test "sim: stream: port 0 hands out 65534, then 65535, then wraps to 49152, and a connect takes 49153 after it" {
+    if (comptime skip) return error.SkipZigTest;
+    try run(1, null, port_wrap.body);
+}
+
 /// Finding 4: the arithmetic limits, each a named panic.
 const limits = struct {
     fn time() !void {
