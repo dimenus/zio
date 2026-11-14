@@ -1300,8 +1300,18 @@ fn testSetNetAllocator(a: std.mem.Allocator) void {
 var dgrams: [max_dgram]Dgram = @splat(.{});
 /// Each slot's generation: how many times it was opened in this run. An ev
 /// op records it at submit (`dgramOpStart`); a slot closed or opened again
-/// since has another, or none open.
+/// since has another, or none open. 0 means "no socket" and is never a
+/// generation. A slot opened `maxInt(u32)` times in one run refuses its next
+/// open (`dgramOpen`): a wrap would give a new socket an old one's
+/// generation, and an op of the old one could act on it. Nothing else in a
+/// slot bounds its opens, so this is a refusal, not a trap of a safety
+/// check, and holds in every build mode.
 var dgram_gen: [max_dgram]u32 = @splat(0);
+
+fn testSetDgramGen(slot: usize, gen: u32) void {
+    if (comptime !builtin.is_test) @compileError("testSetDgramGen is for tests");
+    dgram_gen[slot] = gen;
+}
 var next_port: u16 = first_ephemeral_port;
 var dropped_no_socket: u64 = 0;
 /// Whether this run opened a datagram socket. Only then does
@@ -1428,11 +1438,12 @@ pub fn dgramOpen(nonblocking: bool) error{SystemResources}!i32 {
     var j: usize = 0;
     while (j < max_dgram and dgrams[j].used) j += 1;
     if (j == max_dgram) panic("sim: the datagram socket table is full ({d} sockets)", .{max_dgram});
+    const gen = std.math.add(u32, dgram_gen[j], 1) catch panic("sim: datagram socket slot {d} was opened {d} times in this run: its generation would wrap, and an op of an old socket could act on a new one", .{ j, dgram_gen[j] });
     const ring = net_alloc.alloc(u8, default_rcvbuf_bytes) catch return error.SystemResources;
     errdefer net_alloc.free(ring);
     const meta = net_alloc.alloc(Queued, rcv_packet_limit) catch return error.SystemResources;
+    dgram_gen[j] = gen;
     dgrams[j] = .{ .used = true, .nonblocking = nonblocking, .ring = ring, .meta = meta };
-    dgram_gen[j] += 1;
     net_used = true;
     return fd_base + max_ends + @as(i32, @intCast(j));
 }
@@ -6002,6 +6013,17 @@ test "sim: refuses a loop of a second loop group polling in one run, which would
     try refusal("sim: refuses a loop of a second loop group polling in one run, which would take a pipe op submitted on the first", "sim: a sim run has one loop group", struct {
         fn body() !void {
             try two_groups.run(true);
+        }
+    }.body);
+}
+
+test "sim: dgram refuses: an open of a slot whose generation is at its limit" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: an open of a slot whose generation is at its limit", "sim: datagram socket slot 0 was opened 4294967295 times in this run", struct {
+        fn body() !void {
+            begin(1);
+            testSetDgramGen(0, std.math.maxInt(u32));
+            _ = try dg.open();
         }
     }.body);
 }
