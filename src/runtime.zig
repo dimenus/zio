@@ -755,6 +755,7 @@ pub const Executor = struct {
             self.stack_pool_shrink_timer.c.callback = stackPoolShrinkCallback;
             self.stack_pool_shrink_timer.c.flags.rearm = true;
             self.loop.add(&self.stack_pool_shrink_timer.c);
+            if (comptime zio_options.sim) self.loop.sim_idle_timer = &self.stack_pool_shrink_timer;
         }
 
         self.main_task.coro.setCurrent();
@@ -1106,6 +1107,16 @@ pub const Executor = struct {
             }
         }
         if (sim.hasDueIo()) return;
+        // Only the stack pool's shrink timers left, and no simulated I/O to
+        // come: nothing can make a task ready again. The shrink timer would
+        // keep the clock moving in its steps forever (t-4085).
+        if (sim.nextDueIoRemaining() == null) {
+            var task_timer = false;
+            for (execs) |e| {
+                if (e.loop.simHasTaskTimer()) task_timer = true;
+            }
+            if (!task_timer) sim.deadlock();
+        }
         if (sim.nextDueIoRemaining()) |io| {
             const t = Duration.fromNanoseconds(io);
             if (min_t == null or t.value < min_t.?.value) {
@@ -1713,6 +1724,7 @@ pub const Executor = struct {
     ///
     /// May migrate the task to the current executor for cache locality.
     pub fn scheduleTask(task: *AnyTask, comptime kind: AnyTask.WakeKind) void {
+        if (comptime zio_options.sim) @import("sim.zig").refuseOtherThread("a task wake or spawn");
         const foreign_rt = if (compat.is_safe) beginForeignWakeCheck(task) else {};
         defer if (compat.is_safe) endForeignWakeCheck(foreign_rt);
 
@@ -2301,6 +2313,7 @@ pub const Runtime = struct {
                 self.executors.appendAssumeCapacity(&worker.executor);
             }
             self.startWorkers(.run);
+            for (self.executors.items) |e| e.loop.sim_solo = self.executors.items.len == 1;
             // Executor.init bound each worker as this thread's current
             // executor; the thread belongs to the main executor.
             self.main_executor.main_task.coro.setCurrent();

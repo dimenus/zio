@@ -36,6 +36,7 @@ const Cancelable = @import("../common.zig").Cancelable;
 const Timeoutable = @import("../common.zig").Timeoutable;
 const Waiter = @import("../common.zig").Waiter;
 const Timeout = @import("../time.zig").Timeout;
+const sim = @import("../sim.zig");
 const Clock = @import("../time.zig").Clock;
 const SimpleQueue = @import("../utils/simple_queue.zig").SimpleQueue;
 const AutoCancel = @import("../autocancel.zig").AutoCancel;
@@ -217,6 +218,7 @@ fn removeFromBucket(bucket: *Bucket, waiter: *FutexWaiter) bool {
 
 /// Unblocks at most `max_waiters` callers blocked in a `wait()` call on `ptr`.
 pub fn wake(ptr: *const u32, max_waiters: u32) void {
+    sim.refuseOtherThread("Futex.wake");
     if (max_waiters == 0) return;
 
     const address = @intFromPtr(ptr);

@@ -47,6 +47,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Runtime = @import("../runtime.zig").Runtime;
 const os = @import("../os/root.zig");
+const sim = @import("../sim.zig");
 const yield = @import("../runtime.zig").yield;
 const Group = @import("../group.zig").Group;
 const common = @import("../common.zig");
@@ -79,6 +80,7 @@ pub fn isSet(self: *const Event) bool {
 /// The event remains set until `reset()` is called. Multiple calls to `set()` while
 /// already set have no effect.
 pub fn set(self: *Event) void {
+    sim.refuseOtherThread("Event.set");
     // Pop and wake all waiters while setting the flag.
     //
     // UAF safety: `self` may live on a coroutine stack belonging to a waiting task.
@@ -97,6 +99,7 @@ pub fn set(self: *Event) void {
 /// on it again. It is undefined behavior to call `reset()` while tasks are waiting
 /// in `wait()` or `waitTimeout()`.
 pub fn reset(self: *Event) void {
+    sim.refuseOtherThread("Event.reset");
     std.debug.assert(!self.wait_queue.hasWaiters());
     self.wait_queue.clearFlag();
 }

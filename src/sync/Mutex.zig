@@ -35,6 +35,7 @@ const WaitNode = @import("../utils/wait_queue.zig").WaitNode;
 const WaitQueue = @import("../utils/wait_queue.zig").WaitQueue;
 const Waiter = @import("../common.zig").Waiter;
 const os = @import("../os/root.zig");
+const sim = @import("../sim.zig");
 
 const Mutex = @This();
 
@@ -60,6 +61,7 @@ pub const init: Mutex = .{};
 /// is already locked by another coroutine.
 /// This function will never suspend the current task. If you need blocking behavior, use `lock()` instead.
 pub fn tryLock(self: *Mutex) bool {
+    sim.refuseOtherThread("Mutex.tryLock");
     return self.state.cmpxchgStrong(unlocked, locked, .acquire, .monotonic) == null;
 }
 
@@ -99,6 +101,7 @@ pub fn lockUncancelable(self: *Mutex) void {
 ///
 /// It is undefined behavior if the current coroutine does not hold the lock.
 pub fn unlock(self: *Mutex) void {
+    sim.refuseOtherThread("Mutex.unlock");
     const prev = self.state.swap(unlocked, .seq_cst);
     std.debug.assert(prev != unlocked);
     if (has_thread_futex and prev == thread_contended) {

@@ -12,6 +12,7 @@ const WaitQueue = @import("../utils/wait_queue.zig").WaitQueue;
 const WaitNode = @import("../utils/wait_queue.zig").WaitNode;
 const meta = @import("../meta.zig");
 const select = @import("../select.zig");
+const sim = @import("../sim.zig");
 
 fn FutureResult(comptime T: type) type {
     const E = meta.ErrorSet(T);
@@ -83,6 +84,7 @@ pub fn Future(comptime T: type) type {
         /// Set the future's value and wake all waiters.
         /// Returns silently if the value was already set.
         pub fn set(self: *Self, val: T) void {
+            sim.refuseOtherThread("Future.set");
             const was_set = self.value.set(val);
             if (!was_set) {
                 // Value was already set, ignore

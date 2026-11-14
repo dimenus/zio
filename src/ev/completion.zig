@@ -15,6 +15,7 @@ const HeapNode = @import("heap.zig").HeapNode;
 const ReadBuf = @import("buf.zig").ReadBuf;
 const WriteBuf = @import("buf.zig").WriteBuf;
 const os = @import("../os/root.zig");
+const sim = @import("../sim.zig");
 const net = @import("../os/net.zig");
 const fs = @import("../os/fs.zig");
 const Timestamp = @import("../time.zig").Timestamp;
@@ -666,6 +667,7 @@ pub const Async = struct {
 
     /// Notify the loop to wake up and complete this async handle (thread-safe)
     pub fn notify(self: *Async) void {
+        sim.refuseOtherThread("ev.Async.notify");
         // Pairs with the `pending` swap in Loop.add: both are acq_rel RMWs on
         // the same variable, so they order against each other. If add's swap
         // came first, the acquire here makes its setLoop visible and we wake

@@ -25,6 +25,9 @@ const TaskIdEnt = struct { ptr: usize, id: u32 };
 var begun: bool = false;
 var clock_routed: bool = true;
 var current_seed: u64 = 0;
+/// The thread that called `begin`, as `std.Thread.Id + 1`; 0 outside a run.
+/// Atomic because `refuseOtherThread` reads it from other threads.
+var sim_thread: std.atomic.Value(u64) = .init(0);
 var clock_ns: u64 = 0;
 var rng: std.Random.DefaultPrng = undefined;
 var hasher: std.hash.Wyhash = undefined;
@@ -199,6 +202,39 @@ pub fn begin(seed_value: u64) void {
     next_task_id = 1;
     task_id_len = 0;
     resetIo();
+    // Last, so a thread that sees the owner also sees the seed.
+    sim_thread.store(threadKey(), .release);
+}
+
+fn threadKey() u64 {
+    return @as(u64, @intCast(std.Thread.getCurrentId())) + 1;
+}
+
+/// Under sim, every zio operation runs on the thread that called `begin`:
+/// one thread is what makes a run replay from its seed. A task wake, or a
+/// change to a primitive that a task can see later (`Event.set`, a mutex
+/// taken), made by another thread lands at a real time the seed does not
+/// choose, so once `begin` ran it panics here. The callers check whether or
+/// not a task waits at that moment: a refusal that fired only when one
+/// waits would itself depend on timing.
+///
+/// Called at the entry of `Executor.scheduleTask`, `LoopState.requestWake`,
+/// `Event.set`/`reset`, `Mutex.tryLock`/`unlock` (so every primitive built on
+/// the zio mutex: channels, semaphores, conditions, barriers),
+/// `Futex.wake`, `Future.set` and `ev.Async.notify`. Not covered: plain
+/// atomics a program shares with a thread, and C code; the simulator cannot
+/// see those. Compiled out without sim.
+pub inline fn refuseOtherThread(comptime what: []const u8) void {
+    if (comptime !compiled_in) return;
+    checkSimThread(what);
+}
+
+fn checkSimThread(comptime what: []const u8) void {
+    const owner = sim_thread.load(.acquire);
+    if (owner == 0 or owner == threadKey()) return;
+    // No TRACE_HASH: the hasher belongs to the sim thread, which may be
+    // updating it right now. The seed is enough to replay.
+    std.debug.panic("sim: {s} from a thread that is not the sim thread (the one that called sim.begin) SEED={d}", .{ what, current_seed });
 }
 
 fn resetIo() void {
@@ -209,6 +245,7 @@ fn resetIo() void {
 }
 
 pub fn end() void {
+    sim_thread.store(0, .release);
     begun = false;
     clock_routed = true;
 }
@@ -386,7 +423,9 @@ pub fn printScope() void {
     // with `.zero` before any loop advances the clock, so the wake bits are
     // always clear when a sleep starts; reverting the wake-before-sleep
     // check changes no fixture trace.
-    const common_unsim = "file_io, connect_accept, extra_os_threads, dns, boot_vs_awake (boot==awake), spawn_blocking (panics), work_stealing (sim cannot run work_stealing), worker_os_threads (logical workers share one thread), loop_sleep_handshake (one thread: a wake never races a loop's sleep, so the sleeping bit is never seen set)";
+    // extra_os_threads: a zio wake or a primitive's state change from another
+    // thread panics (`refuseOtherThread`); atomics and C code are not seen.
+    const common_unsim = "file_io, connect_accept, extra_os_threads (a zio wake from one panics), dns, boot_vs_awake (boot==awake), spawn_blocking (panics), work_stealing (sim cannot run work_stealing), worker_os_threads (logical workers share one thread), loop_sleep_handshake (one thread: a wake never races a loop's sleep, so the sleeping bit is never seen set)";
     if (builtin.os.tag.isDarwin()) {
         std.debug.print("SCOPE unsimulated: " ++ common_unsim ++ ", backend_kernel (poll never called; Loop.init does not open a kqueue fd)\n", .{});
     } else {
@@ -950,4 +989,210 @@ test "submit I/O id is stable across cancel order" {
     const ba = runCancelOrderProbe(1, .b);
     try std.testing.expect(ab.state != ba.state);
     try std.testing.expect(ab.trace != ba.trace);
+}
+
+// ---- Refusals that end the run (t-4085) ----
+//
+// Each test runs itself again in a child process of this test binary
+// (test_runner.zig selects one test by TEST_FILTER), with `death_child_env`
+// set. The child takes the path that must panic; the parent checks that it
+// died of SIGABRT with the expected message on stderr. A child that returns
+// instead exits 0, and a child that runs on forever hits the timeout: both
+// fail the parent. The child sets RLIMIT_CORE to 0 first, so no core file.
+
+const death_child_env = "ZIO_SIM_DEATH_CHILD";
+
+fn isDeathChild() bool {
+    return std.c.getenv(death_child_env) != null;
+}
+
+fn noCoreDump() void {
+    std.posix.setrlimit(.CORE, .{ .cur = 0, .max = 0 }) catch {};
+}
+
+fn expectChildPanics(comptime test_name: []const u8, comptime want: []const u8) !void {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_len = try std.process.executablePath(io, &exe_buf);
+
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    if (std.c.getenv("PATH")) |path| try env.put("PATH", std.mem.span(path));
+    try env.put("TEST_FILTER", test_name);
+    try env.put(death_child_env, "1");
+
+    const res = std.process.run(gpa, io, .{
+        .argv = &.{exe_buf[0..exe_len]},
+        .environ_map = &env,
+        // A broken deadlock check runs the clock ahead forever and prints
+        // nothing; this bounds that wait.
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } },
+    }) catch |err| switch (err) {
+        error.Timeout => {
+            std.debug.print("child of \"{s}\" ran 30 s without ending\n", .{test_name});
+            return err;
+        },
+        else => return err,
+    };
+    defer gpa.free(res.stdout);
+    defer gpa.free(res.stderr);
+    const died = switch (res.term) {
+        .signal => |s| s == .ABRT,
+        else => false,
+    };
+    if (!died or std.mem.indexOf(u8, res.stderr, want) == null) {
+        std.debug.print("child of \"{s}\": term {any}, wanted SIGABRT and \"{s}\"; stderr:\n{s}\n", .{ test_name, res.term, want, res.stderr });
+        return error.ChildDidNotPanic;
+    }
+}
+
+const death = struct {
+    const Runtime = @import("runtime.zig").Runtime;
+
+    fn up(executors: u8) !*Runtime {
+        begin(1);
+        return Runtime.init(std.heap.page_allocator, .{
+            .executors = .exact(executors),
+            .thread_pool = .{ .max_threads = 0 },
+        });
+    }
+
+    /// Runs `func(args)` on a new OS thread and joins it. The thread is
+    /// expected to panic, which ends the process before the join returns.
+    fn onOtherThread(comptime func: anytype, args: anytype) !void {
+        const th = try std.Thread.spawn(.{}, func, args);
+        th.join();
+    }
+
+    fn noop() void {}
+
+    fn waitForever(ev: *@import("sync/Event.zig")) void {
+        ev.wait() catch {};
+    }
+};
+
+test "sim: refuses a task spawn from another thread" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanics("sim: refuses a task spawn from another thread", "sim: a task wake or spawn from a thread that is not the sim thread");
+    noCoreDump();
+    const rt = try death.up(1);
+    try death.onOtherThread(struct {
+        fn run(r: *death.Runtime) void {
+            _ = r.spawn(death.noop, .{}) catch {};
+        }
+    }.run, .{rt});
+}
+
+test "sim: refuses a loop wake from another thread" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanics("sim: refuses a loop wake from another thread", "sim: a loop wake from a thread that is not the sim thread");
+    noCoreDump();
+    const rt = try death.up(1);
+    try death.onOtherThread(struct {
+        fn run(r: *death.Runtime) void {
+            r.main_executor.loop.wake();
+        }
+    }.run, .{rt});
+}
+
+test "sim: refuses Event.set from another thread, with no task waiting" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanics("sim: refuses Event.set from another thread, with no task waiting", "sim: Event.set from a thread that is not the sim thread");
+    noCoreDump();
+    _ = try death.up(1);
+    var ev: @import("sync/Event.zig") = .init;
+    try death.onOtherThread(@import("sync/Event.zig").set, .{&ev});
+}
+
+test "sim: refuses Event.reset from another thread" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanics("sim: refuses Event.reset from another thread", "sim: Event.reset from a thread that is not the sim thread");
+    noCoreDump();
+    _ = try death.up(1);
+    var ev: @import("sync/Event.zig") = .init;
+    try death.onOtherThread(@import("sync/Event.zig").reset, .{&ev});
+}
+
+test "sim: refuses Mutex.tryLock from another thread, uncontended" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanics("sim: refuses Mutex.tryLock from another thread, uncontended", "sim: Mutex.tryLock from a thread that is not the sim thread");
+    noCoreDump();
+    _ = try death.up(1);
+    var m: @import("sync/Mutex.zig") = .init;
+    try death.onOtherThread(struct {
+        fn run(mm: *@import("sync/Mutex.zig")) void {
+            _ = mm.tryLock();
+        }
+    }.run, .{&m});
+}
+
+test "sim: refuses Mutex.unlock from another thread, with no task waiting" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanics("sim: refuses Mutex.unlock from another thread, with no task waiting", "sim: Mutex.unlock from a thread that is not the sim thread");
+    noCoreDump();
+    _ = try death.up(1);
+    var m: @import("sync/Mutex.zig") = .init;
+    m.lockUncancelable();
+    try death.onOtherThread(@import("sync/Mutex.zig").unlock, .{&m});
+}
+
+test "sim: refuses Futex.wake from another thread, with no task waiting" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanics("sim: refuses Futex.wake from another thread, with no task waiting", "sim: Futex.wake from a thread that is not the sim thread");
+    noCoreDump();
+    _ = try death.up(1);
+    var word: u32 = 0;
+    try death.onOtherThread(struct {
+        fn run(w: *u32) void {
+            @import("sync/Futex.zig").wake(w, 1);
+        }
+    }.run, .{&word});
+}
+
+test "sim: refuses Future.set from another thread, with no task waiting" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanics("sim: refuses Future.set from another thread, with no task waiting", "sim: Future.set from a thread that is not the sim thread");
+    noCoreDump();
+    _ = try death.up(1);
+    const F = @import("sync/future.zig").Future(u32);
+    var f: F = .init;
+    try death.onOtherThread(struct {
+        fn run(ff: *F) void {
+            ff.set(7);
+        }
+    }.run, .{&f});
+}
+
+test "sim: refuses ev.Async.notify from another thread, before the handle is added" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanics("sim: refuses ev.Async.notify from another thread, before the handle is added", "sim: ev.Async.notify from a thread that is not the sim thread");
+    noCoreDump();
+    _ = try death.up(1);
+    const Async = @import("ev/completion.zig").Async;
+    var a: Async = .init();
+    try death.onOtherThread(Async.notify, .{&a});
+}
+
+fn deadlockChild(executors: u8) !void {
+    noCoreDump();
+    const rt = try death.up(executors);
+    // The default stack pool keeps its shrink timer: the timer that kept the
+    // clock running before t-4085.
+    std.debug.assert(rt.options.stack_pool.shrink_interval.value > 0);
+    var ev: @import("sync/Event.zig") = .init;
+    var h = try rt.spawnInto(.{ .executor = @intCast(executors - 1) }, death.waitForever, .{&ev});
+    h.join();
+}
+
+test "sim: every task parked with only the shrink timer pending is a deadlock, one executor" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanics("sim: every task parked with only the shrink timer pending is a deadlock, one executor", "sim: deadlock clock_ns=0");
+    try deadlockChild(1);
+}
+
+test "sim: every task parked with only the shrink timer pending is a deadlock, two executors" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanics("sim: every task parked with only the shrink timer pending is a deadlock, two executors", "sim: deadlock clock_ns=0");
+    try deadlockChild(2);
 }

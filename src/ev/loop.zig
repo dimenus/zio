@@ -306,6 +306,7 @@ pub const LoopState = struct {
     /// the loop's `sleeping` comes first and the requester sees it, or the
     /// request comes first and the loop sees it and doesn't block.
     pub fn requestWake(self: *LoopState, bit: u32) bool {
+        sim.refuseOtherThread("a loop wake");
         return self.wake_requested.fetchOr(bit, .acq_rel) == sleeping;
     }
 
@@ -563,6 +564,16 @@ pub const Loop = struct {
     /// group-owner callbacks are unaffected (they still run inline).
     do_not_call_callbacks: bool = false,
 
+    /// Sim: the one timer here that wakes no task, the stack pool's shrink
+    /// timer (`Executor.init`). It re-arms forever, so a deadlock check that
+    /// counted it would never fire: the clock would run ahead in its steps
+    /// instead (t-4085). `simHasTaskTimer` leaves it out.
+    sim_idle_timer: if (zio_options.sim) ?*Timer else void = if (zio_options.sim) null else {},
+    /// Sim: this is its runtime's only loop, so `poll` decides a deadlock for
+    /// the whole runtime. With two logical executors `Executor.simMuxStep`
+    /// decides, because one loop's timers say nothing about the other's.
+    sim_solo: if (zio_options.sim) bool else void = if (zio_options.sim) false else {},
+
     const default_queue_size = 256;
 
     pub const Options = struct {
@@ -638,6 +649,21 @@ pub const Loop = struct {
     /// before any add/poll/cancel on this loop.
     pub fn bindThread(self: *Loop) void {
         if (in_debug_mode) current_loop = self;
+    }
+
+    /// Sim: whether a timer other than `sim_idle_timer` is armed. In a
+    /// pairing heap the root has no siblings, so a root with no child is the
+    /// heap's only element.
+    pub fn simHasTaskTimer(self: *Loop) bool {
+        if (comptime !zio_options.sim) unreachable;
+        self.state.lockTimers();
+        defer self.state.unlockTimers();
+        for (&self.state.timers) |*heap| {
+            const root = heap.peek() orelse continue;
+            if (root == self.sim_idle_timer and root.heap.child == null) continue;
+            return true;
+        }
+        return false;
     }
 
     /// Sim: earliest pending timer remaining, or null. Does not fire.
@@ -1612,12 +1638,16 @@ pub const Loop = struct {
             }
         }
         if (comptime zio_options.sim) {
-            // A full park (the loop's max wait, no timer, no simulated I/O
-            // still to come) can never end on one thread: deadlock. Checked
-            // after the sleep announcement, so a wake request that got in
-            // first is not mistaken for one.
-            if (timeout.value != 0 and timer_result.next_timeout == null and
-                timeout.value >= self.max_wait.value and sim.nextDueIoRemaining() == null)
+            // A full park (the caller's cap is at least the loop's max wait)
+            // with no timer that can wake a task and no simulated I/O still
+            // to come can never end on one thread: deadlock. Checked after the
+            // sleep announcement, so a wake request that got in first is not
+            // mistaken for one. As the only loop, this one leaves the shrink
+            // timer out (`sim_idle_timer`); as one of two, it counts every
+            // timer and `simMuxStep` makes the runtime-wide call.
+            const no_task_timer = if (self.sim_solo) !self.simHasTaskTimer() else timer_result.next_timeout == null;
+            if (timeout.value != 0 and no_task_timer and
+                wait_cap.value >= self.max_wait.value and sim.nextDueIoRemaining() == null)
             {
                 sim.deadlock();
             }
