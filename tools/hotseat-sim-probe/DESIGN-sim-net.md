@@ -1,8 +1,8 @@
 # Design brief: a sim network for zio (t-4086, t-4087), revision 3
 
-Status: **phase 1 (section 12) is built but not accepted: an outside review
-of 158ebba found nine defects; two are fixed, seven are open (section 15).
-The rest is for review.**
+Status: **phase 1 (section 12) is built. An outside review of 158ebba found
+nine defects; all nine are closed (section 15). Phase 1 is not accepted
+until the owner reviews that work. The rest is for review.**
 
 Revision 2 (dd55885) was reviewed by another vendor's model. This revision
 takes the decisions made after that review. Section 13 lists what changed
@@ -531,6 +531,10 @@ The scripts the gates below use are beside them, in `zio-sim6-tools/` there
   158ebba):** the owner's two decisions on report 10 (sections 3.2 and 8).
   The bridge test's `enet_socketset_select` and its test are gone, and
   SO_SNDBUF sits in the bridge test's shared table.
+- **The outside review's findings 1 to 9 (3727c95 to 6c2e4e0), and a
+  randomised model test of the sim pipe buffer (a336d63).** Each commit
+  holds the failing run before the fix, the mutants, and what was rejected;
+  the list is under "The outside review of 158ebba" below.
 
 ### Phase 1 acceptance: what holds, group by group
 
@@ -570,7 +574,9 @@ in the message of the commit that added it.
    every run`; `sim: dgram: a bind conflict is AddressInUse, for an equal
    address and across a wildcard`; `sim: dgram: a wildcard receiver gets the
    destination address, a reply from it leaves from it, and a bad source is
-   AddressUnavailable`.
+   AddressUnavailable`; `sim: enet bridge: a send before bind binds the
+   wildcard address and a port, and a reply to any local address on that
+   port arrives` (both builds; section 4's table).
 4. **Readiness lifecycle: holds.** `sim: dgram ev: poll with a zero timeout
    reports readable only once a datagram has landed, and writable always`;
    `sim: dgram ev: a poll parked before the datagram is sent wakes when it
@@ -578,7 +584,11 @@ in the message of the commit that added it.
    that is canceled gives Canceled, and the next datagram is still there for
    the next receive`; `sim: dgram ev: close wakes an ev receive parked on the
    socket`; `sim: dgram: a closed fd number is reused by the next open, which
-   does not see the old socket's data`.
+   does not see the old socket's data`; `sim: dgram ev: 64 sockets, each
+   with a parked receive, all woken at one virtual time`; `sim: dgram ev: a
+   negative fd in a poll set is ignored, as the kernel does, beside a sim
+   socket`; and the `sim: dgram ev refuses:` tests of a poll on a closed
+   socket or a pipe end.
 5. **Independent limits: holds.** `sim: dgram limits: a small byte budget
    drops by bytes, raising SO_RCVBUF after open lets more in, and queued
    datagrams keep their bytes`; `sim: dgram limits: with a large byte budget,
@@ -588,7 +598,13 @@ in the message of the commit that added it.
    sim op`; `sim: exits refuse: a file close of a sim fd`; `sim: exits
    refuse: File.fromFd(sim fd).close() in a loop callback, through the
    blocking dispatch`; `sim: exits: every function in src/os that takes an fd
-   refuses a sim fd first, or has a sim branch`; the `sim: dgram refuses: a
+   refuses a sim fd first, or has a sim branch` (it fails on an integer
+   parameter it cannot name, and on a function used as a value); `sim: exits
+   refuse: an ioctl through the public fs.ioctl alias`; `sim: exits refuse:
+   epoll_pwait2 on a sim fd` (Linux only); the refused send flags and
+   `recvmsg` on a socket that asked for destination addresses (`sim: dgram
+   refuses:`); `sim: dgram trace: the state digest sees where a datagram
+   still on the wire goes and where it came from`; the `sim: dgram refuses: a
    socket ... from another thread` tests (open, bind, send, receive, close,
    setNonBlocking, enableDestinationAddress, setsockopt); the `sim: fd
    namespace:` tests; `sim: dgram trace: ten fresh processes with the heap
@@ -623,32 +639,36 @@ select adapter, which 9ecfbc6 removed.
   socket that is closed and whose number is reused at once ends
   FileDescriptorNotASocket and leaves the new socket's datagram`. Pipe ends
   are never reused within a run, so pipes do not have this.
-- **Open, for the next seat, in this order:**
-  - 3: `stateDigest` leaves out in-flight endpoints. Hash each pending
-    entry's endpoints, sequence and length, and the queues in logical order.
-    Hashes of runs with datagrams in flight change on purpose; pipe-only
-    pinned hashes and starh2's must not (show both).
-  - 4: native exits the structural test misses: the public `fs.ioctl`
-    alias (`ioctlPosix`), `epoll_fd` (linux.zig), `fromfd`/`tofd`
-    (darwin.zig). Guard them, and make an integer parameter the test cannot
-    classify fail instead of passing as "other" (an explicit list of known
-    non-fd names; the default is failure). Show the new rule finds those
-    three on the old code.
-  - 5: `poll` reports a closed socket and a sim pipe as writable; `NetPoll
-    (.send)` does not check the socket is open.
-  - 6: a send before bind binds 127.0.0.1, not the wildcard. Model what the
-    kernels do (wildcard, source chosen per send); check macOS and Linux
-    with a real-socket test first; add the case to the parity table.
-  - 7: send flags are dropped under sim (`sendto`, `sendmsg`,
-    `sendDatagram`); refuse unsupported ones loudly.
-  - 8: `recvmsg` with no control buffer after `enableDestinationAddress`
-    gives no `MSG_CTRUNC`; report it or refuse.
-  - 9: `max_due` (32) and the harvest buffer can overflow below the socket
-    and live-op limits. Size them from the real bound; test 64 sockets
-    woken at one virtual time (the sender can be one of them: there are 64
-    datagram slots).
-  - The same class as the P1s: zero lengths, wraps and fd reuse in pipes
-    (zero-length pipe sends were not checked).
+- **3, fixed in 59b81fc:** a datagram on the wire now hashes its flow,
+  sequence and length in `stateDigest`. The queue part did not reproduce
+  (the wire digest already fixes the queue), so no code for it. Test: `sim:
+  dgram trace: the state digest sees where a datagram still on the wire
+  goes and where it came from`.
+- **4, fixed in 0002d0e:** `ioctlPosix` (behind `pub const ioctl`),
+  `ioctlWindows` and `epoll_pwait2` refuse a sim fd; `renameatx_np` is in
+  `extern_fds`. The structural test fails on an integer parameter whose
+  name is in neither `fd_names` nor `non_fd_ints`, and on a function used as
+  a value. Its header comment has both rules.
+- **5, fixed in 862d083:** a poll refuses a closed socket or a pipe end for
+  any events, `NetPoll(.send)` refuses a closed socket, and a negative fd is
+  skipped as the kernel does.
+- **6, fixed in 81598b9:** a send before bind binds the wildcard address
+  (section 4 has the measured table; the bridge test asserts it in both
+  builds).
+- **7, fixed in 58d40ed:** send flags other than `no_signal` and `dontwait`
+  refuse, derived from `SendFlags`'s fields.
+- **8, fixed in 2e951b2:** `recvmsg` refuses on a socket that asked for
+  destination addresses. The kernels differ without a control buffer (Linux
+  sets `MSG_CTRUNC`, macOS does not; the commit has the run).
+- **9, fixed in 6c2e4e0:** the due list and the harvest buffer hold
+  `max_live` entries; `pushDueAt` checks one due entry per live op.
+- **The pipe siblings, checked in a336d63:** `sim: pipe: the pipe buffer
+  matches a list of bytes under random sends, receives, empty slices and a
+  full buffer` (5 seeds x 1000 steps; six mutants killed). No defect found.
+  The pipe buffer is not a ring (`drainBuf` moves the rest to the front),
+  so it has no wrap. Pipe ends are never reused within a run.
+- **Open, not done:** t-4096, a zero-length receive on an empty sim pipe
+  parks; check what the kernels do first.
 
 ### Next
 
@@ -676,7 +696,9 @@ select adapter, which 9ecfbc6 removed.
   `zig build test -Dsim=true -Dscheduling=pinned -Dtest-filter="sim: "`. With
   `TEST_VERBOSE=true`, strip the colour codes first
   (`sed 's/\x1b\[[0-9;]*[mK]//g'`); then `grep -c "^sim.test.sim:"` counts
-  them, and one of them prints its own text before its "OK".
+  them. Several print their own text first, so their "OK" is on the next
+  line (the ten-process test, the state digest test, the pipe model test,
+  the structural test): check those with `grep -A1`.
 - **The normal suite:** `PATH="$(mise where zig@0.17.0):$PATH" ./check.sh --ci`.
   It runs host tests only.
 - **Linux and Windows:** `check.sh` never compiles a Linux or Windows branch.
@@ -703,7 +725,11 @@ select adapter, which 9ecfbc6 removed.
   it. Check the reason line of each kill, not just the verdict. It cuts each
   reason line at 200 characters, which can drop a C test's failing line;
   `mut/run-why.py` prints from `enet_bridge_test.c:` on. The bridge's mutant
-  list is made by `mut/gen-bridge.py`.
+  list is made by `mut/gen-bridge.py`. Since sitting 13, a mutant can
+  carry `why` (a substring; lines holding it are printed as the reason),
+  `edits` of the form `[file, old, new]` across several files, and `dump` (a
+  file for the full output). The runner of sittings 1 to 12 is kept as
+  `mut/run-12.py`.
 - **starh2's three sim steps:** `starh2-setup.sh <zio commit> <label>` makes a
   `git archive` of starh2 429b2b3 whose two zio pins point at a `git archive`
   of that zio commit (never the live tree). `starh2-gate.sh <label> 10`, in a
@@ -749,3 +775,22 @@ select adapter, which 9ecfbc6 removed.
   files first.
 - **The C file builds with `-Werror`,** so a C mutant that leaves a parameter
   unused does not compile. Keep it used: `n > 1 ? 1 : n`, not `1`.
+- **The mutant runner read the first "Failed tests:" block** of the output
+  (to sitting 12). A death child's own summary is echoed earlier than the
+  parent's, so a killed mutant could read "SURVIVED". It reads the last
+  block now. Read the full output (`dump`) before you believe a survivor.
+- **A mutant that crashes an earlier test is "NOT RUN"** for the test you
+  named: the process died first. Read its panic line (`dump`); it still
+  counts only with the reason you expected.
+- **A new integer parameter in `src/os/` fails the structural test** until
+  its name is in `fd_names` (an fd) or `non_fd_ints` (never an fd) in
+  `src/sim_exits_test.zig`.
+- **The kernels disagree on more than the source address:** a `recvmsg`
+  with no control buffer on a socket asking for destination addresses sets
+  `MSG_CTRUNC` on Linux 6.8 and not on macOS 25.6. Measure both before you
+  write what "the kernel" does.
+- **Tool rules for agents here:** a recursive `rm` of a path built from a
+  variable is refused by a hook; make a new directory instead. Restoring a
+  file with `git checkout <file>` is refused too, and would drop uncommitted
+  work: let the mutant runner restore it. In zsh, a word that starts with
+  `=` (`echo ====`) is a command lookup and fails; quote it.
