@@ -1896,7 +1896,8 @@ fn receiverOf(to: Ip4) ?*Dgram {
 /// What happened to a datagram, in the trace and the wire digest. 0 to 2
 /// are phase 1's, recorded at landing. 3 to 6 are drops by a fault rule at
 /// the send, recorded at the send time; 7 and 8 are drops by a rule in
-/// force at the landing, recorded at the landing (design section 5).
+/// force at the landing, recorded at the landing (the fault protocol above
+/// `pub const Endpoint`).
 const LandOutcome = enum(u8) {
     landed = 0,
     no_socket = 1,
@@ -2029,7 +2030,7 @@ fn isFlowHead(rest: []const WireDatagram, k: usize) bool {
     return true;
 }
 
-// ---- Datagram faults (sim network design, section 5; phase 2) ----
+// ---- Datagram faults (phase 2 of the sim network) ----
 //
 // A test sets fault rules during a run, from a task, at the virtual time
 // that task runs; they act on datagrams sent (and landing) from then on.
@@ -7771,7 +7772,7 @@ test "sim: exits refuse: File.fromFd(sim fd).close() in a loop callback, through
     }.body);
 }
 
-// ---- Phase 2, slice 1: fault rules, drops, counts and records (design section 5) ----
+// ---- Phase 2, slice 1: fault rules, drops, counts and records ----
 
 const nf = struct {
     fn ep(d: u8, port: u16) Endpoint {
@@ -7960,7 +7961,8 @@ test "sim: net faults: a partition or silence that starts while a datagram is on
 }
 
 /// The test's own copy of the draw formula in `faultDraw`'s doc comment,
-/// and of the Gilbert rule of design section 5. It calls nothing of the sim.
+/// and of the Gilbert rule in the fault protocol above `pub const Endpoint`.
+/// It calls nothing of the sim.
 const nf_model = struct {
     fn mix(x: u64) u64 {
         var z = x;
@@ -8280,7 +8282,8 @@ test "sim: net faults refuse: requireEveryRuleMatched with a cleared rule and a 
     }.body);
 }
 
-// Misuse of the fault API panics with a message (design section 5).
+// Misuse of the fault API panics with a message (the list is in the fault
+// protocol above `pub const Endpoint`).
 const nf_misuse = struct {
     fn inRun() void {
         begin(1);
@@ -8498,7 +8501,8 @@ test "sim: net faults: a silence drops before a partition, and of two partitions
 /// A to B under one impairment with delay, jitter and duplication, one
 /// datagram every 400 us. The test's model (below) computes every copy's
 /// landing time from its own copy of the draw formula and the rules of
-/// design section 5, then the order B receives them in, the wire digest,
+/// fault protocol above `pub const Endpoint`, then the order B receives them
+/// in, the wire digest,
 /// and the counts.
 const nf_delay = struct {
     const n: u32 = 300;
@@ -8662,7 +8666,7 @@ test "sim: net faults: after a route change to a shorter delay a flow keeps its 
     try dg.run(1, nf_route.body);
 }
 
-/// Design section 16, point 1: a delay moves the landing, and a landing
+/// A delay moves the landing, and a landing
 /// wakes its op at the time it lands, so `pushDueAt`'s check (a datagram op
 /// is due now) holds. These run with that check in place.
 const nf_wake = struct {

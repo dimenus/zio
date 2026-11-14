@@ -2,8 +2,8 @@
 
 Status: **phase 1 (section 12) is built, and four rounds of outside review
 of it are closed (section 15). Section 15 is the acceptance record of phase
-1. Phase 2 (faults and replay) has its design check (section 16) and its
-API (section 5); building waits for the owner's answers in section 16.**
+1. Phase 2 (faults and replay) is built (section 15); its API and rules
+are the comment above `pub const Endpoint` in `src/sim.zig`.**
 
 Revision 2 (dd55885) was reviewed by another vendor's model. This revision
 takes the decisions made after that review. Section 13 lists what changed
@@ -202,101 +202,10 @@ a receive ring with byte and packet limits, and stats.
 
 ## 5. The test's API (phase 2: faults)
 
-In `zio.sim`, in a sim build, on the sim thread, during a run. `begin` starts
-a run with no rule. A test changes rules from a task, at the virtual time
-that task runs; a controller task that sleeps to a time and then sets a rule
-is exact.
-
-```zig
-/// null matches any value. `ip` is in 127/8; `port` is not 0.
-pub const Endpoint = struct { ip: ?[4]u8 = null, port: ?u16 = null };
-/// One direction: datagrams from `from` to `to`. `.{}` is every datagram.
-pub const Path = struct { from: Endpoint = .{}, to: Endpoint = .{} };   // + fn reversed()
-
-pub const Impairment = struct {
-    loss_ppm: u32 = 0,         // independent loss
-    burst: ?Burst = null,      // Gilbert loss: every datagram is lost in the bad state
-    delay_ns: u64 = 0,         // added to wire_latency_ns
-    jitter_ns: u64 = 0,        // plus a uniform 0..jitter_ns, per copy
-    reorder: bool = false,     // false: never lands before an earlier datagram of its flow
-    dup_ppm: u32 = 0,          // a second copy, with its own jitter
-};
-pub const Burst = struct { enter_ppm: u32, leave_ppm: u32 };
-
-pub fn setImpairment(path: Path, imp: Impairment) void;
-pub fn clearImpairment(path: Path) RuleStats;
-pub fn setPartition(path: Path) void;     // drop everything on the path
-pub fn healPartition(path: Path) RuleStats;
-pub fn silence(ep: Endpoint) void;        // drop everything to or from ep
-pub fn unsilence(ep: Endpoint) RuleStats;
-pub fn netFaultStats() NetFaultStats;     // the run's count per cause
-pub fn netFaultDraws() u64;               // promise 2
-pub fn wireDigest() u64;                  // phase 1; send-time drops added
-pub const RuleStats = struct { matched: u64, dropped: u64, duplicated: u64, delayed: u64 };
-pub const NetFaultStats = struct {
-    lost: u64, lost_burst: u64,
-    partitioned_at_send: u64, partitioned_in_flight: u64,
-    silenced_at_send: u64, silenced_in_flight: u64,
-    duplicated: u64, delayed: u64, overtaking: u64,
-};
-```
-
-A datagram meets the rules twice. The sender succeeds either way.
-
-1. **At send**, once its source is known:
-   - a silence of its source or destination, or a partition of its flow:
-     dropped (`silenced_at_send`, `partitioned_at_send`; silence first). No
-     draw.
-   - else the **one** impairment set most recently among those that match:
-     1. `burst`: the rule's state moves (good to bad with `enter_ppm`, bad to
-        good with `leave_ppm`), then in the bad state it is lost
-        (`lost_burst`). The state is the rule's, shared by every flow it
-        matches: a link has one bad period.
-     2. `loss_ppm`: lost (`lost`).
-     3. `dup_ppm`: two copies (`duplicated`).
-     4. each copy lands at `now + wire_latency_ns + delay_ns + jitter`.
-   - unless that rule says `reorder`, a copy lands no earlier than the
-     latest landing of its flow already on the wire. With no rule this
-     changes nothing: phase 1's latency is fixed.
-   - `overtaking` counts copies scheduled to land before an earlier
-     datagram of their flow; `delayed` counts copies later than
-     `wire_latency_ns`.
-2. **At landing** (the first harvest at or after its time): a silence or a
-   partition in force then that matches it drops it
-   (`silenced_in_flight`, `partitioned_in_flight`). A link that goes down
-   loses what is in it. Else phase 1: no socket, queue full, or landed.
-
-**The draws.** A fault draw is a counter-based hash of the seed, the
-datagram's send number in the run and the purpose (burst, loss, dup, jitter
-of copy 0 or 1); the formula is in its doc comment. It never draws from the
-run's RNG, so faults do not move the schedule's draws, and a model can
-compute the same value without calling the sim. A field that cannot change
-the outcome draws nothing: ppm 0 or 1_000_000, jitter 0, no burst.
-
-**One rule per path and kind; last set wins among impairments.**
-`setImpairment` on a path that has one replaces it, resets its burst to
-good, and makes it the most recent. Partitions and silences are outside
-"last set wins": any one that matches drops, whatever impairment was set
-after it.
-
-**Misuse panics with a message:** any call outside a run or off the sim
-thread; ppm over 1_000_000; a burst with `enter_ppm` or `leave_ppm` 0 (a
-burst that never starts, or never ends: that is `setPartition`);
-`delay_ns + jitter_ns` over 60 s; an `Endpoint` ip outside 127/8, including
-0.0.0.0 (a socket bound to the wildcard is `.{ .port = p }`); port 0; an
-impairment with every field at its default (there is one way to say "no
-impairment": `clearImpairment`); a clear, heal or unsilence of a rule that
-is not there; a second partition or silence of an equal path; more than 64
-rules.
-
-**What is recorded.** A drop at send is a `dgram` trace event and a wire
-digest record at the send time, with outcome 3 (lost), 4 (burst), 5
-(partition) or 6 (silence); a drop in flight is recorded at landing as 7
-(partition) or 8 (silence); a copy sets bit 0x80 of the outcome. Phase 1's
-outcomes 0, 1 and 2 and their records do not change. The state digest hashes
-the rule table, burst states and counts in a run that set a rule. Rule
-changes are not in the trace or the wire digest: a rule that acts on nothing
-leaves both unchanged (promise 2).
+Built (sitting 20). The API, the order in which a datagram meets the rules,
+the draw, the counts, the records and the misuse list are the comment above
+`pub const Endpoint` in `src/sim.zig`; the reasoning is in the messages of
+3d35086 (the design check) and 24fcbeb to 2561a08 (the four slices).
 
 - **Stream track:** `setConnectOutcome(path, .accept | .refuse |
   .no_answer)` comes with that track.
@@ -449,7 +358,7 @@ option, and hotseat's bridge will not; `IP_TTL` is not modelled.
 - **Bandwidth and queueing.** Delay is drawn per datagram; there is no link
   rate, no queue that grows with load, and loss does not depend on load.
 - **NAT rebinding**, where the peer sees a datagram's source port change
-  while the sender's socket stays the same (section 16, open point 3).
+  while the sender's socket stays the same (t-4100).
 
 ## 11. Phase 1 acceptance
 
@@ -545,8 +454,8 @@ Before hotseat replaces ENet's socket half in production:
      silence, partition, loss and burst, the counts, the trace and digest
      records; promise 2;
   2. delay, jitter, the flow-order clamp, reorder and duplication; a test
-     of a parked op woken by a delayed landing (section 16, point 1);
-  3. the op-level model test learns the faults (section 16);
+     of a parked op woken by a delayed landing (the `pushDueAt` check stays);
+  3. the op-level model test learns the faults;
   4. promise 3: a faulted workload in ten fresh processes, and one changed
      rule gives another digest.
 - **Phase 3 (hotseat's):** ENet over its bridge, under sim and with the
@@ -957,7 +866,7 @@ the mutants in its commits.
 ### Next: phase 2 (faults and replay)
 
 - **Phase 2** (section 12): faults, counters, validation, promises 2 and 3.
-  The design check is section 16 (sitting 19); the owner's answers came
+  The design check was 3d35086 (sitting 19); the owner's answers came
   with sitting 20: keep the `pushDueAt` check (a delay moves the landing,
   not the wake) and test the delayed wake; silence by endpoint; NAT
   rebinding stays t-4100, not in this phase; and one call that checks every
@@ -1062,6 +971,9 @@ the mutants in its commits.
   `build.zig`, `build.zig.zon` and `src/`. When they differ,
   `fndiff.py <a> <b>` lists the functions that differ, with only moved code
   and data normalized away. Control: the mutex's `locked` from 1 to 3.
+- **The fault tests:** the filter `sim: net faults` (the refusals are
+  `sim: net faults refuse`). The op model's seeds 9 to 16 carry its fault
+  steps; seeds 1 to 8 are the phase 1 mix.
 - **The op-level model test:** the filter `sim: op model`. It runs itself
   in a child process; the parent prints the child's counts and, on a
   failure, `op model: FAIL seed S step K: ...` or the last step the child
@@ -1159,75 +1071,18 @@ the mutants in its commits.
 - **Count skips by reason in a random test.** The op-level test's slot
   pool was full in 7164 steps, which silently cut its traffic in half;
   `no_free_slot` and the per-kind skip counts show it now.
+- **A random test whose sockets and rules all use one address cannot see
+  an address bug.** The op model's fault rules only used 127.0.0.1 until
+  the mutant "an endpoint ignores its address" survived; rules on
+  127.0.0.2, which holds no socket, now catch it (sitting 20).
+- **A "small" change to a drawn range is not small.** One more nanosecond
+  of jitter changes the modulus of every jitter draw, so the whole run
+  changes. To change only times, change a fixed delay (sitting 20).
+- **A mutant's old text must be unique in the file**, and the test's own
+  model copies of the fault code hold the same lines: pick text with the
+  sim's own names in it (`faultDraw`, `fault_stats`).
 - **Tool rules for agents here:** a recursive `rm` of a path built from a
   variable is refused by a hook; make a new directory instead. Restoring a
   file with `git checkout <file>` is refused too, and would drop uncommitted
   work: let the mutant runner restore it. In zsh, a word that starts with
   `=` (`echo ====`) is a command lookup and fails; quote it.
-
-## 16. Phase 2 design check (sitting 19, 2026-11-14)
-
-Sections 5, 7 and 12 were read against the code at 33b95ca and against the
-owner's phase 2 requirements. Section 5 is now the API. What the check
-found:
-
-**Open points for the owner (building waits for these):**
-
-1. **The `pushDueAt` check does not need to go.** Section 15 said a delayed
-   landing makes it fire. It cannot. Every datagram op is pushed with the
-   time `clock_ns` (`dgramClose`, `dgramOpDone`, `wakeParked`; read, and
-   `grep -n "pushDueAt(" src/sim.zig` lists those three and the pipe call),
-   and the check compares that same value with `clock_ns`. A fault delays
-   the **landing** (the wire entry's `due_at`), and a landing wakes its op at
-   the time it lands. The check would fire only if the sim delayed the
-   **wake** after a landing, and the design does not do that: the queue
-   would show a datagram while the op still slept. Recommendation: keep the
-   check (a second guard that costs nothing), and add the test of a parked
-   receive and a parked poll woken by a delayed landing, also with the
-   socket closed and its number reused while the datagram is in flight.
-2. **Silence is keyed by an endpoint, not by an fd.** The requirement says
-   "one socket". Revision 2 rejected per-fd faults: tests think in links,
-   and often do not hold the peer's fd (hotseat's ENet owns its socket). An
-   exact endpoint names one socket; `.{ .port = p }` names a socket bound to
-   the wildcard; `.{ .ip = a }` names a whole host that the test gave its
-   own 127/8 address (the sim treats all of 127/8 as local on every host).
-3. **"A path change" is half covered.** A route change (a delay step, a
-   loss burst, a short partition) is a rule change at a time, which the API
-   has. **NAT rebinding** (the peer sees the sender's source port change,
-   and replies to the new port must reach the old socket) is not: it needs
-   a NAT table, translation both ways, and an API to rebind at a time;
-   about one slice of its own. ENet follows a peer's new source
-   (`protocol.c:1088-1089`), so hotseat can test that by opening a new
-   socket today. Does hotseat need rebinding in phase 2?
-
-**Decided in the check (the owner may override):**
-
-- **Drop rules act again at landing**, so a partition or a silence started
-  while a delayed datagram is on the wire drops it. Rejected: deciding
-  everything at send. With a 50 ms delay rule, a partition would then let
-  50 ms of traffic through after it began.
-- **An all-off impairment panics** instead of meaning "removal". The old
-  rule needed a paragraph to say what an all-off rule under a wider rule
-  does; now there is one way to remove a rule.
-- **The draw is keyed by the send number in the run,** not by a per-flow
-  number. Per-flow keys would keep one flow's losses fixed when unrelated
-  traffic changes, but need a flow table, and a seed does not survive code
-  changes anyway.
-- **The burst state belongs to the rule,** shared by every flow it matches.
-
-**Who checks what in phase 2.**
-
-- Promise 1: today only two pipe-only probes are pinned. Slice 1 pins a
-  datagram workload too, measured at 33b95ca, 3 runs.
-- **The op-level model test can predict every fault in the set.** The
-  model keeps its own rule table and burst states, computes each draw from
-  the formula (its own code, no call into the sim), and so knows which
-  datagrams land, in which socket, and when. It keeps its existing rule of
-  one source per destination per landing instant (the sim orders flows that
-  land at one instant by the run's RNG), now from the instants it predicts.
-  No fault falls back to conservation only. Conservation (every datagram
-  sent is landed, dropped with a cause, or on the wire) is checked as well,
-  per cause, against `netFaultStats` and per rule.
-- The requirements' rule against silent misuse also covers rules that
-  never act: `clearImpairment`, `healPartition` and `unsilence` return the
-  rule's counts, so a test can assert that its rule matched something.

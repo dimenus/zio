@@ -30,7 +30,7 @@
 //   pair.
 // - Fault steps (seeds 9 to 16; 1 to 8 keep the phase 1 mix), between
 //   polls, set or remove a datagram fault rule (design
-//   section 5): an impairment with random loss, burst, delay, jitter,
+//   protocol above `pub const Endpoint` in sim.zig): an impairment with random loss, burst, delay, jitter,
 //   reorder and duplication, a partition, or a silence, on paths of the
 //   sockets' ports with wildcards; at most `max_frules` in force. A removal
 //   checks the counts the sim returns against the model's. The end removes
@@ -40,7 +40,8 @@
 // pending. It shares no helper with the sim: it lands datagrams by the
 // design's rules (section 4 and 6: wire latency, the socket bound to the
 // destination port, the byte budget of length plus 256 and the 1024-packet
-// limit), decides every fault itself (section 5, with its own copy of the
+// limit), decides every fault itself (the fault protocol above
+// `pub const Endpoint` in sim.zig, with its own copy of the
 // draw formula of `sim.faultDraw`'s doc comment, its own rule table and
 // burst states, the order clamp, and the drop rules again at landing), and it keeps each pipe end as a list of bytes of at most
 // `pipe_buf_cap` with the sim's documented rules for close, shutdown and
@@ -414,7 +415,7 @@ const Counts = struct {
     registration_proofs: u64 = 0,
     /// Race groups of waiting receives submitted at the end.
     end_groups: u64 = 0,
-    /// Fault rules set and removed (design section 5); datagrams the rules
+    /// Fault rules set and removed; datagrams the rules
     /// dropped, by cause, and copies made, delayed, clamped and overtaking;
     /// a waiting op woken by a delayed landing; removals whose returned
     /// counts the model checked.
@@ -515,7 +516,8 @@ fn sockAddr(port: u16) os_net.sockaddr.in {
 
 // ---- the model's fault rules ----
 //
-// The test's own copy of design section 5 and of the draw formula in
+// The test's own copy of the fault protocol above `pub const Endpoint` in
+// sim.zig and of the draw formula in
 // `sim.faultDraw`'s doc comment. It uses the API's types (`sim.Endpoint`,
 // `sim.Impairment`) and nothing of the sim's fault code.
 
