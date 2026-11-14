@@ -971,6 +971,7 @@ pub fn errnoToSendError(err: E) SendError {
                 .EHOSTUNREACH => error.HostUnreachable,
                 .EAFNOSUPPORT => error.AddressFamilyUnsupported,
                 .EOPNOTSUPP => error.OperationNotSupported,
+                .EADDRNOTAVAIL => error.AddressUnavailable,
                 .ENOBUFS => error.SystemResources,
                 .OPERATION_ABORTED => error.Canceled,
                 else => unexpectedError(err),
@@ -981,6 +982,7 @@ pub fn errnoToSendError(err: E) SendError {
                 .SUCCESS => unreachable,
                 .AGAIN => error.WouldBlock,
                 .ACCES, .PERM => error.AccessDenied,
+                .ADDRNOTAVAIL => error.AddressUnavailable,
                 .CONNRESET => error.ConnectionResetByPeer,
                 .CONNABORTED => error.ConnectionAborted,
                 .TIMEDOUT => error.ConnectionTimedOut,
@@ -1208,6 +1210,11 @@ fn sendFlagsToSys(flags: SendFlags) c_int {
 pub const SendError = error{
     WouldBlock,
     AccessDenied,
+    /// EADDRNOTAVAIL: the source address the send asked for (`sendmsg` with a
+    /// source address) is not one this host or socket can send from. ENet
+    /// treats it as transient and drops that one datagram, so it must not
+    /// fall into `Unexpected`.
+    AddressUnavailable,
     ConnectionResetByPeer,
     ConnectionAborted,
     ConnectionTimedOut,
@@ -2018,4 +2025,9 @@ test "recv on non-blocking socket without data returns WouldBlock" {
     const result = recv(fds[0], (&recv_iov)[0..1], .{});
 
     try std.testing.expectError(error.WouldBlock, result);
+}
+
+test "a send that fails with EADDRNOTAVAIL is AddressUnavailable, not Unexpected" {
+    const e: E = if (builtin.os.tag == .windows) .EADDRNOTAVAIL else .ADDRNOTAVAIL;
+    try std.testing.expectEqual(error.AddressUnavailable, errnoToSendError(e));
 }

@@ -2567,9 +2567,12 @@ fn sendErrToSocketSendErr(err: ev.NetSendMsg.Error) Io.net.Socket.SendError {
         error.SocketNotConnected, error.BrokenPipe => error.SocketUnconnected,
         error.AccessDenied => error.AccessDenied,
         error.Canceled => error.Canceled,
+        // std.Io has no send error for EADDRNOTAVAIL; before zio named it, it
+        // was `Unexpected` here too.
         error.WouldBlock,
         error.FileDescriptorNotASocket,
         error.OperationNotSupported,
+        error.AddressUnavailable,
         error.Unexpected,
         => error.Unexpected,
     };
@@ -2888,6 +2891,7 @@ fn sendErrToWriteErr(err: ev.NetSend.Error) Io.Operation.NetWrite.Error {
         error.FileDescriptorNotASocket,
         error.MessageTooBig,
         error.OperationNotSupported,
+        error.AddressUnavailable,
         error.Unexpected,
         => error.Unexpected,
     };
