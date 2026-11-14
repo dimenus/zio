@@ -420,7 +420,7 @@ pub const Waiter = struct {
                     // and its task be freed.
                     if (comptime @import("options.zig").options.sim) {
                         const sim = @import("sim.zig");
-                        sim.emit(.wake, sim.taskId(@intFromPtr(t.task)), 0);
+                        sim.emit(.wake, sim.taskId(&t.task.sim_id), 0);
                     }
                     switch (t.kind) {
                         .ordinary => Executor.scheduleTask(t.task, .done),

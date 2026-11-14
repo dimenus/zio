@@ -1638,7 +1638,7 @@ pub const Executor = struct {
         }
         self.spendQuantum();
         const task = AnyTask.fromWaitNode(buf[pick]);
-        sim.emit(.task_switch, sim.taskId(@intFromPtr(task)), self.id);
+        sim.emit(.task_switch, sim.taskId(&task.sim_id), self.id);
         return task;
     }
 

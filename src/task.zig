@@ -212,6 +212,9 @@ pub const AnyTask = struct {
     /// (`setTaskLabel`). Written only by the task itself; its executor copies
     /// it into `Executor.activity_label` whenever it switches to the task.
     label: usize = 0,
+    /// Sim only: this task's trace id, 0 until the trace first sees it
+    /// (`sim.taskId`). Reset with the rest of the task when one is created.
+    sim_id: if (zio_options.sim) u32 else void = if (zio_options.sim) 0 else {},
 
     /// See `Options.debug_cancel`. Only accessed by the task itself.
     cancel_debug: if (zio_options.debug_cancel) CancelDebug else void = if (zio_options.debug_cancel) .{} else {},

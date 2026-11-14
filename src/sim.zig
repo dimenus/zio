@@ -20,8 +20,6 @@ pub const EventKind = enum(u8) {
     preempt = 6,
 };
 
-const TaskIdEnt = struct { ptr: usize, id: u32 };
-
 var begun: bool = false;
 var clock_routed: bool = true;
 var current_seed: u64 = 0;
@@ -33,8 +31,6 @@ var rng: std.Random.DefaultPrng = undefined;
 var hasher: std.hash.Wyhash = undefined;
 var event_count: u64 = 0;
 var next_task_id: u32 = 1;
-var task_ids: [2048]TaskIdEnt = undefined;
-var task_id_len: u32 = 0;
 
 const max_ends = 32;
 const max_due = 32;
@@ -201,7 +197,6 @@ pub fn begin(seed_value: u64) void {
     hasher = std.hash.Wyhash.init(0);
     event_count = 0;
     next_task_id = 1;
-    task_id_len = 0;
     resetIo();
     establishFdNamespace();
     // Last, so a thread that sees the owner also sees the seed.
@@ -377,19 +372,29 @@ pub fn pickIndex(n: usize) usize {
     return rng.random().uintLessThan(usize, n);
 }
 
-pub fn taskId(ptr: usize) u32 {
+/// The trace id of a task, given the task's own `sim_id` field. The first
+/// time the trace sees a task it gets the next id, in the order the seeded
+/// schedule first sees tasks, and keeps it for its life.
+///
+/// The id lives in the task, not in a table keyed by its address (t-4092).
+/// Keyed by address, a task created where a freed one had been inherited the
+/// freed task's id; whether an allocator hands back a freed address varies
+/// between processes (page_allocator) or merges distinct tasks under one id
+/// (the task pool), so the same seed gave different traces in different
+/// processes. A run where no address was reused gets the same ids as before.
+pub fn taskId(slot: *u32) u32 {
     if (comptime !compiled_in) return 0;
     if (!begun) return 0;
-    var i: u32 = 0;
-    while (i < task_id_len) : (i += 1) {
-        if (task_ids[i].ptr == ptr) return task_ids[i].id;
+    if (slot.* == 0) {
+        slot.* = next_task_id;
+        next_task_id += 1;
     }
-    if (task_id_len >= task_ids.len) panic("sim: task id table full", .{});
-    const id = next_task_id;
-    next_task_id += 1;
-    task_ids[task_id_len] = .{ .ptr = ptr, .id = id };
-    task_id_len += 1;
-    return id;
+    return slot.*;
+}
+
+/// Tasks given an id so far in this run.
+pub fn tasksSeen() u32 {
+    return next_task_id - 1;
 }
 
 pub fn emit(kind: EventKind, a: u32, b: u32) void {
@@ -423,7 +428,9 @@ pub fn stateDigest() u64 {
     std.mem.writeInt(u64, buf[0..8], clock_ns, .little);
     std.mem.writeInt(u64, buf[8..16], event_count, .little);
     std.mem.writeInt(u32, buf[16..20], next_task_id, .little);
-    std.mem.writeInt(u32, buf[20..24], task_id_len, .little);
+    // Was the address table's length: equal to this whenever no address
+    // was reused, so digests of such runs are unchanged (t-4092).
+    std.mem.writeInt(u32, buf[20..24], next_task_id - 1, .little);
     std.mem.writeInt(u64, buf[24..32], hasher.final(), .little);
     h.update(&buf);
     var i: u8 = 0;
@@ -2565,4 +2572,162 @@ test "sim: refuses zio.random off an executor during a run" {
             p1.random_mod.random(&buf);
         }
     }.body);
+}
+
+// ---- t-4092: a task's trace id is the task's, not its address's ----
+
+const t4092 = struct {
+    const rt_mod = @import("runtime.zig");
+    const Allocator = std.mem.Allocator;
+    const Alignment = std.mem.Alignment;
+
+    /// Larger than a task-pool item, so each task comes from the runtime's
+    /// allocator (as in starh2's dst-zio spawn fixtures).
+    const Big = struct { pad: [640]u8 = @splat(0) };
+    fn quick(b: Big) void {
+        std.mem.doNotOptimizeAway(b.pad[0]);
+    }
+    const spawned = 8;
+
+    const Out = struct { trace: u64, seen: u32 };
+
+    /// Spawns `spawned` tasks one after the other, each freed before the next
+    /// is made, so an allocator that reuses memory puts the next at the
+    /// freed one's address.
+    fn workload(alloc: Allocator, seed_value: u64) !Out {
+        begin(seed_value);
+        defer end();
+        const rt = try rt_mod.Runtime.init(alloc, .{
+            .executors = .exact(1),
+            .thread_pool = .{ .max_threads = 0 },
+            .stack_pool = .{ .maximum_size = 8 * 1024 * 1024, .committed_size = 256 * 1024, .shrink_interval = .zero },
+        });
+        defer rt.deinit();
+        var i: usize = 0;
+        while (i < spawned) : (i += 1) {
+            var h = try rt.spawn(quick, .{.{}});
+            h.join();
+        }
+        return .{ .trace = traceHash(), .seen = tasksSeen() };
+    }
+
+    /// Never hands back a freed address (frees are dropped; a test leak).
+    const NeverReuse = struct {
+        fn alloc(_: *anyopaque, len: usize, a: Alignment, ra: usize) ?[*]u8 {
+            return std.heap.page_allocator.rawAlloc(len, a, ra);
+        }
+        fn resize(_: *anyopaque, _: []u8, _: Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+        fn remap(_: *anyopaque, _: []u8, _: Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+        fn free(_: *anyopaque, _: []u8, _: Alignment, _: usize) void {}
+        const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+        fn allocator() Allocator {
+            return .{ .ptr = undefined, .vtable = &vtable };
+        }
+    };
+
+    /// Always hands back the last freed block when the size and alignment
+    /// match, the way a pool or a kernel that reuses a mapping does.
+    const ReuseLast = struct {
+        var cached: ?[]u8 = null;
+        var cached_align: Alignment = .@"1";
+        fn alloc(_: *anyopaque, len: usize, a: Alignment, ra: usize) ?[*]u8 {
+            if (cached) |c| {
+                if (c.len == len and cached_align == a) {
+                    cached = null;
+                    return c.ptr;
+                }
+            }
+            return std.heap.page_allocator.rawAlloc(len, a, ra);
+        }
+        fn resize(_: *anyopaque, _: []u8, _: Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+        fn remap(_: *anyopaque, _: []u8, _: Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+        fn free(_: *anyopaque, m: []u8, a: Alignment, ra: usize) void {
+            if (cached) |c| std.heap.page_allocator.rawFree(c, cached_align, ra);
+            cached = m;
+            cached_align = a;
+        }
+        const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+        fn allocator() Allocator {
+            return .{ .ptr = undefined, .vtable = &vtable };
+        }
+    };
+};
+
+test "sim: a task's trace id does not depend on whether the allocator reuses freed task memory" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    const fresh = try t4092.workload(t4092.NeverReuse.allocator(), 7);
+    const reused = try t4092.workload(t4092.ReuseLast.allocator(), 7);
+    // Every spawned task is a distinct task, plus at most the main task.
+    try std.testing.expect(fresh.seen >= t4092.spawned and fresh.seen <= t4092.spawned + 1);
+    try std.testing.expectEqual(fresh.seen, reused.seen);
+    try std.testing.expectEqual(fresh.trace, reused.trace);
+}
+
+test "sim: twenty fresh processes with the heap moved give one trace for a workload that frees and spawns tasks" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (isDeathChild()) {
+        noCoreDump();
+        // The heap perturbation of design rev 3, section 7: each child first
+        // maps a different number of pages, so later addresses differ.
+        const shift = std.fmt.parseInt(usize, std.mem.span(std.c.getenv("ZIO_SIM_HEAP_SHIFT") orelse "0"), 10) catch 0;
+        if (shift > 0) _ = try std.heap.page_allocator.alloc(u8, shift * 4096 + 7);
+        const out = try t4092.workload(std.heap.page_allocator, 7);
+        // Each spawned task is its own task, plus the main task. Equal
+        // traces alone are not enough: before t-4092's fix every child here
+        // gave the same trace with the 8 tasks merged under one id.
+        if (out.seen != t4092.spawned + 1) {
+            std.debug.print("seen {d} tasks, wanted {d}\n", .{ out.seen, t4092.spawned + 1 });
+            return error.TasksMerged;
+        }
+        var line_buf: [64]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "sim-trace: {x:0>16} seen={d}\n", .{ out.trace, out.seen });
+        _ = std.c.write(2, line.ptr, line.len);
+        childDone("sim: twenty fresh processes with the heap moved give one trace for a workload that frees and spawns tasks");
+        return;
+    }
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_len = try std.process.executablePath(io, &exe_buf);
+    var first: ?[]const u8 = null;
+    var first_buf: [64]u8 = undefined;
+    var k: usize = 1;
+    while (k <= 20) : (k += 1) {
+        var env: std.process.Environ.Map = .init(gpa);
+        defer env.deinit();
+        if (std.c.getenv("PATH")) |path| try env.put("PATH", std.mem.span(path));
+        try env.put("TEST_FILTER", "sim: twenty fresh processes with the heap moved");
+        try env.put(death_child_env, "1");
+        var shift_buf: [16]u8 = undefined;
+        try env.put("ZIO_SIM_HEAP_SHIFT", try std.fmt.bufPrint(&shift_buf, "{d}", .{k * 13}));
+        const res = try std.process.run(gpa, io, .{
+            .argv = &.{exe_buf[0..exe_len]},
+            .environ_map = &env,
+            .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } },
+        });
+        defer gpa.free(res.stdout);
+        defer gpa.free(res.stderr);
+        try checkDoneMarkers("sim: twenty fresh processes with the heap moved give one trace for a workload that frees and spawns tasks", res.stderr);
+        const at = std.mem.indexOf(u8, res.stderr, "sim-trace: ") orelse return error.NoTrace;
+        const end_at = std.mem.indexOfScalarPos(u8, res.stderr, at, '\n') orelse return error.NoTrace;
+        const got = res.stderr[at..end_at];
+        if (first) |f| {
+            if (!std.mem.eql(u8, f, got)) {
+                std.debug.print("child {d}: {s}, child 1: {s}\n", .{ k, got, f });
+                return error.TraceDiffers;
+            }
+        } else {
+            @memcpy(first_buf[0..got.len], got);
+            first = first_buf[0..got.len];
+        }
+    }
+    std.debug.print("20 children: {s}\n", .{first.?});
 }
