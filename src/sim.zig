@@ -4346,14 +4346,17 @@ test "sim: dgram: the receive queue matches a list of byte strings under random 
 }
 
 /// What one direction of a sim pipe should hold: the bytes sent and not yet
-/// received, in order, under `pipe_buf_cap`.
+/// received, in order, under `pipe_buf_cap`. It calls no helper of the code
+/// under test (not `totalLen`): a helper both sides share can be wrong for
+/// both in the same way, and the comparison then passes.
 const PipeModel = struct {
     bytes: std.ArrayList(u8) = .empty,
 
     /// A send copies what fits, gathered in slice order. A full buffer parks
     /// a send of one byte or more; a send of nothing returns 0 at once.
     fn send(m: *PipeModel, gpa: std.mem.Allocator, src: []const []const u8) !?usize {
-        const total = totalLen(src);
+        var total: usize = 0;
+        for (src) |sl| total += sl.len;
         if (total == 0) return 0;
         const space = pipe_buf_cap - m.bytes.items.len;
         if (space == 0) return null;
@@ -4377,10 +4380,11 @@ const PipeModel = struct {
 };
 
 // One pipe, both directions, driven through the sim's own byte handling
-// (`copySend`, `drainBuf`): sends of one to three slices (a quarter of them
+// (`copySend`, `drainBuf`): sends of zero to five slices (a quarter of them
 // empty) big enough to fill the 4096-byte buffer often, a send to a full
-// buffer that parks and is cancelled, and receives into zero to three slices
-// (a quarter of them empty). Each end's buffer is compared with
+// buffer that parks and is cancelled, and receives into zero to five slices
+// (a quarter of them empty). Parking, waking and harvest are the op-level
+// model test's (`sim_op_model_test.zig`). Each end's buffer is compared with
 // `PipeModel` after every step. A failure prints the seed and the step.
 test "sim: pipe: the pipe buffer matches a list of bytes under random sends, receives, empty slices and a full buffer" {
     if (comptime !compiled_in) return error.SkipZigTest;
@@ -4389,6 +4393,8 @@ test "sim: pipe: the pipe buffer matches a list of bytes under random sends, rec
     const gpa = arena.allocator();
     var parks: usize = 0;
     var empty_sends: usize = 0;
+    var no_slice_sends: usize = 0;
+    var wide: usize = 0;
     for ([_]u64{ 1, 2, 3, 4, 5 }) |model_seed| {
         begin(model_seed);
         defer end();
@@ -4403,16 +4409,20 @@ test "sim: pipe: the pipe buffer matches a list of bytes under random sends, rec
             // `from` sends into the buffer of the other end, `models[1 - from]`.
             const from = r.uintLessThan(usize, 2);
             if (r.boolean()) {
-                var parts: [3][]u8 = undefined;
-                const n = r.intRangeAtMost(usize, 1, 3);
+                var parts: [5][]u8 = undefined;
+                const n = r.uintAtMost(usize, 5);
+                var total: usize = 0;
                 for (parts[0..n]) |*part| {
                     const len: usize = if (r.uintLessThan(u8, 4) == 0) 0 else r.intRangeAtMost(usize, 1, 1500);
                     part.* = try gpa.alloc(u8, len);
                     r.bytes(part.*);
+                    total += len;
                 }
-                var src: [3][]const u8 = undefined;
+                var src: [5][]const u8 = undefined;
                 for (parts[0..n], 0..) |part, k| src[k] = part;
-                if (totalLen(src[0..n]) == 0) empty_sends += 1;
+                if (total == 0) empty_sends += 1;
+                if (n == 0) no_slice_sends += 1;
+                if (n >= 4) wide += 1;
                 const want = try models[1 - from].send(gpa, src[0..n]);
                 switch (copySend(fds[from], src[0..n], &dummy, 0, false)) {
                     .due => |got| try std.testing.expectEqual(want, got),
@@ -4427,9 +4437,10 @@ test "sim: pipe: the pipe buffer matches a list of bytes under random sends, rec
                     },
                 }
             } else {
-                var bufs: [3][2000]u8 = undefined;
-                var dst: [3][]u8 = undefined;
-                const n = r.uintAtMost(usize, 3);
+                var bufs: [5][2000]u8 = undefined;
+                var dst: [5][]u8 = undefined;
+                const n = r.uintAtMost(usize, 5);
+                if (n >= 4) wide += 1;
                 var cap: usize = 0;
                 for (dst[0..n], 0..) |*d, k| {
                     const len: usize = if (r.uintLessThan(u8, 4) == 0) 0 else r.intRangeAtMost(usize, 1, 2000);
@@ -4453,9 +4464,11 @@ test "sim: pipe: the pipe buffer matches a list of bytes under random sends, rec
         }
     }
     // The run did reach the cases it is for.
-    std.debug.print("pipe model test: 5000 steps, {d} sends parked on a full buffer, {d} sends of nothing\n", .{ parks, empty_sends });
+    std.debug.print("pipe model test: 5000 steps, {d} sends parked on a full buffer, {d} sends of nothing ({d} with no slice), {d} sends or receives of four or five slices\n", .{ parks, empty_sends, no_slice_sends, wide });
     try std.testing.expect(parks > 20);
     try std.testing.expect(empty_sends > 20);
+    try std.testing.expect(no_slice_sends > 20);
+    try std.testing.expect(wide > 20);
 }
 
 // The outside review's sequence for finding 2 (review of 158ebba).
