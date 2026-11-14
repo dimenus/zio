@@ -274,6 +274,7 @@ pub fn begin(seed_value: u64) void {
     hasher = std.hash.Wyhash.init(0);
     event_count = 0;
     next_task_id = 1;
+    resetInstant();
     resetIo();
     establishFdNamespace();
     // Last, so a thread that sees the owner also sees the seed.
@@ -478,9 +479,110 @@ pub fn tasksSeen() u32 {
     return next_task_id - 1;
 }
 
+// ---- A spin at one virtual instant (t-4133) ----
+//
+// The rule: a run whose loops pass through `Loop.poll` more than
+// `instant_poll_limit` times while `clock_ns` stands still panics, and the
+// line names the spin. Under sim, work takes no virtual time. A task that
+// keeps arming a timer for a moment already past is woken at once, at the
+// same instant, and a task that yields until the clock moves never sees it
+// move; either loops at one instant for ever, at full CPU and with no
+// message. On a real clock the same loop ends when real time passes, so
+// under sim it is a hang that only a wall-time alarm outside the run sees.
+//
+// What is counted: each pass of `Loop.poll` (`notePoll`, first in it once
+// the loop is known not done). Every scheduler turn of every executor goes
+// through it: a full wait, the `.zero` poll after a spent tick budget, each
+// loop of `simPollAll`, and a bare `ev.Loop` test's own polls. The count
+// starts again when the clock has moved since the last pass. Trace events
+// were measured and rejected: a main task that only yields makes no task
+// switch and no wake, so they stop while the polls go on, and a burst of
+// datagram landings at one instant gives hundreds of them in a correct run.
+//
+// The bound is a margin over a measurement, not a count of anything a
+// program asks for: the commit that added it has the largest count seen in
+// a correct run and the wall time a spin takes to reach the bound.
+// `setInstantPollLimit` changes it for one run.
+//
+// The check reads the clock and counts. It draws nothing and emits nothing,
+// so a run that stays under the bound keeps every trace and digest.
+
+/// Loop polls allowed at one virtual instant before the run panics (t-4133).
+pub const default_instant_poll_limit: u64 = 100_000;
+var instant_poll_limit: u64 = default_instant_poll_limit;
+/// The virtual time the counts below belong to.
+var instant_ns: u64 = 0;
+var instant_polls: u64 = 0;
+var instant_timer_fires: u64 = 0;
+/// For the panic line: the trace id of the task that last ran or was woken,
+/// and the last timer that fired (its clock and deadline, and when).
+var last_task_trace_id: u32 = 0;
+var last_timer: ?struct { clock: u8, deadline_ns: u64, fired_ns: u64 } = null;
+
+fn resetInstant() void {
+    instant_poll_limit = default_instant_poll_limit;
+    instant_ns = 0;
+    instant_polls = 0;
+    instant_timer_fires = 0;
+    last_task_trace_id = 0;
+    last_timer = null;
+}
+
+fn rollInstant() void {
+    if (clock_ns == instant_ns) return;
+    instant_ns = clock_ns;
+    instant_polls = 0;
+    instant_timer_fires = 0;
+}
+
+/// Sets the bound of the rule above for this run; `begin` restores
+/// `default_instant_poll_limit`. A run that does a great deal of zero-time
+/// work at one instant raises it; a test that wants a spin caught early
+/// lowers it. 0 is refused: no run can poll less than once.
+pub fn setInstantPollLimit(n: u64) void {
+    if (comptime !compiled_in) return;
+    refuseOtherThread("sim.setInstantPollLimit");
+    if (!begun) panic("sim: setInstantPollLimit before begin", .{});
+    if (n == 0) panic("sim: setInstantPollLimit(0): a run polls at least once", .{});
+    instant_poll_limit = n;
+}
+
+/// Called by `Loop.poll` under sim, once per pass (the rule above).
+pub fn notePoll() void {
+    if (comptime !compiled_in) return;
+    if (!begun) return;
+    rollInstant();
+    instant_polls += 1;
+    if (instant_polls > instant_poll_limit) spinPanic();
+}
+
+/// Called by `Loop.checkTimers` under sim for each timer it fires.
+pub fn noteTimerFire(clock_idx: u8, deadline_ns: u64) void {
+    if (comptime !compiled_in) return;
+    if (!begun) return;
+    rollInstant();
+    instant_timer_fires += 1;
+    last_timer = .{ .clock = clock_idx, .deadline_ns = deadline_ns, .fired_ns = clock_ns };
+}
+
+fn spinPanic() noreturn {
+    var task_buf: [64]u8 = undefined;
+    // Trace id 0: no task has been switched to or woken yet, which is a
+    // main task that only yields.
+    const task = if (last_task_trace_id == 0)
+        "no task has been switched to or woken in this run (the main task?)"
+    else
+        std.fmt.bufPrint(&task_buf, "the last task run or woken has trace id {d}", .{last_task_trace_id}) catch unreachable;
+    const head = "sim: {d} loop polls at virtual time {d} ns with the clock not moving (the limit is {d}, sim.setInstantPollLimit): a task spins without virtual time passing (t-4133); {s}; ";
+    const lt = last_timer orelse panic(head ++ "no timer has fired in this run", .{ instant_polls, clock_ns, instant_poll_limit, task });
+    if (lt.fired_ns != clock_ns) panic(head ++ "no timer fired at this instant (the last fired at {d} ns)", .{ instant_polls, clock_ns, instant_poll_limit, task, lt.fired_ns });
+    panic(head ++ "{d} timers fired at this instant, the last with deadline {d} ns on clock {d}", .{ instant_polls, clock_ns, instant_poll_limit, task, instant_timer_fires, lt.deadline_ns, lt.clock });
+}
+
 pub fn emit(kind: EventKind, a: u32, b: u32) void {
     if (comptime !compiled_in) return;
     if (!begun) return;
+    if (kind == .task_switch or kind == .wake) last_task_trace_id = a;
     var word: [8]u8 = undefined;
     word[0] = @backingInt(kind);
     std.mem.writeInt(u24, word[1..4], @truncate(a), .little);
@@ -4864,6 +4966,20 @@ pub fn noCoreDump() void {
 }
 
 pub fn expectChildPanics(comptime test_name: []const u8, comptime want: []const u8) !void {
+    _ = try runPanicChild(test_name, want);
+}
+
+/// `expectChildPanics`, and the child must end within `max_ms` of wall
+/// time. Prints how long it took.
+fn expectChildPanicsWithin(comptime test_name: []const u8, comptime want: []const u8, max_ms: u64) !void {
+    const ns = try runPanicChild(test_name, want);
+    std.debug.print("child of \"{s}\" panicked after {d} ms of wall time (at most {d})\n", .{ test_name, ns / std.time.ns_per_ms, max_ms });
+    if (ns > max_ms * std.time.ns_per_ms) return error.ChildTooSlow;
+}
+
+/// Runs the test `test_name` in a child process and checks it panics with
+/// `want`; returns the child's wall time in ns.
+fn runPanicChild(comptime test_name: []const u8, comptime want: []const u8) !u64 {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -4875,6 +4991,7 @@ pub fn expectChildPanics(comptime test_name: []const u8, comptime want: []const 
     try env.put("TEST_FILTER", test_name);
     try env.put(death_child_env, "1");
 
+    const started = std.Io.Timestamp.now(io, .awake);
     const res = std.process.run(gpa, io, .{
         .argv = &.{exe_buf[0..exe_len]},
         .environ_map = &env,
@@ -4898,6 +5015,7 @@ pub fn expectChildPanics(comptime test_name: []const u8, comptime want: []const 
         std.debug.print("child of \"{s}\": term {any}, wanted SIGABRT and \"{s}\"; stderr:\n{s}\n", .{ test_name, res.term, want, res.stderr });
         return error.ChildDidNotPanic;
     }
+    return @intCast(started.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds);
 }
 
 /// Whether a line of `stderr` is the panic itself saying `want`: the line
@@ -5072,6 +5190,93 @@ test "sim: every task parked with only the shrink timer pending is a deadlock, t
     if (comptime !compiled_in) return error.SkipZigTest;
     if (!isDeathChild()) return expectChildPanics("sim: every task parked with only the shrink timer pending is a deadlock, two executors", "sim: deadlock clock_ns=0");
     try deadlockChild(2);
+}
+
+// ---- A spin at one virtual instant (t-4133) ----
+
+const spin = struct {
+    const Waiter = @import("common.zig").Waiter;
+    const rt_mod = @import("runtime.zig");
+
+    /// t-4133's shape: a task arms a timer for a moment already past, is
+    /// woken at once at the same instant, and arms it again.
+    fn pastTimer() void {
+        while (true) {
+            var w: Waiter = .init();
+            defer w.deinit();
+            w.timedWait(1, .{ .deadline = .fromNanoseconds(0) }, .allow_cancel) catch {};
+        }
+    }
+
+    /// Waits for the clock to move by yielding. A main task's yield makes
+    /// no task switch and no wake, so the trace stops while the polls go on.
+    fn yieldUntilClockMoves() void {
+        const start = clock_ns;
+        while (clock_ns == start) rt_mod.yield() catch {};
+    }
+
+    fn spawnedPastTimer(executors: u8) !void {
+        noCoreDump();
+        const rt = try death.up(executors);
+        var h = try rt.spawnInto(.{ .executor = @intCast(executors - 1) }, pastTimer, .{});
+        h.join();
+    }
+};
+
+test "sim: spin: a task that keeps arming a timer for a moment already past panics at one virtual instant, naming the task and the timer, within seconds of wall time" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanicsWithin("sim: spin: a task that keeps arming a timer for a moment already past panics at one virtual instant, naming the task and the timer, within seconds of wall time", "sim: 100001 loop polls at virtual time 0 ns with the clock not moving (the limit is 100000, sim.setInstantPollLimit): a task spins without virtual time passing (t-4133); the last task run or woken has trace id 1; 100000 timers fired at this instant, the last with deadline 0 ns on clock 0", 5000);
+    try spin.spawnedPastTimer(1);
+}
+
+test "sim: spin: the same with the task on the second of two executors" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanicsWithin("sim: spin: the same with the task on the second of two executors", "sim: 100001 loop polls at virtual time 0 ns with the clock not moving (the limit is 100000, sim.setInstantPollLimit): a task spins without virtual time passing (t-4133); the last task run or woken has trace id 1; 33319 timers fired at this instant, the last with deadline 0 ns on clock 0", 5000);
+    try spin.spawnedPastTimer(2);
+}
+
+test "sim: spin: a main task that yields until the clock moves panics, with no timer to name" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanicsWithin("sim: spin: a main task that yields until the clock moves panics, with no timer to name", "sim: 100001 loop polls at virtual time 0 ns with the clock not moving (the limit is 100000, sim.setInstantPollLimit): a task spins without virtual time passing (t-4133); no task has been switched to or woken in this run (the main task?); no timer has fired in this run", 5000);
+    noCoreDump();
+    _ = try death.up(1);
+    spin.yieldUntilClockMoves();
+}
+
+test "sim: spin: a lowered limit panics at exactly one poll past it, at the virtual time of the spin" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanics("sim: spin: a lowered limit panics at exactly one poll past it, at the virtual time of the spin", "sim: 51 loop polls at virtual time 3000000 ns with the clock not moving (the limit is 50, sim.setInstantPollLimit): a task spins without virtual time passing (t-4133); the last task run or woken has trace id 1; 51 timers fired at this instant, the last with deadline 0 ns on clock 0");
+    noCoreDump();
+    const rt = try death.up(1);
+    setInstantPollLimit(50);
+    // Timers fire at 1 and 2 ms too: the line counts only this instant's.
+    for (0..3) |_| try spin.rt_mod.sleep(.fromMilliseconds(1));
+    var h = try rt.spawn(spin.pastTimer, .{});
+    h.join();
+}
+
+test "sim: spin refuses: setInstantPollLimit(0)" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanics("sim: spin refuses: setInstantPollLimit(0)", "sim: setInstantPollLimit(0): a run polls at least once");
+    noCoreDump();
+    _ = try death.up(1);
+    setInstantPollLimit(0);
+}
+
+test "sim: spin: the count starts again when the clock moves: 2000 sleeps of 1 ms under a limit of 10 end normally, and begin restores the default" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    const Runtime = @import("runtime.zig").Runtime;
+    begin(1);
+    defer end();
+    const rt = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1), .thread_pool = .{ .max_threads = 0 } });
+    defer rt.deinit();
+    setInstantPollLimit(10);
+    for (0..2000) |_| try spin.rt_mod.sleep(.fromMilliseconds(1));
+    try std.testing.expectEqual(@as(u64, 2_000_000_000), clock_ns);
+    try std.testing.expectEqual(@as(u64, 10), instant_poll_limit);
+    end();
+    begin(1);
+    try std.testing.expectEqual(default_instant_poll_limit, instant_poll_limit);
 }
 
 // ---- Runs that must end normally (round 3) ----

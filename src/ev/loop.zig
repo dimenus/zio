@@ -1259,6 +1259,7 @@ pub const Loop = struct {
                 for (batch[0..batch_count]) |timer| {
                     if (comptime zio_options.sim) {
                         sim.emit(.timer_fire, @backingInt(clock), @truncate(timer.deadline.value));
+                        sim.noteTimerFire(@backingInt(clock), timer.deadline.value);
                     }
                     self.state.markCompleted(&timer.c);
                     fired = true;
@@ -1624,6 +1625,9 @@ pub const Loop = struct {
         if (self.done()) return;
 
         const wait = wait_cap.value != 0;
+        // Sim: a pass at a virtual instant the clock has not left; too many
+        // is a spin (`sim.notePoll`, t-4133).
+        if (comptime zio_options.sim) sim.notePoll();
 
         self.state.updateNow();
         const timer_result = self.checkTimers();

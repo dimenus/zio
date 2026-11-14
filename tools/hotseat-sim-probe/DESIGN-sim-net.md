@@ -1375,6 +1375,49 @@ the mutants in its commits.
   work: let the mutant runner restore it. In zsh, a word that starts with
   `=` (`echo ====`) is a command lookup and fails; quote it.
 
+## 16. A run that spins while virtual time stands still (t-4133)
+
+**The defect.** Under sim, work takes no virtual time. A task that arms a
+timer for a moment already past is woken at once, at the same instant. If
+it then arms the same past moment again, the run loops at one `clock_ns`
+for ever, at 100% CPU, with no message (hotseat, a mutant of its Control).
+On a real clock the loop ends, because real time passes. Under sim it is a
+hang, and only a wall-time alarm outside the run sees it.
+
+**What is counted: passes of `Loop.poll` at one virtual instant.** Every
+scheduler turn of every executor goes through `Loop.poll` (a full wait, a
+`.zero` poll after a tick budget, a harvest in `simPollAll`), and a bare
+`ev.Loop` test polls it directly. The count is reset when `clock_ns` has
+moved since the last pass. Two other counters were measured and rejected:
+
+- **Trace events at one instant** miss a main task that only yields: it
+  makes no task switch and no wake, so the events stop while the polls go
+  on. And a burst of datagram landings at one instant gives hundreds of
+  events in a correct run (the datagram limit tests), so the bound would
+  have to sit near a number that real work reaches.
+- **Timer fires at one instant** miss every spin that is not a timer
+  (a yield loop, two tasks that wake each other at one instant).
+
+**The bound: `default_instant_poll_limit`, a constant in `src/sim.zig`.**
+It must be far above any correct run and low enough that a spin panics in
+about a second of wall time. Its commit gives both measurements and how to
+repeat them: the largest count over the sim suite (every child process
+included), both op models, and starh2's three steps; and the wall time of
+the death tests. The bound is not a count of anything a program asks for,
+so it is not derived from one; it is a margin over a measurement.
+
+**A test can change it:** `sim.setInstantPollLimit(n)` between `begin`
+and `end`; `begin` restores the default. A program that does a great deal
+of zero-time work at one instant raises it. A test that wants the check to
+fire early lowers it.
+
+**What the panic prints:** the count, the virtual time, the seed (as every
+sim panic does, with `TRACE_HASH` and the event count), the trace id of the
+task that last ran or was woken, and the last timer that fired (its
+deadline and the virtual time it fired at), or that no timer fired at this
+instant. The check reads the clock and counts; it draws nothing and emits
+nothing, so no digest, trace or count of a correct run changes (promise 1).
+
 ## 17. The stream track: simulated TCP on loopback (design check, revision 3)
 
 Status: **slices 1 and 2 of 17.16 are built**, slice 2 with its op model
