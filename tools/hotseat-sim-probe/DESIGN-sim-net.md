@@ -1195,7 +1195,12 @@ the mutants in its commits.
 Status: **design only. Nothing in this section is built.** Revision 1 was
 6e854fc, revision 2 was 2d987f7, and revision 3 is sitting 25. It answers
 the second outside review, `gpt-simnet10.md`, and the grader's rulings on
-report 24. Each claim says how it is known: **(read)** from the code at
+report 24. The third outside review, `gpt-simnet11.md`, is answered in
+place, slice by slice, with no fourth full round (the grader's ruling):
+its findings 1, 2, 8 and the accept part of 3 are fixed here before slice
+1 (17.5, 17.6, 17.8's RST list, 17.15 item 3). Its findings 3 (send and
+receive), 4 to 7, 9, 10 and 11 are fixed before slice 2; section 15 lists
+them. Each claim says how it is known: **(read)** from the code at
 the file and line named, **(ran)** from the probes kept beside the
 sitting's report, or **(not measured)**.
 
@@ -1350,10 +1355,20 @@ do.
   from 1, and is never reused in a run. A connection has two
   **endpoints** and two **directions**.
 - **An endpoint** has a phase: `C-open`, `C-syn`, `C-failed` (client);
-  `S-prov`, `S-queued` (server, unaccepted); `est` (owned by a
+  `absent`, `S-prov`, `S-queued` (server, unaccepted); `est` (owned by a
   descriptor); `dead`. An unaccepted server endpoint has **no
   descriptor**. It is owned by its listener's queue, and lives until it
   is accepted (it becomes `est` with a new slot), or until it dies.
+- **The server endpoint is `absent` until a SYN makes it `S-prov`.** Only
+  a landing SYN creates server state (17.6), and a SYN that lands either
+  makes `S-prov`, or is answered with an RST (no listener), or is dropped
+  (its client is dead). So once no SYN of a connection is on the wire or
+  held, an `absent` server endpoint can never become present. **For
+  retirement, `absent` counts as dead.** Two cases reach it: a connect to
+  a port with no listener (the RST lands, and the wrapper closes the
+  client), and a client closed in `C-syn` whose SYN is dropped at landing
+  or discarded while held. Each retires once its client is dead and its
+  last entry has landed (review 3, finding 1).
 - **An endpoint dies** when its descriptor is closed, when its listener
   closes before it is accepted, or when an RST lands on it in `S-prov`.
   `failStream` does not kill an endpoint: it marks it failed, and the
@@ -1361,7 +1376,7 @@ do.
   flags it needs to answer late entries (17.8): whether it sent an RST,
   and whether it failed.
 - **A connection retires** only when all of these hold:
-  - both endpoints are dead;
+  - both endpoints are dead (`absent` counts as dead, above);
   - no entry of it is on the wire or held;
   - no credit departure is owed (17.7).
 
@@ -1431,11 +1446,15 @@ landing time.
    goes out; the op parks.
 
 **A SYN lands at address A:**
-1. A listener is open at A and has room: a new `S-prov` endpoint; a
-   SYN-ACK goes out.
-2. A listener is open at A and full: panic (capacity).
-3. Otherwise (no listener, or it closed): an RST goes out to the client.
-   No server endpoint is made.
+1. The client endpoint is dead (closed in `C-syn` before the SYN
+   landed): dropped (`stream_dropped_dead`). No answer, and the server
+   endpoint stays `absent`.
+2. A listener is open at A and has room: a new `S-prov` endpoint; a
+   SYN-ACK goes out. "At A" means bound to A exactly, else bound to
+   0.0.0.0 on A's port.
+3. A listener is open at A and full: panic (capacity).
+4. Otherwise (no listener, or it closed): an RST goes out to the client.
+   No server endpoint is made: it stays `absent` (17.5).
 
 **A SYN-ACK lands at the client endpoint:**
 1. The endpoint failed (`failStream` in `C-syn`): dropped, no answer. The
@@ -1464,19 +1483,50 @@ canceling a wait does not abort a connect. A later SYN-ACK makes it
 1. `C-open` or `C-failed`: the slot is freed; nothing goes on the wire.
 2. `C-syn` with its SYN not yet landed (on the wire or held): the
    endpoint is dead. The SYN is dropped at landing, or discarded if
-   held (`stream_dropped_dead`), and it never makes server state.
+   held (`stream_dropped_dead`), and it never makes server state: the
+   server endpoint stays `absent`, and the connection retires when the
+   SYN is gone (17.5).
 3. `C-syn` with its SYN landed: the endpoint is dead. The SYN-ACK
    answers with an RST when it lands (above).
 4. `est`: 17.8.
 
-**`NetAccept(listener)`:**
-1. An unresolved accept exists on this listener (parked, or woken and
+**Submission and harvest are two lists** (review 3, finding 3). An op
+that parks is evaluated twice: at the call, and again at its harvest
+after a wake. The "unresolved" guard belongs to the call only: at
+harvest the op being harvested is itself the unresolved one, so applying
+the guard there would refuse every woken op. The harvest list starts
+with the generation instead. The send and receive lists of 17.8 get the
+same split before slice 2.
+
+**`NetAccept(fd)`, at the call:**
+1. The fd is not a stream listener (an open stream socket, an endpoint,
+   or a closed number): refused, by name, before anything else. A
+   datagram socket keeps its existing answer, `OperationNotSupported`.
+2. An unresolved accept exists on this listener (parked, or woken and
    not harvested): refused.
-2. The queue is not empty: the head becomes `est` with a new slot, and
-   the call completes at once. zio's inline path takes it (upstream
-   #872).
-3. Otherwise: it parks. It is woken by an ACK landing; a cancel ends it
-   `Canceled`. Close: below.
+3. The queue is not empty: the head is claimed at once. It becomes `est`
+   with a new slot, and the call completes.
+4. Otherwise: it parks. An ACK landing wakes it (17.6 above). A wake
+   **claims nothing**: the connection stays at the head of the queue.
+
+**`NetAccept`, at the harvest of a woken accept:**
+1. The listener's generation no longer matches (it was closed, or its
+   number reused): `FileDescriptorNotASocket`. Nothing is claimed.
+2. Otherwise: the queue head is claimed now, becomes `est` with a new
+   slot, and the accept completes with it. An empty queue here is an
+   invariant panic: only an accept takes from the queue, and a second
+   accept is refused while this one is unresolved.
+
+**Cancel or deadline of an accept**, parked or woken and not harvested:
+`Canceled` (zio maps a deadline to `Timeout`), at the call. Nothing was
+claimed, so the connection the wake was for stays queued, and the next
+accept takes it.
+
+**`NetConnect`, at the harvest of a woken connect:** the generation
+first (`FileDescriptorNotASocket`), then the result recorded at its
+wake: ok at the SYN-ACK, `ConnectionRefused` at the RST. A later landing
+in the same instant does not change that result; it is the next call's
+to see.
 
 **Close of a listener:**
 1. Every `S-prov` and `S-queued` endpoint dies. Their unread bytes are
@@ -1755,10 +1805,16 @@ In every case the endpoint is dead. Unresolved ops end
 
 **An RST lands at X:**
 1. X failed, or a reset was already received: dropped and counted.
-2. X is dead: dropped; an `S-prov` endpoint that was still in its
-   listener's count is removed from it.
-3. X is `C-syn`: 17.6.
-4. Otherwise (`S-queued` or `est`):
+2. X is dead: dropped. A dead endpoint is in no listener's count: the
+   count is the listener's live `S-prov` and `S-queued` endpoints, so a
+   death leaves it by construction.
+3. X is a live `S-prov` endpoint (the client closed in `C-syn` after its
+   SYN landed, and its SYN-ACK was answered with this RST): X dies at
+   once and leaves its listener's count, which frees one place of
+   capacity. Nothing answers. It was never queued, so no accept can see
+   it (review 3, finding 2).
+4. X is `C-syn`: 17.6.
+5. Otherwise (`S-queued` or `est`):
    - set `reset_received`, and the pending error by profile (above);
    - unread bytes stay, and are read first (rows 20 and 22);
    - X's held outbound data and FIN are discarded (`abort`);
@@ -2040,11 +2096,27 @@ Loopback is too fast to catch it; the sim's rule is 17.6's.
 3. **Teardown, apart from TIME_WAIT (finding 14).** At `sim.end`,
    **before** cleanup, the check fails, listing what remains, if any of
    these is left:
-   - an unresolved op;
+   - an unresolved op on a stream socket;
+   - an occupied stream socket slot, of any kind: an open socket never
+     connected, a listener (with or without an accept waiting), or an
+     endpoint's descriptor (review 3, finding 8: an open socket or an
+     empty listener is neither of the other two, and would pass);
    - an unretired connection: an endpoint not dead, an entry on the
      wire or held, or a credit owed.
 
-   A test must close its sockets and clear its rules first.
+   **How a test drains before the check.** It closes every stream
+   socket, then clears its rules (a held entry is released only by
+   clearing the rule that holds it), then sleeps in virtual time until
+   the stream wire is empty. The sim gives the count
+   (`sim.streamEntriesInFlight()`, entries on the wire, held, and credit
+   departures owed); a test sleeps while it is not 0. With no fault, a
+   FIN or an RST lands one L after it leaves, and an RST it answers lands
+   one L later still, so `2 × L` after the last close is enough. A delay
+   rule adds its delay. Paced credits (slice 2) are departures owed: they
+   leave at most one L apart, so the same loop drains them. Sleeping by a
+   loop on the count, not by a fixed time, is the rule: a fixed sleep
+   that was long enough today is wrong the day a delay is added.
+
    **Reservations are expected.** They are counted and printed, then
    freed, and the check asserts that they are gone.
 4. **Replay.** Ten fresh processes with the heap moved give one transcript
@@ -2095,7 +2167,7 @@ pending.
   reset delivery alive".** Followed through endpoint lifetimes (17.5).
   One difference: an RST that lands on an `S-prov` endpoint kills it at
   once, because nothing can be queued for an endpoint that never reached
-  the queue.
+  the queue. That is line 3 of 17.8's RST list.
 - **Review finding 9 offered "send another cumulative update when the
   outstanding entry lands".** Not used. The receiver cannot see that
   landing without a wire entry of its own. Credit is paced on the
