@@ -1,8 +1,8 @@
 # Design brief: a sim network for zio (t-4086, t-4087), revision 3
 
-Status: **phase 1 (section 12) is built. Rounds 1 (158ebba) and 2
-(1126ebe) of the outside review are closed, with the three model tests of
-round 2 (section 15). The rest is for review.**
+Status: **phase 1 (section 12) is built, and four rounds of outside review
+of it are closed (section 15). Section 15 is the acceptance record of phase
+1; phase 2 (faults and replay) is next.**
 
 Revision 2 (dd55885) was reviewed by another vendor's model. This revision
 takes the decisions made after that review. Section 13 lists what changed
@@ -541,13 +541,9 @@ The scripts the gates below use are beside them, in `zio-sim6-tools/` there
   158ebba):** the owner's two decisions on report 10 (sections 3.2 and 8).
   The bridge test's `enet_socketset_select` and its test are gone, and
   SO_SNDBUF sits in the bridge test's shared table.
-- **The outside review's findings 1 to 9 (3727c95 to 6c2e4e0), and a
-  randomised model test of the sim pipe buffer (a336d63).** Each commit
-  holds the failing run before the fix, the mutants, and what was rejected;
-  the list is under "The outside review of 158ebba" below.
-- **Round 2 of the outside review, F1 to F6 (794ce5d to 47ac04c), and its
-  three model tests (4a228c9, 6299984, 1143822):** the list is under "Round
-  2 of the outside review" below.
+- **Four rounds of outside review, all closed (3727c95 to d939580), and
+  three model tests:** the next sections. Each fix commit holds the failing
+  run before the fix, the mutants, and what was rejected.
 
 ### Phase 1 acceptance: what holds, group by group
 
@@ -600,8 +596,26 @@ in the message of the commit that added it.
    does not see the old socket's data`; `sim: dgram ev: 64 sockets, each
    with a parked receive, all woken at one virtual time`; `sim: dgram ev: a
    negative fd in a poll set is ignored, as the kernel does, beside a sim
-   socket`; and the `sim: dgram ev refuses:` tests of a poll on a closed
-   socket or a pipe end.
+   socket`; the `sim: dgram ev refuses:` tests of a poll on a closed
+   socket or a pipe end. Close, reuse and the harvest batch (rounds 1 and
+   3): `sim: dgram ev: a receive parked on a socket that is closed and whose
+   number is reused at once ends FileDescriptorNotASocket and leaves the new
+   socket's datagram`; `sim: dgram ev: a receive woken by a landing whose
+   socket a callback earlier in the same harvest closes and reopens ends
+   FileDescriptorNotASocket`, the same for a poll; `sim: dgram ev: a task
+   that a CompletionQueue callback runs inside the harvest closes and reopens
+   the socket of a receive later in the batch, which ends
+   FileDescriptorNotASocket`; `sim: pipe: a receive later in a batch whose
+   end, or whose peer's end, a callback earlier in it closes gets the bytes
+   it was woken for`; `sim: dgram ev: a race group of two sends that finish
+   without deferral completes each member once`, the same for pipe sends;
+   `sim: pipe: a receive with no room on a full pipe does not wake the send
+   parked on it, and one with room does`. One waiter at a time (round 3):
+   `sim: pipe refuses: a second ev receive on an end whose receive is woken
+   and not yet harvested`, the same for a send; `sim: dgram ev refuses: a
+   second ev receive on a socket whose receive is woken and not yet
+   harvested, from a callback earlier in the batch`; `sim: dgram ev refuses:
+   two ev ops parked on one socket`. And the op-level model test (below).
 5. **Independent limits: holds.** `sim: dgram limits: a small byte budget
    drops by bytes, raising SO_RCVBUF after open lets more in, and queued
    datagrams keep their bytes`; `sim: dgram limits: with a large byte budget,
@@ -623,8 +637,12 @@ in the message of the commit that added it.
    namespace:` tests; `sim: dgram trace: ten fresh processes with the heap
    moved give one transcript, wire digest, trace and state digest`; `sim:
    dgram trace: one changed payload byte gives a different wire digest, with
-   the seed, lengths and endpoints the same`; and starh2's three sim steps
-   (the gate below; its result is in the report of each sitting).
+   the seed, lengths and endpoints the same`; one loop group per run (round
+   4): `sim: refuses a loop of a second loop group polling in one run, which
+   would take a datagram op submitted on the first`, the same for a pipe op,
+   and `sim: refuses two Runtimes in one sim run`; `sim: dgram refuses: an
+   open of a slot whose generation is at its limit`; and starh2's three sim
+   steps (the gate below; its result is in the report of each sitting).
 7. **Production-path parity: holds.** All `sim: enet bridge:` tests run
    against real sockets on macOS and Linux with the same expected values as
    in a sim run: one table, `expect` in `enet_bridge_test.c`, SO_SNDBUF
@@ -633,7 +651,21 @@ in the message of the commit that added it.
    cannot use: the sim's column in a sim run, the kernel's otherwise` (its
    `source_rows` table, a column per build).
 
-### The outside review of 158ebba (gpt-simnet3.md in the reports' folder)
+### The outside reviews: four rounds, all closed
+
+Another vendor's model read the code four times; its texts are
+`gpt-simnet3.md` to `gpt-simnet6.md` in the reports' folder. Each finding
+got a test on the code before the fix (its failing output is in the fix's
+commit), the fix, and mutants.
+
+| round | read | serious findings | closed by |
+|---|---|---|---|
+| 1 | 158ebba | 2 P1 (an empty datagram moved the ring head; a close-woken op ran against a reused number) and 8 more | 3727c95 to 6c2e4e0, 9ecfbc6 |
+| 2 | 1126ebe | 1 P1 (a batch entry completed twice), 5 more, and three model tests | 794ce5d to 47ac04c; 4a228c9, 6299984, 1143822 |
+| 3 | b9b9bd1 | 1 P1 (a landing-woken op reached a reused number from inside the batch), 3 P2 | 5c048a8, 9f48648, 0c0b061 |
+| 4 | 0c0b061 | no P1; 2 P2 and 1 small | 621d29a, 72c1693, d939580 |
+
+### Round 1 of the outside review (gpt-simnet3.md, of 158ebba)
 
 Each finding is taken in the review's order: a test from its sequence, run
 on the code before the fix (it must fail), then the fix and a mutant of it.
@@ -740,7 +772,7 @@ fix, then the fix and mutants. Each commit has the failing output.
 
 F1's guard (`isLive`, `endOp`) was found sound.
 
-- **P1, fixed (the commit that adds `dgramOpOnItsSocket`):** a
+- **P1, fixed in 5c048a8:** a
   receive or poll woken by a landing could reach a socket that reused its
   number, because a callback earlier in the same harvest batch, or a task
   that a CompletionQueue owner callback runs (`simCoopYield`), closed and
@@ -750,7 +782,8 @@ F1's guard (`isLive`, `endOp`) was found sound.
   (`dgramOpOnItsSocket`). This replaces the `dgram_closed` due kind: one
   mechanism. The pipe side has no reuse; a callback that closes an end
   earlier in a batch leaves a later receive its bytes (tested).
-- **Findings 2 and 3, by the owner's decision (no multiple waiters):** a
+- **Findings 2 and 3, fixed in 9f48648, by the owner's decision (no
+  multiple waiters):** a
   pipe end takes one unresolved ev receive and one unresolved ev send at a
   time, and a datagram socket one unresolved ev receive or poll for
   reading. Unresolved means parked, or woken and not yet harvested. A second
@@ -762,7 +795,7 @@ F1's guard (`isLive`, `endOp`) was found sound.
   repark stays, for a layer receive (`recvDatagram`) that takes the
   datagram first. starh2's gate with the rule: no refusal. A receive with no
   room no longer wakes the parked send (it freed nothing).
-- **Finding 4 and the model's gaps:** the op model now holds every waiting
+- **Finding 4 and the model's gaps, fixed in 0c0b061:** the op model now holds every waiting
   op to its wake: after each poll, a pipe op woken (bytes, room, close,
   shutdown, reset) must have completed `pipe_wake_ns` after its wake, and a
   datagram op as soon as its datagram landed; at the end each op still
@@ -773,15 +806,72 @@ F1's guard (`isLive`, `endOp`) was found sound.
   woken one (receive, send, datagram). It does not reach a CompletionQueue's
   coop yield (no runtime); `sim.zig` tests that route alone.
 
-### Next
+### Round 4 of the outside review (gpt-simnet6.md, of 0c0b061)
 
-- **For hotseat, not zio:** ENet's receive returns 0 for an empty datagram,
-  the same as would-block, so ENet's receive loop stops there for that
-  service call. Later datagrams wait for the next call.
+No P1. The generation, the one-unresolved-op rule, the removed reparks and
+the zero-room change were found sound.
+
+- **Finding 1, fixed in 621d29a:** the due list is the run's, so a loop of
+  another LoopGroup took an op submitted on an unrelated loop and finished
+  it on itself. Older than the sim network (the same with pipe ops at
+  3417a77). A sim run has one loop group by construction (one Runtime's
+  executors share it; two Runtimes in a run deadlock), so a second group
+  refuses (`sim.claimLoopGroup`), at a sim Runtime's init and at a loop's
+  first submit or harvest. No per-group accounting.
+- **Finding 2, fixed in 72c1693:** the op model's end proved readiness for
+  every waiting op at once, so a race sibling's cancel could hide a lost
+  registration. Now one op at a time, no random action meanwhile, and a
+  proof counts only when that op completes from it.
+- **Small, fixed in d939580:** a slot's generation at `maxInt(u32)` refuses
+  the next open, with a message, in every build mode.
+
+### The three model tests
+
+Each fails when a case it exists for never happened (its counts are
+required non-zero), prints its seed and step on a failure, and is killed by
+the mutants in its commits.
+
+1. **The op-level model test** (`src/sim_op_model_test.zig`, `sim: op
+   model: ...`; 4a228c9, 0c0b061, 72c1693). Generates, on four datagram
+   sockets and a series of pipe pairs with a bare `ev.Loop`: ev and layer
+   sends and receives (scatter, truncation, empty datagrams), polls,
+   cancels, race groups with deferred and non-deferred members, follow-ups
+   into freed slots inside a harvest, close and reopen (number reuse),
+   SO_RCVBUF, clock steps, timers due with I/O, pipe close, shutdown and
+   reset, and inside a poll: closes and reopens, layer receives that take a
+   woken op's datagram, and cancels. Checks every completion's result and
+   bytes against a plain model, every wake against its deadline, and at the
+   end proves each waiting op's registration alone; refusal probes check
+   that a second op behind a woken one refuses. Finds rounds 1 and 2's four
+   defects with each fix reverted (the table in 4a228c9's message). Holes:
+   flows that share a landing instant and a waiting pipe op with a deferred
+   callback (t-4098); the 1024-packet limit (test 2 covers it); a
+   CompletionQueue's coop yield (no runtime; tested alone in `sim.zig`).
+2. **The datagram queue model test** (`sim: dgram: the receive queue
+   matches a list of byte strings under random sends, scatter receives,
+   ...`; 3727c95, 6299984). One socket, one flow: sends left on the wire or
+   landed at once, scatter receives, SO_RCVBUF changes in flight, bursts to
+   the packet limit, runs of receives that wrap the metadata ring, and a
+   drained tail. Hole: one flow only.
+3. **The pipe model test** (`sim: pipe: the pipe buffer matches a list of
+   bytes under random sends, receives, empty slices and a full buffer`;
+   a336d63, 1143822). The pipe buffer alone (`sendBytes`, `drainBuf`),
+   zero to five slices, with a reference that calls no pipe helper. Holes:
+   storage only (test 1 covers parking and harvest); a zero-length receive
+   on an empty sim pipe parks, and what the kernels do is not checked
+   (t-4096).
+
+### Next: phase 2 (faults and replay)
+
 - **Phase 2** (section 12): faults, counters, validation, promises 2 and 3.
   If a fault delays the wake of an op that a landing makes due, the check
   in `pushDueAt` fires. The socket generation already protects such an op;
-  that check can then be dropped, after a test of a delayed wake.
+  drop that check then, with a test of a delayed wake.
+- Open and filed: t-4096 (zero-length receive on an empty sim pipe), t-4098
+  (the op model's holes above).
+- **For hotseat, not zio:** ENet's receive returns 0 for an empty datagram,
+  the same as would-block, so ENet's receive loop stops there for that
+  service call. Later datagrams wait for the next call.
 
 ### Decided by the design's owner (2026-11-14, after reports 6-8)
 
@@ -830,7 +920,9 @@ F1's guard (`isLive`, `endOp`) was found sound.
   in a child process; the parent prints the child's counts and, on a
   failure, `op model: FAIL seed S step K: ...` or the last step the child
   started. `ZIO_OP_MODEL_SEED=S` replays one seed, `ZIO_OP_MODEL_STEPS=N`
-  sets the length; both pass through `zig build test`. To run the child by
+  sets the length; both pass through `zig build test`, and either skips the
+  counter floors and the three probe children (a replay is a diagnostic).
+  `ZIO_OP_MODEL_STEPS=0` runs the end alone (the registration proof). To run the child by
   hand (to see all its output): the test binary from `.zig-cache/o/*/test`
   with `ZIO_SIM_DEATH_CHILD=1` and `TEST_FILTER` set to the child's name.
 - **The revert check:** in a `git clone --shared` of the tree,
