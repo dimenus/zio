@@ -8,8 +8,7 @@
 //
 // The contract it copies is unix.c of cgutman/enet at aca87840b57f (the ENet
 // that hotseat vendors), for enet_socket_create, _bind, _get_address,
-// _set_option, _get_option, _send, _receive, _wait, _destroy and
-// enet_socketset_select:
+// _set_option, _get_option, _send, _receive, _wait and _destroy:
 // - send: the bytes sent; 0 for would-block, and for EADDRNOTAVAIL, ENETDOWN,
 //   ENETUNREACH, EHOSTDOWN and EHOSTUNREACH, which ENet treats as transient;
 //   -1 for anything else. errno is left as the layer's error.
@@ -35,9 +34,9 @@
 //   (protocol.c:1731) is left to the production bridge.
 // - get_option reads ERROR only. TTL gives -1 without a read: the sim does
 //   not model reading IP_TTL (sim network design, section 8).
-// - ENetSocketSet is a list of sockets, not unix.h's fd_set: a sim fd is
-//   100000 or more, past FD_SETSIZE. Neither ENet's core nor hotseat calls
-//   enet_socketset_select.
+// - No enet_socketset_select. unix.h makes ENetSocketSet an fd_set, and a
+//   sim fd is 100000 or more, past FD_SETSIZE (sim network design, section
+//   3.2). ENet's core waits with enet_socket_wait, and hotseat calls neither.
 // - No control messages: the layer's recvDatagram and sendDatagram carry the
 //   destination and source addresses as values.
 //
@@ -112,12 +111,6 @@ typedef enum {
 
 enum { ENET_HOST_RECEIVE_BUFFER_SIZE = 256 * 1024, ENET_HOST_SEND_BUFFER_SIZE = 256 * 1024 };
 
-#define ENET_SOCKETSET_MAX 8
-typedef struct {
-    int count;
-    ENetSocket sockets[ENET_SOCKETSET_MAX];
-} ENetSocketSet;
-
 // ---- The layer, through enet_bridge_test.zig ----
 
 extern int zio_test_socket(void);
@@ -130,7 +123,6 @@ extern int zio_test_setsockopt(int fd, int level, int name, const void *value, s
 extern int zio_test_getsockopt(int fd, int level, int name, void *value, socklen_t len);
 extern ssize_t zio_test_send(int fd, const struct sockaddr_in *to, const uint8_t *from, const ENetBuffer *buffers, size_t count);
 extern ssize_t zio_test_receive(int fd, struct sockaddr_in *from, ENetBuffer *buffers, size_t count, int *truncated, uint8_t *to, int *has_to);
-extern int zio_test_poll(struct pollfd *fds, unsigned count, int timeout_ms);
 extern int zio_test_wait(int fd, short events, int timeout_ms, short *revents);
 extern void zio_test_close(int fd);
 // Not the bridge's: parks the calling zio task until fd is readable.
@@ -265,36 +257,6 @@ static int enet_socket_receive(ENetSocket socket, ENetAddress *peerAddress, ENet
     return (int)received;
 }
 
-static int enet_socketset_select(ENetSocket maxSocket, ENetSocketSet *readSet, ENetSocketSet *writeSet,
-                                 enet_uint32 timeout) {
-    (void)maxSocket; // select's nfds; poll takes the list
-    struct pollfd fds[2 * ENET_SOCKETSET_MAX];
-    unsigned n = 0;
-    for (int i = 0; i < readSet->count; i++) fds[n++] = (struct pollfd){.fd = readSet->sockets[i], .events = POLLIN};
-    for (int i = 0; i < writeSet->count; i++) fds[n++] = (struct pollfd){.fd = writeSet->sockets[i], .events = POLLOUT};
-    int rc = zio_test_poll(fds, n, (int)timeout);
-    if (rc < 0) {
-        errno = -rc;
-        return -1;
-    }
-    // As select: each set keeps its ready sockets, and the count is the sum.
-    int ready = 0;
-    n = 0;
-    int kept = 0;
-    for (int i = 0; i < readSet->count; i++, n++) {
-        if (fds[n].revents & (POLLIN | POLLERR | POLLHUP)) readSet->sockets[kept++] = fds[n].fd;
-    }
-    readSet->count = kept;
-    ready += kept;
-    kept = 0;
-    for (int i = 0; i < writeSet->count; i++, n++) {
-        if (fds[n].revents & (POLLOUT | POLLERR | POLLHUP)) writeSet->sockets[kept++] = fds[n].fd;
-    }
-    writeSet->count = kept;
-    ready += kept;
-    return ready;
-}
-
 static int enet_socket_wait(ENetSocket socket, enet_uint32 *condition, enet_uint32 timeout) {
     short events = 0, revents = 0;
     if (*condition & ENET_SOCKET_WAIT_SEND) events |= POLLOUT;
@@ -315,20 +277,6 @@ static int enet_socket_wait(ENetSocket socket, enet_uint32 *condition, enet_uint
     return 0;
 }
 
-static void socketset_empty(ENetSocketSet *set) { set->count = 0; }
-
-static void socketset_add(ENetSocketSet *set, ENetSocket socket) {
-    if (set->count == ENET_SOCKETSET_MAX) abort();
-    set->sockets[set->count++] = socket;
-}
-
-static int socketset_check(const ENetSocketSet *set, ENetSocket socket) {
-    for (int i = 0; i < set->count; i++) {
-        if (set->sockets[i] == socket) return 1;
-    }
-    return 0;
-}
-
 // ---- Expected values ----
 
 // The bridge's answers, one value for a sim run and for real loopback
@@ -339,6 +287,7 @@ static const struct {
     int no_case;        // set_option or get_option of an option the bridge has no case for
     int bind_in_use;    // bind to an address another socket holds (errno EADDRINUSE)
     int empty_datagram; // send and receive of an empty datagram
+    int sndbuf;         // set_option SNDBUF: a kernel takes it; a sim run accepts it with no effect (section 8)
     int ok;             // bind, set_option, get_option, get_address, wait
 } expect = {
     .would_block = 0,
@@ -346,11 +295,12 @@ static const struct {
     .no_case = -1,
     .bind_in_use = -1,
     .empty_datagram = 0,
+    .sndbuf = 0,
     .ok = 0,
 };
 
-// The exceptions: answers a sim run and the kernel do not share, one column
-// per build. Each is a decision of the sim network design.
+// The one exception: an answer a sim run and the kernel do not share, with a
+// column per build. It is a decision of the sim network design.
 enum { COL_SIM, COL_LINUX, COL_MACOS };
 
 static int column(int sim) {
@@ -363,11 +313,6 @@ static int column(int sim) {
 #error "the ENet bridge test runs on macOS and Linux only"
 #endif
 }
-
-// SO_SNDBUF: the sim does not model send buffers, so it is an unsupported,
-// advisory option there (design section 8); a kernel takes it. ENet ignores
-// both answers.
-static const int expect_sndbuf[3] = {[COL_SIM] = -1, [COL_LINUX] = 0, [COL_MACOS] = 0};
 
 // A source address the socket cannot use (design sections 3.1 and 11). SENT:
 // the send returns its length, and the datagram arrives from that address.
@@ -523,7 +468,7 @@ int ebt_exchange(int peer_port, int *my_port) {
 
 // Group 2: ENet's host creation (host.c:52-70), in its order, then a
 // datagram that arrives with its destination address.
-int ebt_host_create(int sim) {
+int ebt_host_create(void) {
     ENetAddress address = ip4(any, 0);
     ENetSocket s = enet_socket_create(AF_INET, ENET_SOCKET_TYPE_DATAGRAM);
     if (s == ENET_SOCKET_NULL) FAIL("enet_socket_create: ENET_SOCKET_NULL (errno %d)", errno);
@@ -533,7 +478,7 @@ int ebt_host_create(int sim) {
     EXPECT("non-blocking, read back", zio_test_is_nonblocking(s), 1);
     EXPECT("set_option RCVBUF", enet_socket_set_option(s, ENET_SOCKOPT_RCVBUF, ENET_HOST_RECEIVE_BUFFER_SIZE), expect.ok);
     EXPECT("set_option SNDBUF", enet_socket_set_option(s, ENET_SOCKOPT_SNDBUF, ENET_HOST_SEND_BUFFER_SIZE),
-           expect_sndbuf[column(sim)]);
+           expect.sndbuf);
     ENetAddress got;
     EXPECT("get_address", enet_socket_get_address(s, &got), expect.ok);
     EXPECT("get_address length", got.addressLength, sizeof(struct sockaddr_in));
@@ -627,15 +572,15 @@ int ebt_truncation(void) {
     return 0;
 }
 
-// Group 2: an option the layer does not support (SNDBUF in a sim run), and
-// options the bridge has no case for, give -1 and change nothing.
-int ebt_unsupported_option(int sim) {
+// Group 2: options the bridge has no case for give -1 and change nothing;
+// SNDBUF succeeds and leaves the receive side alone.
+int ebt_unsupported_option(void) {
     ENetSocket s, tx;
     uint16_t port;
     TRY(open_bound(loopback, &s, &port));
     int before = -1, after = -1;
     EXPECT("SO_RCVBUF before", zio_test_getsockopt(s, SOL_SOCKET, SO_RCVBUF, &before, sizeof(before)), 0);
-    EXPECT("set_option SNDBUF", enet_socket_set_option(s, ENET_SOCKOPT_SNDBUF, 4096), expect_sndbuf[column(sim)]);
+    EXPECT("set_option SNDBUF", enet_socket_set_option(s, ENET_SOCKOPT_SNDBUF, 4096), expect.sndbuf);
     EXPECT("set_option BROADCAST", enet_socket_set_option(s, ENET_SOCKOPT_BROADCAST, 1), expect.no_case);
     int ttl = -7;
     EXPECT("get_option TTL", enet_socket_get_option(s, ENET_SOCKOPT_TTL, &ttl), expect.no_case);
@@ -730,29 +675,6 @@ int ebt_wait_interrupt(void) {
     EXPECT("its condition", asked, ENET_SOCKET_WAIT_INTERRUPT);
     EXPECT("wait not asking for interrupts", rc_not_asked, -1);
     EXPECT("its errno", errno_not_asked, EINTR);
-    return 0;
-}
-
-// Group 2: enet_socketset_select with a zero timeout keeps the ready
-// sockets in each set and counts them.
-int ebt_select(void) {
-    ENetSocket a, b, tx;
-    uint16_t b_port;
-    TRY(open_bound(loopback, &a, NULL));
-    TRY(open_bound(loopback, &b, &b_port));
-    TRY(open_bound(loopback, &tx, NULL));
-    EXPECT("send to b", send_text(tx, b_port, NULL, "s"), 1);
-    TRY(arrive(b));
-    ENetSocketSet rd, wr;
-    socketset_empty(&rd);
-    socketset_empty(&wr);
-    socketset_add(&rd, a);
-    socketset_add(&rd, b);
-    socketset_add(&wr, a);
-    EXPECT("select", enet_socketset_select(a > b ? a : b, &rd, &wr, 0), 2);
-    EXPECT("a readable", socketset_check(&rd, a), 0);
-    EXPECT("b readable", socketset_check(&rd, b), 1);
-    EXPECT("a writable", socketset_check(&wr, a), 1);
     return 0;
 }
 

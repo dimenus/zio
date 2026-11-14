@@ -1055,9 +1055,10 @@ pub fn takeDue(out: []TakenDue) usize {
 //   and packets (`rcv_packet_limit`). A datagram costs its length plus
 //   `datagram_overhead` bytes, and one packet. One that does not fit is
 //   dropped and counted (`DatagramStats.dropped_rcvbuf`), never a panic.
-// - Socket options come in three classes (`dgramSetOption`): modelled,
-//   unsupported (`error.OptionNotSupported`, nothing changes, the caller may
-//   ignore it), and misuse (a panic naming the option).
+// - Socket options come in four classes (`dgramSetOption`): modelled,
+//   accepted with no effect (`SO_SNDBUF`), unsupported
+//   (`error.OptionNotSupported`, nothing changes, the caller may ignore it),
+//   and misuse (a panic naming the option).
 // - Receives are non-suspending here: an empty queue is `WouldBlock`, and a
 //   receive that would have to block refuses (the sim thread would never
 //   wake).
@@ -1471,13 +1472,14 @@ const sys = std.posix.system;
 /// macOS's SO_NET_SERVICE_TYPE (sys/socket.h), which ENet's QoS option sets.
 const darwin_so_net_service_type: u32 = 0x1116;
 
-const OptionClass = enum { rcvbuf, dst_addr, so_error, unsupported, misuse };
+const OptionClass = enum { rcvbuf, dst_addr, so_error, sndbuf, unsupported, misuse };
 
 fn classifyOption(level: i32, name: u32) OptionClass {
     if (level == sys.SOL.SOCKET) {
         if (name == sys.SO.RCVBUF) return .rcvbuf;
         if (name == sys.SO.ERROR) return .so_error;
-        if (name == sys.SO.SNDBUF or name == sys.SO.RCVLOWAT or name == sys.SO.REUSEADDR or
+        if (name == sys.SO.SNDBUF) return .sndbuf;
+        if (name == sys.SO.RCVLOWAT or name == sys.SO.REUSEADDR or
             name == sys.SO.RCVTIMEO or name == sys.SO.SNDTIMEO) return .unsupported;
         if (builtin.os.tag.isDarwin() and name == darwin_so_net_service_type) return .unsupported;
         if (builtin.os.tag == .linux and name == sys.SO.PRIORITY) return .unsupported;
@@ -1518,11 +1520,15 @@ fn optionInt(comptime what: []const u8, fd: i32, val: []const u8) c_int {
 
 /// `setsockopt` on a sim datagram socket. Modelled: `SO_RCVBUF` (the byte
 /// limit; the queue is re-provisioned), and the destination-address option
-/// (`IP_PKTINFO` on Linux, `IP_RECVDSTADDR` on macOS). Unsupported: send
-/// buffer, low-water mark, address reuse, timeouts, TOS, TTL, ENet's QoS
-/// options; `error.OptionNotSupported` and nothing changes. Anything else is
-/// misuse and refuses, naming the option: broadcast, multicast, port reuse,
-/// a TCP option, an unknown option or level.
+/// (`IP_PKTINFO` on Linux, `IP_RECVDSTADDR` on macOS). Accepted with no
+/// effect: `SO_SNDBUF`. A sim send never waits or fails for buffer space, so
+/// any send buffer size is already satisfied, and answering 0 as a kernel
+/// does keeps a caller on the branch it takes in production (ENet sets it on
+/// every host). A send-side limit, if one is ever added, must model it for
+/// real. Unsupported: low-water mark, address reuse, timeouts, TOS, TTL,
+/// ENet's QoS options; `error.OptionNotSupported` and nothing changes.
+/// Anything else is misuse and refuses, naming the option: broadcast,
+/// multicast, port reuse, a TCP option, an unknown option or level.
 pub fn dgramSetOption(fd: i32, level: i32, name: u32, val: []const u8) error{OptionNotSupported}!void {
     refuseOtherThread("sim socket setsockopt");
     const d = dgramSlot("setsockopt", fd);
@@ -1533,6 +1539,7 @@ pub fn dgramSetOption(fd: i32, level: i32, name: u32, val: []const u8) error{Opt
             resizeQueue(d, @intCast(v));
         },
         .dst_addr => d.dst_addr = optionInt("the destination-address option", fd, val) != 0,
+        .sndbuf => _ = optionInt("SO_SNDBUF", fd, val),
         .unsupported => return error.OptionNotSupported,
         .so_error, .misuse => panic("sim: setsockopt {s} (level {d}, option {d}) on sim fd {d} is misuse here", .{ optionName(level, name), level, name, fd }),
     }
@@ -1548,7 +1555,7 @@ pub fn dgramGetOption(fd: i32, level: i32, name: u32, out: []u8) void {
         .rcvbuf => @intCast(d.byte_limit),
         .so_error => 0,
         .dst_addr => @intFromBool(d.dst_addr),
-        .unsupported, .misuse => panic("sim: getsockopt {s} (level {d}, option {d}) on sim fd {d} is not simulated", .{ optionName(level, name), level, name, fd }),
+        .sndbuf, .unsupported, .misuse => panic("sim: getsockopt {s} (level {d}, option {d}) on sim fd {d} is not simulated", .{ optionName(level, name), level, name, fd }),
     };
     if (out.len != @sizeOf(c_int)) panic("sim: getsockopt on sim fd {d} into {d} bytes (an int is {d})", .{ fd, out.len, @sizeOf(c_int) });
     @memcpy(out, std.mem.asBytes(&v));
@@ -4490,7 +4497,7 @@ test "sim: dgram ev refuses: pollInterruptible with a positive timeout on a sim 
 
 // ---- Phase 1, slice 3: socket options and receive limits (sections 6, 8) ----
 
-test "sim: dgram options: an ENet-shaped host creation: socket, non-blocking, RCVBUF, SNDBUF ignored, destination addresses, bind to port 0, getsockname" {
+test "sim: dgram options: an ENet-shaped host creation: socket, non-blocking, RCVBUF, SNDBUF accepted with no effect, destination addresses, bind to port 0, getsockname" {
     if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
     try dg.run(1, struct {
         fn body() !void {
@@ -4498,8 +4505,8 @@ test "sim: dgram options: an ENet-shaped host creation: socket, non-blocking, RC
             try dg.os_net.setNonBlocking(fd, true);
             try std.testing.expect(try dg.os_net.isNonBlocking(fd));
             try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF, 256 * 1024);
-            // ENet ignores the -1 its bridge returns for this.
-            try std.testing.expectError(error.OptionNotSupported, dg.setInt(fd, sys.SOL.SOCKET, sys.SO.SNDBUF, 256 * 1024));
+            // Accepted as a kernel does; the byte limit stays RCVBUF's (below).
+            try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.SNDBUF, 256 * 1024);
             try dg.os_net.enableDestinationAddress(fd);
             try dg.bindTo(fd, dg.addr(0, 0, 0, 0, 0));
             try std.testing.expectEqual(Ip4{ .ip = .{ 0, 0, 0, 0 }, .port = 49152 }, try dg.local(fd));
@@ -4527,7 +4534,6 @@ test "sim: dgram options: an unsupported option returns OptionNotSupported and c
             const fd = try dg.open();
             const before = try dg.getInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF);
             const unsupported = [_][2]i64{
-                .{ sys.SOL.SOCKET, sys.SO.SNDBUF },
                 .{ sys.SOL.SOCKET, sys.SO.RCVLOWAT },
                 .{ sys.SOL.SOCKET, sys.SO.REUSEADDR },
                 .{ sys.IPPROTO.IP, sys.IP.TOS },

@@ -1,8 +1,7 @@
 # Design brief: a sim network for zio (t-4086, t-4087), revision 3
 
-Status: **phase 1 (section 12) is built. One acceptance item falls short of
-its wording: group 7 has a second exception, SO_SNDBUF (section 15). The rest
-is for review.**
+Status: **phase 1 (section 12) is built, and its seven acceptance groups hold
+(section 15). The rest is for review.**
 
 Revision 2 (dd55885) was reviewed by another vendor's model. This revision
 takes the decisions made after that review. Section 13 lists what changed
@@ -115,15 +114,24 @@ treats this case apart (section 11).
 
 - **hotseat** owns a small C-callable bridge in its repo that implements
   ENet's socket functions (`enet_socket_create`, `_bind`, `_get_address`,
-  `_set_option`, `_get_option`, `_send`, `_receive`, `_wait`, `_destroy`,
-  and `enet_socketset_select`) over this layer, in production too. It
-  returns ENet's own codes:
+  `_set_option`, `_get_option`, `_send`, `_receive`, `_wait` and
+  `_destroy`) over this layer, in production too. It returns ENet's own
+  codes:
   - 0 for would-block and for `AddressUnavailable` on send;
   - -2 for truncation;
   - `ENET_SOCKET_WAIT_INTERRUPT` from `pollInterruptible`;
   - -1 for an unsupported option, which ENet ignores (`host.c:66-68`).
 
   hotseat's `requireNonBlocking` moves to `isNonBlocking`.
+- **A consumer's bridge must not offer an `fd_set` select for sim fds.**
+  ENet's unix.h makes `ENetSocketSet` an `fd_set`, which holds descriptors
+  below `FD_SETSIZE` (1024 on macOS and Linux). A sim fd is `fd_base +
+  index`, 100000 or more (section 3.3), so `FD_SET` on one writes past the
+  set. ENet's core does not need it: it waits with `enet_socket_wait`
+  (`protocol.c:1953`), which the bridge builds on `pollInterruptible`, and
+  hotseat calls `enet_socketset_select` nowhere. So the bridge leaves
+  `enet_socketset_select` out. A caller that needs to wait on several sim
+  fds uses the layer's `poll`.
 - **starh2** moves `getpeername` and `TCP_NODELAY` to the layer (stream
   track).
 - A consumer keeps a grep gate in its own repo for direct libc socket calls.
@@ -271,12 +279,13 @@ harness asserts its own budget (`dropped_rcvbuf == 0`) separately.
     deterministic bytes.
   - `zio.random` off an executor is refused during a run.
 
-## 8. Options: three classes
+## 8. Options: four classes
 
 | class | under sim | examples |
 |---|---|---|
 | **modelled** | the option has its documented effect | `SO_RCVBUF` (byte limit), non-blocking, `enableDestinationAddress`, `TCP_NODELAY = 1` and `SO_REUSEADDR = 1` (stream track) |
-| **unsupported, advisory** | returns `error.OptionNotSupported` (zio's existing name); nothing changes; the caller may ignore it | `SO_SNDBUF`, `SO_RCVLOWAT`, `SO_REUSEADDR` on a datagram socket, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `IP_TOS`, `IP_TTL`, `IPV6_TCLASS`, and ENet's QoS option (`SO_NET_SERVICE_TYPE` on macOS, `SO_PRIORITY` on Linux), `TCP_NODELAY = 0` (stream track) |
+| **accepted, no effect** | succeeds, as the kernel does; nothing changes | `SO_SNDBUF` |
+| **unsupported, advisory** | returns `error.OptionNotSupported` (zio's existing name); nothing changes; the caller may ignore it | `SO_RCVLOWAT`, `SO_REUSEADDR` on a datagram socket, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `IP_TOS`, `IP_TTL`, `IPV6_TCLASS`, and ENet's QoS option (`SO_NET_SERVICE_TYPE` on macOS, `SO_PRIORITY` on Linux), `TCP_NODELAY = 0` (stream track) |
 | **misuse** | panics with the option's name | an option on a closed or unknown fd; `SO_REUSEPORT`; broadcast and multicast options; a TCP option on a datagram socket; any other option or level; a non-positive `SO_RCVBUF` |
 
 **Reading an option** (`getsockopt`): modelled are `SO_RCVBUF` (the byte
@@ -287,9 +296,17 @@ option, and hotseat's bridge will not; `IP_TTL` is not modelled.
 
 - An unsupported option returns an error, so ENet's ignored -1 works
   (`host.c:66-68`).
+- **Why `SO_SNDBUF` is accepted, not unsupported.** ENet sets it on every
+  host (`host.c:68`), and a kernel answers 0. A sim that answers a call a
+  consumer really makes with another code sends the code under test down a
+  different branch: ENet ignores it, another caller may not. In the sim a
+  send never waits or fails for buffer space, so any send buffer size is
+  already satisfied, and 0 with no change is the true answer. Reading it
+  stays not modelled (below). **If phase 2 adds a send-side limit, `SO_SNDBUF`
+  must be modelled for real then.**
 - hotseat's Darwin tests that need a 1-byte `SO_SNDBUF` to get `EMSGSIZE`
-  stay real-socket tests. Under sim they would see `OptionNotSupported`, and
-  their sends would succeed. Send pressure is not modelled (section 10).
+  stay real-socket tests. Under sim the option is accepted with no effect,
+  and their sends would succeed. Send pressure is not modelled (section 10).
 - **TIME_WAIT is not modelled.** Stream rebinding without `SO_REUSEADDR` is
   refused (stream track). starh2's listeners set `reuse_address = true`
   (`src/edge/server.zig:1984, 2033, 2063, 2151`).
@@ -343,7 +360,7 @@ repo's suite under `sim: `.
      receive is the next datagram);
    - an unsupported option returns -1 and nothing changes;
    - **an ENet-shaped host creation:** socket, non-blocking, `RCVBUF`,
-     `SNDBUF` (ignored -1), `enableDestinationAddress`, bind to port 0,
+     `SNDBUF` (0, no effect), `enableDestinationAddress`, bind to port 0,
      `getsockname`.
 3. **Addressing:**
    - port 0 gives 49152, 49153, ... in every run;
@@ -474,8 +491,9 @@ The scripts the gates below use are beside them, in `zio-sim6-tools/` there
   fds; every ev op on a datagram socket goes through the same layer calls, and
   parks on the socket where a backend would wait; a real fd in a sim op
   refuses.
-- **Options and limits (ec6ec37):** three option classes
-  (`dgramSetOption`'s doc comment); `SO_RCVBUF` re-provisions the queue; the
+- **Options and limits (ec6ec37):** the option classes
+  (`dgramSetOption`'s doc comment; `SO_SNDBUF` moved to its own class
+  later, see below); `SO_RCVBUF` re-provisions the queue; the
   sim's allocator can fail in a test (`testSetNetAllocator`).
 - **Trace and `wireDigest` (31783f6):** a `dgram` trace event per landing;
   `wireDigest()`; the datagram table in `stateDigest` only for a run that
@@ -488,11 +506,15 @@ The scripts the gates below use are beside them, in `zio-sim6-tools/` there
   in ed2ecee's message.
 - **The C bridge tests (7833cee):** `src/enet_bridge_test.c` is an
   ENet-shaped bridge over the layer (unix.c of cgutman/enet at aca87840b57f,
-  for the ten functions of section 3.2) with eleven C tests;
+  for the socket functions of section 3.2) with C tests;
   `src/enet_bridge_test.zig` exports the `zio_test_*` shims it calls and runs
   each test, in a sim run in a sim build and on real loopback sockets without
   sim. The test binary has its own root module in build.zig, so only it
   compiles the C file. Protocol: the header comments of both files.
+- **SO_SNDBUF accepted with no effect, and no fd_set select (after
+  158ebba):** the owner's two decisions on report 10 (sections 3.2 and 8).
+  The bridge test's `enet_socketset_select` and its test are gone, and
+  SO_SNDBUF sits in the bridge test's shared table.
 
 ### Phase 1 acceptance: what holds, group by group
 
@@ -515,17 +537,17 @@ in the message of the commit that added it.
    - `an empty datagram is received as 0 with its source written, and the
      next datagram is next`;
    - `a datagram that does not fit is -2 and is consumed`;
-   - `SNDBUF (unsupported in a sim run), BROADCAST and reading TTL give -1
-     and change nothing`. The layer's unsupported class exists only in a sim
-     run; on real sockets the bridge's own -1 (an option it has no case for)
-     is what this checks;
+   - `BROADCAST and reading TTL give -1 and change nothing, and SNDBUF
+     succeeds with the receive side unchanged`. The -1 is the bridge's own,
+     for an option it has no case for. No option the bridge sets reaches the
+     layer's unsupported class any more, so that class is proved at the Zig
+     level: `sim: dgram options: an unsupported option returns
+     OptionNotSupported and changes nothing`;
    - `enet_socket_wait with a zero timeout reports receive only once a
      datagram is queued, and send always`;
    - `real sockets only: a signal cuts a wait: ENET_SOCKET_WAIT_INTERRUPT
      when asked for, -1 and EINTR when not`. It skips in a sim build: a sim
      poll takes a zero timeout only, so nothing can cut it (section 10);
-   - `enet_socketset_select keeps the ready sockets of each set and counts
-     them`;
    - `a bind to a port in use is -1 with EADDRINUSE, destroy frees the port,
      destroy of ENET_SOCKET_NULL does nothing`.
 3. **Addressing: holds.** `sim: dgram: port 0 gives 49152, 49153, 49154 in
@@ -558,27 +580,16 @@ in the message of the commit that added it.
    dgram trace: one changed payload byte gives a different wire digest, with
    the seed, lengths and endpoints the same`; and starh2's three sim steps
    (the gate below; its result is in the report of each sitting).
-7. **Production-path parity: holds for every check but one, so it does not
-   hold as section 11 words it.** All `sim: enet bridge:` tests run against
-   real sockets on macOS and Linux with the same expected values as in a sim
-   run (the `expect` table of `enet_bridge_test.c`). The source-address case
-   is apart, as section 11 says: `sim: enet bridge: a source address the
-   socket cannot use: the sim's column in a sim run, the kernel's otherwise`
-   (its `source_rows` table). **The check that differs and that section 11
-   does not list:** `ENET_SOCKOPT_SNDBUF` gives -1 in a sim run (section 8's
-   unsupported class) and 0 on real sockets (`expect_sndbuf`). ENet ignores
-   both. Proposed for the owner: add SO_SNDBUF to group 7's "not a parity
-   case" list. Until then, group 7 is not fully met.
+7. **Production-path parity: holds.** All `sim: enet bridge:` tests run
+   against real sockets on macOS and Linux with the same expected values as
+   in a sim run: one table, `expect` in `enet_bridge_test.c`, SO_SNDBUF
+   included. The one exception is the one section 11 names, a source address
+   the socket cannot use: `sim: enet bridge: a source address the socket
+   cannot use: the sim's column in a sim run, the kernel's otherwise` (its
+   `source_rows` table, a column per build).
 
 ### Next
 
-- **The owner's call on SO_SNDBUF** (group 7, above).
-- **Section 3.2, `enet_socketset_select`:** ENet's unix.h has `typedef fd_set
-  ENetSocketSet`, and a sim fd (100000 and up) is past FD_SETSIZE, so
-  hotseat's bridge cannot implement it over the layer with ENet's type.
-  Neither ENet's core nor hotseat calls it. Proposed: hotseat's bridge drops
-  it, or its patched unix.h redefines the set (the test fixture uses a list
-  of sockets).
 - **For hotseat, not zio:** ENet's receive returns 0 for an empty datagram,
   the same as would-block, so ENet's receive loop stops there for that
   service call. Later datagrams wait for the next call.
@@ -615,8 +626,8 @@ in the message of the commit that added it.
   (`/work/src/os`). `-Dtarget=x86_64-windows` compiles the Windows test
   binary.
 - **The C bridge tests in both builds:** the filter `sim: enet bridge`, once
-  with `-Dsim=true -Dscheduling=pinned` (10 run, the interrupt test skips)
-  and once without sim (all 11 run, on real sockets). On Linux, the same two
+  with `-Dsim=true -Dscheduling=pinned` (the interrupt test skips there)
+  and once without sim (all run, on real sockets). On Linux, the same two
   binaries in colima with `TEST_FILTER=sim: enet bridge`.
 - **Unchanged without sim:** `textcmp.sh <base commit> <src dir> <label>`
   builds the eight examples ReleaseFast from the base and from the src dir at
@@ -636,7 +647,12 @@ in the message of the commit that added it.
   of that zio commit (never the live tree). `starh2-gate.sh <label> 10`, in a
   Rex tab, runs the three steps once and `dst-zio` 9 more times;
   `dstzio-cmp.py <ref> <new>` compares the value sets per line. The reference
-  is 0b71a9c (`dstzio-ref.txt`, 10 runs, every line one value).
+  is 0b71a9c (`dstzio-ref.txt`, 10 runs, every line one value). The trace
+  digest of a gate's full first run is, exactly,
+  `grep -o 'TRACE_HASH=[0-9a-f]*' gate-<label>.txt | sort | md5 -q`; the
+  reference value is c05b7576d516675ee650676f4af38437 (65 lines, the same
+  for `gate-ref.txt`). Report 9's value came from another command; this one
+  replaces it.
 
 ### Traps already hit (each cost a round)
 

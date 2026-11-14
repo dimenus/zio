@@ -11,8 +11,9 @@
 //   sockets are sim fds;
 // - without sim, it runs on a plain runtime, and the same calls reach the
 //   kernel, on real loopback sockets.
-// The C file holds the expected values: one table for both builds, and two
-// exception tables with a column per build.
+// The C file holds the expected values: one table for both builds, and one
+// exception table, with a column per build (a source address the socket
+// cannot use).
 //
 // The shims, for the C side:
 // - Each returns a value >= 0 on success, or `-errno` for the layer's error:
@@ -112,11 +113,6 @@ export fn zio_test_receive(fd: c_int, from: *os_net.sockaddr.in, buffers: [*]os_
     return @intCast(info.len);
 }
 
-export fn zio_test_poll(fds: [*]os_net.pollfd, count: c_uint, timeout_ms: c_int) c_int {
-    const n = os_net.poll(fds[0..count], timeout_ms) catch |err| return errnoOf(err);
-    return @intCast(n);
-}
-
 export fn zio_test_wait(fd: c_int, events: c_short, timeout_ms: c_int, revents: *c_short) c_int {
     const outcome = os_net.pollInterruptible(fd, events, timeout_ms) catch |err| return errnoOf(err);
     return switch (outcome) {
@@ -152,14 +148,13 @@ fn waitIo(c: *ev.Completion) !void {
 extern var ebt_failure: [256]u8;
 extern fn ebt_close_all() void;
 extern fn ebt_exchange(peer_port: c_int, my_port: *c_int) c_int;
-extern fn ebt_host_create(sim: c_int) c_int;
+extern fn ebt_host_create() c_int;
 extern fn ebt_would_block() c_int;
 extern fn ebt_empty_datagram() c_int;
 extern fn ebt_truncation() c_int;
-extern fn ebt_unsupported_option(sim: c_int) c_int;
+extern fn ebt_unsupported_option() c_int;
 extern fn ebt_wait() c_int;
 extern fn ebt_wait_interrupt() c_int;
-extern fn ebt_select() c_int;
 extern fn ebt_bind_conflict_and_destroy() c_int;
 extern fn ebt_source_address(sim: c_int) c_int;
 
@@ -198,7 +193,7 @@ fn runC(comptime c_test: fn () callconv(.c) c_int) !void {
     }.body);
 }
 
-/// Runs one C test that reads its column of an exception table.
+/// Runs one C test that reads its column of the exception table.
 fn runCForBuild(comptime c_test: fn (c_int) callconv(.c) c_int) !void {
     try run(struct {
         fn body() !void {
@@ -263,7 +258,7 @@ test "sim: enet bridge: C sends two buffers to a zio task's ev receive, which re
 }
 
 test "sim: enet bridge: an ENet-shaped host creation: create, bind to port 0, NONBLOCK read back, RCVBUF, SNDBUF, get_address, get_option ERROR, then a datagram with its destination" {
-    try runCForBuild(ebt_host_create);
+    try runC(ebt_host_create);
 }
 
 test "sim: enet bridge: a receive with nothing queued is 0, errno EWOULDBLOCK, and writes no address" {
@@ -278,8 +273,8 @@ test "sim: enet bridge: a datagram that does not fit is -2 and is consumed" {
     try runC(ebt_truncation);
 }
 
-test "sim: enet bridge: SNDBUF (unsupported in a sim run), BROADCAST and reading TTL give -1 and change nothing" {
-    try runCForBuild(ebt_unsupported_option);
+test "sim: enet bridge: BROADCAST and reading TTL give -1 and change nothing, and SNDBUF succeeds with the receive side unchanged" {
+    try runC(ebt_unsupported_option);
 }
 
 test "sim: enet bridge: enet_socket_wait with a zero timeout reports receive only once a datagram is queued, and send always" {
@@ -291,10 +286,6 @@ test "sim: enet bridge: real sockets only: a signal cuts a wait: ENET_SOCKET_WAI
     // section 10).
     if (comptime in_sim) return error.SkipZigTest;
     try runC(ebt_wait_interrupt);
-}
-
-test "sim: enet bridge: enet_socketset_select keeps the ready sockets of each set and counts them" {
-    try runC(ebt_select);
 }
 
 test "sim: enet bridge: a bind to a port in use is -1 with EADDRINUSE, destroy frees the port, destroy of ENET_SOCKET_NULL does nothing" {
