@@ -119,6 +119,9 @@ pub const DueKind = enum(u8) {
     send = 2,
     close = 3,
     shutdown = 4,
+    /// Any ev op on a sim datagram socket (`dgramOpDone`, a landing or a
+    /// close that wakes a parked op).
+    dgram = 5,
 };
 
 const Due = struct {
@@ -605,10 +608,14 @@ pub fn takeOpId(c: *anyopaque) ?u32 {
 }
 
 fn pushDueKind(c: *anyopaque, kind: DueKind, id: u32) void {
+    pushDueAt(c, kind, id, clock_ns + ioDelayNs());
+}
+
+fn pushDueAt(c: *anyopaque, kind: DueKind, id: u32, at: u64) void {
     if (due_len >= max_due) panic("sim: I/O due list full", .{});
     due[due_len] = .{
         .c = c,
-        .due_at = clock_ns + ioDelayNs(),
+        .due_at = at,
         .kind = kind,
         .id = id,
     };
@@ -931,6 +938,11 @@ pub fn shutdownFd(fd: i32, how: ShutdownHow, c: *anyopaque) enum { due, bad_fd }
 }
 
 pub fn cancelIo(c: *anyopaque) ?u32 {
+    for (&dgrams) |*d| {
+        if (d.parked) |p| {
+            if (p.c == c) d.parked = null;
+        }
+    }
     for (&ends) |*e| {
         if (e.pending_recv) |p| {
             if (p.c == c) e.pending_recv = null;
@@ -1064,6 +1076,9 @@ const Dgram = struct {
     /// plus `datagram_overhead`.
     charged: usize = 0,
     stats: DatagramStats = .{},
+    /// An ev op waiting for a datagram (a receive, or a poll for reading):
+    /// a landing or a close makes it due now.
+    parked: ?Parked = null,
 };
 
 const WireDatagram = struct {
@@ -1325,11 +1340,15 @@ fn ringWrite(d: *Dgram, off: usize, in: []const u8) void {
     @memcpy(d.ring[0 .. in.len - first], in[first..]);
 }
 
-/// `close`: frees the socket, its port and its queue. Datagrams already on
-/// the wire to its address land in whatever socket holds that address then.
+/// `close`: frees the socket, its port and its queue, and wakes an ev op
+/// parked on it. Datagrams already on the wire to its address land in
+/// whatever socket holds that address then.
 pub fn dgramClose(fd: i32) void {
     refuseOtherThread("sim socket close");
     const d = dgramSlot("close", fd);
+    // A real backend leaves such an op waiting for ever; the sim ends it, so
+    // a test of close does not hang. It completes FileDescriptorNotASocket.
+    wakeParked(d);
     freeQueue(d);
     d.* = .{};
 }
@@ -1342,6 +1361,35 @@ pub fn datagramStats(fd: i32) DatagramStats {
 /// Datagrams that landed where no socket was bound, in this run.
 pub fn datagramsDroppedNoSocket() u64 {
     return dropped_no_socket;
+}
+
+// The ev ops on a datagram socket (`Loop.submitSimDgram`): each gets an op id
+// at submit. One that has its result at once is due now, with no seeded
+// delay; one that must wait for a datagram parks on the socket.
+
+pub fn dgramOpStart(c: *anyopaque) u32 {
+    return allocOpId(c);
+}
+
+pub fn dgramOpDone(c: *anyopaque, id: u32) void {
+    pushDueAt(c, .dgram, id, clock_ns);
+}
+
+pub fn dgramPark(fd: i32, c: *anyopaque, id: u32) void {
+    const d = dgramSlot("an ev receive or poll", fd);
+    if (d.parked != null) panic("sim: two ev ops parked on sim datagram socket {d}", .{fd});
+    d.parked = .{ .c = c, .id = id };
+}
+
+pub fn dgramIsOpen(fd: i32) bool {
+    if (fd < fd_base + max_ends or fd >= fd_base + sim_fd_count) return false;
+    return dgrams[@intCast(fd - fd_base - max_ends)].used;
+}
+
+/// `poll` with a zero timeout: readable when a datagram is queued; a
+/// datagram socket is always writable (send pressure is not modelled).
+pub fn dgramReadable(fd: i32) bool {
+    return dgramSlot("poll", fd).meta_len > 0;
 }
 
 fn receiverOf(to: Ip4) ?*Dgram {
@@ -1371,6 +1419,13 @@ fn land(w: WireDatagram) void {
     d.ring_used += w.bytes.len;
     d.charged += cost;
     d.stats.received += 1;
+    wakeParked(d);
+}
+
+fn wakeParked(d: *Dgram) void {
+    const p = d.parked orelse return;
+    d.parked = null;
+    pushDueAt(p.c, .dgram, p.id, clock_ns);
 }
 
 fn sameFlow(a: WireDatagram, b: WireDatagram) bool {
@@ -3260,8 +3315,68 @@ const dg = struct {
         o.stack_pool.shrink_interval = .zero;
         const rt = try rt_mod.Runtime.init(std.heap.page_allocator, o);
         defer rt.deinit();
+        runtime = rt;
         var h = try rt.spawn(body, .{});
         try h.join();
+    }
+
+    /// The runtime of the run in progress, for a body that spawns tasks.
+    var runtime: *rt_mod.Runtime = undefined;
+
+    const ev = @import("ev/root.zig");
+    const io_common = @import("common.zig");
+
+    /// zio's own receive (`net.Socket.receiveFrom`'s ev op), on a sim fd.
+    fn evRecvFrom(fd: i32, buf: []u8) !struct { len: usize, from: Ip4 } {
+        var iov: [1]os_net.iovec = undefined;
+        var from: os_net.sockaddr.in = undefined;
+        var from_len: os_net.socklen_t = @sizeOf(os_net.sockaddr.in);
+        var op = ev.NetRecvFrom.init(fd, .fromSlice(buf, &iov), .{}, @ptrCast(&from), &from_len);
+        try io_common.waitForIo(&op.c);
+        const n = try op.getResult();
+        return .{ .len = n, .from = .{ .ip = @bitCast(from.addr), .port = std.mem.bigToNative(u16, from.port) } };
+    }
+
+    /// zio's own send of two buffers as one datagram (`NetSendTo`).
+    fn evSendTo2(fd: i32, to: os_net.sockaddr.in, a: []const u8, b: []const u8) !usize {
+        var iov = [2]os_net.iovec_const{ os_net.iovecConstFromSlice(a), os_net.iovecConstFromSlice(b) };
+        var op = ev.NetSendTo.init(fd, .{ .iovecs = &iov }, .{}, @ptrCast(&to), @sizeOf(os_net.sockaddr.in));
+        try io_common.waitForIo(&op.c);
+        return op.getResult();
+    }
+
+    fn evPoll(fd: i32, event: ev.NetPoll.Event) !void {
+        var op = ev.NetPoll.init(fd, event);
+        try io_common.waitForIo(&op.c);
+        try op.getResult();
+    }
+
+    fn evOpen() !i32 {
+        var op = ev.NetOpen.init(.ipv4, .dgram, .ip, .{ .nonblocking = true });
+        try io_common.waitForIo(&op.c);
+        return op.getResult();
+    }
+
+    fn evBind(fd: i32, a: os_net.sockaddr.in) !Ip4 {
+        var sa = a;
+        var len: os_net.socklen_t = @sizeOf(os_net.sockaddr.in);
+        var op = ev.NetBind.init(fd, @ptrCast(&sa), &len);
+        try io_common.waitForIo(&op.c);
+        try op.getResult();
+        return .{ .ip = @bitCast(sa.addr), .port = std.mem.bigToNative(u16, sa.port) };
+    }
+
+    fn evClose(fd: i32) void {
+        var op = ev.NetClose.init(fd);
+        io_common.waitForIoUncancelable(&op.c);
+        op.getResult() catch {};
+    }
+
+    /// `poll(fd, events, 0)` through the socket layer: the revents.
+    fn pollNow(fd: i32, events: i16) !i16 {
+        var fds = [1]os_net.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
+        _ = try os_net.poll(&fds, 0);
+        return fds[0].revents;
     }
 
     fn open() !i32 {
@@ -3924,6 +4039,234 @@ test "sim: fd namespace: a datagram socket opened after the soft limit was raise
             begin(1);
             try p1.raiseSoftLimit();
             _ = try dgramOpen(true);
+        }
+    }.body);
+}
+
+// ---- Phase 1, slice 2: readiness and the ev ops on datagram sockets ----
+
+test "sim: dgram ev: the layer sends two buffers to an ev receiver, and an ev send of two buffers reaches the layer, whole, with sources" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            const ev_fd = try dg.evOpen();
+            const ev_addr = try dg.evBind(ev_fd, dg.addr(127, 0, 0, 1, 0));
+            try std.testing.expectEqual(Ip4{ .ip = .{ 127, 0, 0, 1 }, .port = 49152 }, ev_addr);
+            const c_fd = try dg.open();
+            try dg.bindTo(c_fd, dg.addr(127, 0, 0, 1, 0));
+            // Layer to ev.
+            _ = try dg.sendTo(c_fd, dg.addr(127, 0, 0, 1, 49152), &.{ "hel", "lo" });
+            var buf: [16]u8 = undefined;
+            const got = try dg.evRecvFrom(ev_fd, &buf);
+            try std.testing.expectEqualStrings("hello", buf[0..got.len]);
+            try std.testing.expectEqual(Ip4{ .ip = .{ 127, 0, 0, 1 }, .port = 49153 }, got.from);
+            // Ev to layer.
+            try std.testing.expectEqual(@as(usize, 6), try dg.evSendTo2(ev_fd, dg.addr(127, 0, 0, 1, 49153), "wor", "ld!"));
+            try dg.settle();
+            var b1: [2]u8 = undefined;
+            var b2: [8]u8 = undefined;
+            const back = try dg.recvInto(c_fd, &.{ &b1, &b2 });
+            try std.testing.expectEqual(@as(usize, 6), back.info.len);
+            try std.testing.expectEqualStrings("wo", &b1);
+            try std.testing.expectEqualStrings("rld!", b2[0..4]);
+            try std.testing.expectEqual(Ip4{ .ip = .{ 127, 0, 0, 1 }, .port = 49152 }, back.from);
+            dg.evClose(ev_fd);
+        }
+    }.body);
+}
+
+test "sim: dgram ev: poll with a zero timeout reports readable only once a datagram has landed, and writable always" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            const rx = try dg.open();
+            const tx = try dg.open();
+            try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
+            const IN = dg.os_net.POLL.IN;
+            const OUT = dg.os_net.POLL.OUT;
+            try std.testing.expectEqual(@as(i16, OUT), try dg.pollNow(rx, IN | OUT));
+            _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 49152), null, "x");
+            try std.testing.expectEqual(@as(i16, 0), try dg.pollNow(rx, IN));
+            try dg.settle();
+            try std.testing.expectEqual(@as(i16, IN), try dg.pollNow(rx, IN));
+            try std.testing.expectEqual(dg.os_net.PollOutcome{ .ready = IN }, try dg.os_net.pollInterruptible(rx, IN, 0));
+            var buf: [1]u8 = undefined;
+            _ = try dg.recvInto(rx, &.{&buf});
+            try std.testing.expectEqual(@as(i16, 0), try dg.pollNow(rx, IN));
+            try std.testing.expectEqual(dg.os_net.PollOutcome.timed_out, try dg.os_net.pollInterruptible(rx, IN, 0));
+        }
+    }.body);
+}
+
+const dg_park = struct {
+    var rx: i32 = 0;
+    var tx: i32 = 0;
+    var woke_at: u64 = 0;
+    var sent_at: u64 = 0;
+    var result: anyerror!void = {};
+    var got: [8]u8 = undefined;
+    var got_len: usize = 0;
+
+    fn pollThenRecord() void {
+        result = dg.evPoll(rx, .recv);
+        woke_at = clockNs();
+    }
+
+    fn recvThenRecord() void {
+        if (dg.evRecvFrom(rx, &got)) |r| {
+            got_len = r.len;
+            result = {};
+        } else |err| result = err;
+        woke_at = clockNs();
+    }
+};
+
+test "sim: dgram ev: a poll parked before the datagram is sent wakes when it lands, with no second send, and rearms" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            dg_park.rx = try dg.open();
+            dg_park.tx = try dg.open();
+            try dg.bindTo(dg_park.rx, dg.addr(127, 0, 0, 1, 0));
+            var round: usize = 0;
+            while (round < 2) : (round += 1) {
+                dg_park.woke_at = 0;
+                var h = try dg.runtime.spawn(dg_park.pollThenRecord, .{});
+                // Let the poll park: a sleep of 1 ms with nothing on the wire.
+                try dg.rt_mod.sleep(.fromMilliseconds(1));
+                try std.testing.expectEqual(@as(u64, 0), dg_park.woke_at);
+                dg_park.sent_at = clockNs();
+                _ = try dg.sendFrom(dg_park.tx, dg.addr(127, 0, 0, 1, 49152), null, "x");
+                h.join();
+                try dg_park.result;
+                try std.testing.expectEqual(dg_park.sent_at + wire_latency_ns, dg_park.woke_at);
+                var buf: [1]u8 = undefined;
+                _ = try dg.recvInto(dg_park.rx, &.{&buf});
+            }
+        }
+    }.body);
+}
+
+test "sim: dgram ev: a parked receive that is canceled gives Canceled, and the next datagram is still there for the next receive" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            dg_park.rx = try dg.open();
+            dg_park.tx = try dg.open();
+            try dg.bindTo(dg_park.rx, dg.addr(127, 0, 0, 1, 0));
+            var h = try dg.runtime.spawn(dg_park.recvThenRecord, .{});
+            try dg.rt_mod.sleep(.fromMilliseconds(1));
+            h.cancel();
+            try std.testing.expectError(error.Canceled, dg_park.result);
+            _ = try dg.sendFrom(dg_park.tx, dg.addr(127, 0, 0, 1, 49152), null, "kept");
+            var buf: [8]u8 = undefined;
+            const got = try dg.evRecvFrom(dg_park.rx, &buf);
+            try std.testing.expectEqualStrings("kept", buf[0..got.len]);
+        }
+    }.body);
+}
+
+test "sim: dgram ev: close wakes an ev receive parked on the socket" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            dg_park.rx = try dg.open();
+            try dg.bindTo(dg_park.rx, dg.addr(127, 0, 0, 1, 0));
+            dg_park.woke_at = 0;
+            var h = try dg.runtime.spawn(dg_park.recvThenRecord, .{});
+            try dg.rt_mod.sleep(.fromMilliseconds(1));
+            try std.testing.expectEqual(@as(u64, 0), dg_park.woke_at);
+            const closed_at = clockNs();
+            dg.evClose(dg_park.rx);
+            h.join();
+            try std.testing.expectError(error.FileDescriptorNotASocket, dg_park.result);
+            try std.testing.expectEqual(closed_at, dg_park.woke_at);
+        }
+    }.body);
+}
+
+test "sim: dgram ev: an ev receive with a datagram already queued and a poll for writing complete at once, and a receive with dontwait and none queued is WouldBlock" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            const rx = try dg.evOpen();
+            _ = try dg.evBind(rx, dg.addr(127, 0, 0, 1, 0));
+            var buf: [4]u8 = undefined;
+            var iov: [1]dg.os_net.iovec = undefined;
+            var op = dg.ev.NetRecvFrom.init(rx, .fromSlice(&buf, &iov), .{ .dontwait = true }, null, null);
+            try dg.io_common.waitForIo(&op.c);
+            try std.testing.expectError(error.WouldBlock, op.getResult());
+            const tx = try dg.open();
+            _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 49152), null, "now");
+            try dg.settle();
+            const before = clockNs();
+            const got = try dg.evRecvFrom(rx, &buf);
+            try std.testing.expectEqualStrings("now", buf[0..got.len]);
+            try std.testing.expectEqual(before, clockNs());
+            // A poll for writing completes at once: a datagram socket is
+            // always writable here.
+            try dg.evPoll(rx, .send);
+            try std.testing.expectEqual(before, clockNs());
+        }
+    }.body);
+}
+
+test "sim: dgram ev refuses: a real fd in a sim op" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram ev refuses: a real fd in a sim op", "sim: a real fd 0 reached sim op net_recvfrom during a run", struct {
+        fn body() !void {
+            try r3.up();
+            var buf: [4]u8 = undefined;
+            _ = try dg.evRecvFrom(0, &buf);
+        }
+    }.body);
+}
+
+test "sim: dgram ev refuses: two ev ops parked on one socket" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram ev refuses: two ev ops parked on one socket", "sim: two ev ops parked on sim datagram socket 100032", struct {
+        fn body() !void {
+            try r3.up();
+            dg_park.rx = try dg.open();
+            try dg.bindTo(dg_park.rx, dg.addr(127, 0, 0, 1, 0));
+            _ = try r3.rt.spawn(dg_park.recvThenRecord, .{});
+            _ = try r3.rt.spawn(dg_park.pollThenRecord, .{});
+            try r3.rt.sleep(.fromMilliseconds(1));
+        }
+    }.body);
+}
+
+test "sim: dgram ev refuses: a poll with a positive timeout on a sim fd" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram ev refuses: a poll with a positive timeout on a sim fd", "sim: a poll with a timeout of 10 ms on sim fds: only a zero timeout is allowed", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            var fds = [1]dg.os_net.pollfd{.{ .fd = fd, .events = dg.os_net.POLL.IN, .revents = 0 }};
+            _ = try dg.os_net.poll(&fds, 10);
+        }
+    }.body);
+}
+
+test "sim: dgram ev refuses: a poll that mixes sim and real fds" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram ev refuses: a poll that mixes sim and real fds", "sim: a poll of 1 sim fds and 1 real fds: they cannot be mixed", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            var fds = [2]dg.os_net.pollfd{ .{ .fd = fd, .events = dg.os_net.POLL.IN, .revents = 0 }, .{ .fd = 0, .events = dg.os_net.POLL.IN, .revents = 0 } };
+            _ = try dg.os_net.poll(&fds, 0);
+        }
+    }.body);
+}
+
+test "sim: dgram ev refuses: pollInterruptible with a positive timeout on a sim fd" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram ev refuses: pollInterruptible with a positive timeout on a sim fd", "sim: a poll with a timeout of 5 ms on sim fds: only a zero timeout is allowed", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            _ = try dg.os_net.pollInterruptible(fd, dg.os_net.POLL.IN, 5);
         }
     }.body);
 }

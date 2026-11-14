@@ -20,6 +20,11 @@ const NetSend = @import("completion.zig").NetSend;
 const NetRecv = @import("completion.zig").NetRecv;
 const NetClose = @import("completion.zig").NetClose;
 const NetShutdown = @import("completion.zig").NetShutdown;
+const NetSendTo = @import("completion.zig").NetSendTo;
+const NetRecvFrom = @import("completion.zig").NetRecvFrom;
+const NetSendMsg = @import("completion.zig").NetSendMsg;
+const NetRecvMsg = @import("completion.zig").NetRecvMsg;
+const NetPoll = @import("completion.zig").NetPoll;
 const WallTimerMode = @import("completion.zig").WallTimerMode;
 const NetSendFile = @import("completion.zig").NetSendFile;
 const ReadBuf = @import("buf.zig").ReadBuf;
@@ -1749,11 +1754,28 @@ pub const Loop = struct {
         return out[0..buf.iovecs.len];
     }
 
-    /// Sim: start a net op on a `sim.pipePair` end, scattering or gathering
-    /// across every iovec. A result the pipe can give now is set here and
-    /// delivered after a seeded delay (`harvestSimIo`); otherwise the op
-    /// parks on the pipe.
+    /// Sim: the fd a net op names, or null for one that names none.
+    fn simOpHandle(c: *Completion) ?i32 {
+        return switch (c.op) {
+            .net_open => null,
+            inline .net_bind, .net_listen, .net_connect, .net_accept, .net_recv, .net_send, .net_recvfrom, .net_sendto, .net_recvmsg, .net_recvmmsg, .net_sendmsg, .net_sendmmsg, .net_poll, .net_shutdown, .net_close => |op| c.cast(op.toType()).handle,
+            else => null,
+        };
+    }
+
+    /// Sim: start a net op. On a sim datagram socket (and every `net_open`
+    /// during a run) it goes to `submitSimDgram`. On a `sim.pipePair` end it
+    /// scatters or gathers across every iovec: a result the pipe can give
+    /// now is set here and delivered after a seeded delay (`harvestSimIo`);
+    /// otherwise the op parks on the pipe. A real fd never gets here: during
+    /// a run that is input at a real time, so it refuses.
     fn submitSimIo(self: *Loop, c: *Completion) void {
+        if (simOpHandle(c)) |h| {
+            if (!sim.isSimFd(h)) sim.panic("sim: a real fd {d} reached sim op {s} during a run", .{ h, @tagName(c.op) });
+            if (sim.isDgramFd(h)) return submitSimDgram(c);
+        } else if (c.op == .net_open) {
+            return submitSimDgram(c);
+        }
         switch (c.op) {
             .net_recv => {
                 const op = c.cast(NetRecv);
@@ -1806,6 +1828,80 @@ pub const Loop = struct {
         }
     }
 
+    /// Sim: an ev op on a sim datagram socket. It does what the poll backend
+    /// does once the socket is ready, through the same socket-layer calls
+    /// (their sim branch, src/os/net.zig) and the same shared helpers for
+    /// open, bind, shutdown and close. Where that backend would wait for
+    /// readiness (a receive with nothing queued, a poll for reading), the op
+    /// parks on the socket, and the datagram's landing makes it due
+    /// (`sim.land`). A result is due at once, with no seeded delay: unlike a
+    /// pipe, a datagram's timing is the wire's (`sim.wire_latency_ns`).
+    fn submitSimDgram(c: *Completion) void {
+        const id = sim.dgramOpStart(c);
+        if (tryDgramOp(c)) {
+            sim.dgramOpDone(c, id);
+        } else {
+            sim.dgramPark(simOpHandle(c).?, c, id);
+        }
+    }
+
+    /// Does a datagram op now if it can; false when it must wait for a
+    /// datagram. The socket layer's receive is called with `dontwait`: the
+    /// op parks instead of the layer refusing a blocking receive.
+    fn tryDgramOp(c: *Completion) bool {
+        switch (c.op) {
+            .net_open => common.handleNetOpen(c),
+            .net_bind => common.handleNetBind(c),
+            .net_shutdown => common.handleNetShutdown(c),
+            .net_close => common.handleNetClose(c),
+            .net_send => {
+                const op = c.cast(NetSend);
+                if (net.send(op.handle, op.buffer.iovecs, op.flags)) |n| c.setResult(.net_send, n) else |err| c.setError(err);
+            },
+            .net_recv => {
+                const op = c.cast(NetRecv);
+                if (net.recv(op.handle, op.buffers.iovecs, op.flags)) |n| c.setResult(.net_recv, n) else |err| c.setError(err);
+            },
+            .net_sendto => {
+                const op = c.cast(NetSendTo);
+                if (net.sendto(op.handle, op.buffer.iovecs, op.flags, op.addr, op.addr_len)) |n| c.setResult(.net_sendto, n) else |err| c.setError(err);
+            },
+            .net_sendmsg => {
+                const op = c.cast(NetSendMsg);
+                if (net.sendmsg(op.handle, op.data.iovecs, op.flags, op.addr, op.addr_len, op.control)) |n| c.setResult(.net_sendmsg, n) else |err| c.setError(err);
+            },
+            .net_recvfrom => {
+                const op = c.cast(NetRecvFrom);
+                var flags = op.flags;
+                flags.dontwait = true;
+                if (net.recvfrom(op.handle, op.buffer.iovecs, flags, op.addr, op.addr_len)) |n| {
+                    c.setResult(.net_recvfrom, n);
+                } else |err| switch (err) {
+                    error.WouldBlock => if (op.flags.dontwait) c.setError(err) else return false,
+                    else => c.setError(err),
+                }
+            },
+            .net_recvmsg => {
+                const op = c.cast(NetRecvMsg);
+                var flags = op.flags;
+                flags.dontwait = true;
+                if (net.recvmsg(op.handle, op.data.iovecs, flags, op.addr, op.addr_len, op.control)) |r| {
+                    c.setResult(.net_recvmsg, r);
+                } else |err| switch (err) {
+                    error.WouldBlock => if (op.flags.dontwait) c.setError(err) else return false,
+                    else => c.setError(err),
+                }
+            },
+            .net_poll => {
+                const op = c.cast(NetPoll);
+                if (op.event == .recv and !sim.dgramReadable(op.handle)) return false;
+                c.setResult(.net_poll, {});
+            },
+            else => sim.panic("sim: unsimulated I/O op {s} on a datagram socket", .{@tagName(c.op)}),
+        }
+        return true;
+    }
+
     /// Sim: called from `cancelLocal`, inside the pin's cancel pass. An op
     /// that already has its result keeps it (the cancel lost the race);
     /// otherwise it ends `Canceled`. `cancelLocal`'s epilogue dispatches.
@@ -1824,6 +1920,17 @@ pub const Loop = struct {
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const c: *Completion = @ptrCast(@alignCast(buf[i].c));
+            if (!c.has_result) dgram: {
+                // A parked datagram op that a landing or a close made due.
+                const h = simOpHandle(c) orelse break :dgram;
+                if (!sim.isDgramFd(h)) break :dgram;
+                if (!sim.dgramIsOpen(h)) {
+                    c.setError(error.FileDescriptorNotASocket);
+                } else if (!tryDgramOp(c)) {
+                    sim.dgramPark(h, c, buf[i].id);
+                    continue;
+                }
+            }
             if (!c.has_result) {
                 switch (c.op) {
                     .net_recv => {

@@ -120,6 +120,9 @@ pub const PollError = error{
 };
 
 pub fn poll(fds: []pollfd, timeout: i32) PollError!usize {
+    if (comptime sim_layer) {
+        if (simPoll(fds, timeout)) |n| return n;
+    }
     switch (builtin.os.tag) {
         .windows => {
             while (true) {
@@ -1950,7 +1953,56 @@ fn destinationFromControl(control: []const u8) ?[4]u8 {
     return null;
 }
 
+pub const PollOutcome = union(enum) {
+    /// The `revents` the kernel returned.
+    ready: i16,
+    timed_out,
+    /// A signal interrupted the wait (EINTR). `poll` retries instead.
+    interrupted,
+};
+
+/// One `poll` of one fd, for a caller that must see a signal: EINTR returns
+/// `.interrupted` instead of being retried. ENet's `enet_socket_wait` reports
+/// it as `ENET_SOCKET_WAIT_INTERRUPT`. Under sim, a sim fd takes a zero
+/// timeout only (it can never be interrupted then); a positive one refuses.
+pub fn pollInterruptible(fd: fd_t, events: i16, timeout_ms: i32) PollError!PollOutcome {
+    if (comptime builtin.os.tag == .windows) @compileError("pollInterruptible: not on Windows yet");
+    var fds = [1]pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
+    if (comptime sim_layer) {
+        if (simPoll(&fds, timeout_ms)) |n| return if (n == 0) .timed_out else .{ .ready = fds[0].revents };
+    }
+    const rc = posix.system.poll(&fds, 1, timeout_ms);
+    return switch (posix.errno(rc)) {
+        .SUCCESS => if (rc == 0) .timed_out else .{ .ready = fds[0].revents },
+        .INTR => .interrupted,
+        .INVAL, .NOMEM => error.SystemResources,
+        else => |err| unexpectedError(err),
+    };
+}
+
 // ---- The sim branch's helpers (only with sim, never on Windows) ----
+
+/// `poll` over sim fds: null when none of `fds` is a sim fd. A sim fd is
+/// readable when a datagram is queued, and always writable. Nothing can land
+/// while the sim thread waits, so only a zero timeout is allowed, and real and
+/// sim fds cannot be mixed in one call.
+fn simPoll(fds: []pollfd, timeout: i32) ?usize {
+    var sim_fds: usize = 0;
+    for (fds) |f| {
+        if (sim.isSimFd(f.fd)) sim_fds += 1;
+    }
+    if (sim_fds == 0) return null;
+    if (sim_fds != fds.len) sim.panic("sim: a poll of {d} sim fds and {d} real fds: they cannot be mixed", .{ sim_fds, fds.len - sim_fds });
+    if (timeout != 0) sim.panic("sim: a poll with a timeout of {d} ms on sim fds: only a zero timeout is allowed", .{timeout});
+    var ready: usize = 0;
+    for (fds) |*f| {
+        f.revents = 0;
+        if (f.events & POLL.IN != 0 and sim.dgramReadable(f.fd)) f.revents |= POLL.IN;
+        if (f.events & POLL.OUT != 0) f.revents |= POLL.OUT;
+        if (f.revents != 0) ready += 1;
+    }
+    return ready;
+}
 
 const sim_max_iovecs = 16;
 
@@ -2492,4 +2544,47 @@ test "setNonBlocking and isNonBlocking agree with each other and with socket's f
     const nb = try real_dgram.open();
     defer close(nb);
     try std.testing.expect(try isNonBlocking(nb));
+}
+
+test "pollInterruptible: ready when a datagram is queued, timed out when none comes" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const rx = try real_dgram.open();
+    defer close(rx);
+    const tx = try real_dgram.open();
+    defer close(tx);
+    const port = try real_dgram.bindAt(rx, .{ 127, 0, 0, 1 });
+    try std.testing.expectEqual(PollOutcome.timed_out, try pollInterruptible(rx, POLL.IN, 10));
+    _ = try real_dgram.send1(tx, real_dgram.in4(.{ 127, 0, 0, 1 }, port), null, "x");
+    try std.testing.expectEqual(PollOutcome{ .ready = POLL.IN }, try pollInterruptible(rx, POLL.IN, 1000));
+}
+
+test "pollInterruptible: a signal during the wait is .interrupted, where poll would retry" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const fd = try real_dgram.open();
+    defer close(fd);
+    _ = try real_dgram.bindAt(fd, .{ 127, 0, 0, 1 });
+    const S = struct {
+        var done: std.atomic.Value(bool) = .init(false);
+        fn handler(_: posix.SIG) callconv(.c) void {}
+        /// Signals the polling thread until it reports back, so a signal
+        /// that arrives before the poll starts cannot make the test wait out
+        /// its timeout.
+        fn kicker(target: std.c.pthread_t) void {
+            while (!done.load(.acquire)) {
+                _ = std.c.pthread_kill(target, posix.SIG.USR2);
+                @import("time.zig").sleep(.fromMilliseconds(20));
+            }
+        }
+    };
+    // No SA_RESTART: the kernel ends the poll with EINTR.
+    const act: posix.Sigaction = .{ .handler = .{ .handler = S.handler }, .mask = posix.sigemptyset(), .flags = 0 };
+    var old: posix.Sigaction = undefined;
+    posix.sigaction(posix.SIG.USR2, &act, &old);
+    defer posix.sigaction(posix.SIG.USR2, &old, null);
+    S.done.store(false, .release);
+    const t = try std.Thread.spawn(.{}, S.kicker, .{std.c.pthread_self()});
+    const outcome = pollInterruptible(fd, POLL.IN, 5000);
+    S.done.store(true, .release);
+    t.join();
+    try std.testing.expectEqual(PollOutcome.interrupted, try outcome);
 }
