@@ -19,6 +19,8 @@ const FileRead = @import("completion.zig").FileRead;
 const NetSend = @import("completion.zig").NetSend;
 const NetRecv = @import("completion.zig").NetRecv;
 const NetClose = @import("completion.zig").NetClose;
+const NetConnect = @import("completion.zig").NetConnect;
+const NetAccept = @import("completion.zig").NetAccept;
 const NetShutdown = @import("completion.zig").NetShutdown;
 const NetSendTo = @import("completion.zig").NetSendTo;
 const NetRecvFrom = @import("completion.zig").NetRecvFrom;
@@ -1762,6 +1764,7 @@ pub const Loop = struct {
         sim.claimLoopGroup(self.loop_group, "a loop of another group submitted an op");
         if (simOpHandle(c)) |h| {
             if (!sim.isSimFd(h)) sim.panic("sim: a real fd {d} reached sim op {s} during a run", .{ h, @tagName(c.op) });
+            if (sim.isStreamFd(h)) return submitSimStream(c, h);
             if (sim.isDgramFd(h)) return submitSimDgram(c);
         } else if (c.op == .net_open) {
             return submitSimDgram(c);
@@ -1876,6 +1879,66 @@ pub const Loop = struct {
         }
     }
 
+    /// Sim: an ev op on a sim stream socket (design section 17; slice 1).
+    /// Bind, listen and close go through the socket layer as on a datagram
+    /// socket, and are due now. Connect and accept are the sim's own
+    /// (`sim.streamConnect`, `sim.streamAccept`): a connect always parks
+    /// until its SYN-ACK or RST lands; an accept takes a queued connection
+    /// now, or parks until an ACK lands. Every other op on a stream socket
+    /// refuses by name: the byte paths, shutdown and poll come with slice 2,
+    /// and the datagram calls never apply.
+    fn submitSimStream(c: *Completion, h: i32) void {
+        const id = sim.streamOpStart(c, h);
+        switch (c.op) {
+            .net_bind => common.handleNetBind(c),
+            .net_listen => common.handleNetListen(c),
+            .net_close => common.handleNetClose(c),
+            .net_connect => {
+                const op = c.cast(NetConnect);
+                // Parked unless it failed before its SYN.
+                sim.streamConnect(h, net.simAddr("connect", op.addr, op.addr_len), c, id) catch |err| {
+                    c.setError(err);
+                    sim.streamOpDone(c, id);
+                };
+                return;
+            },
+            .net_accept => {
+                const op = c.cast(NetAccept);
+                const a = sim.streamAccept(h, c, id, op.flags.nonblocking) orelse return;
+                simAccepted(op, a);
+            },
+            .net_poll => sim.panic("sim: NetPoll on sim stream socket {d} is refused: no supported stream path polls (design 17.4)", .{h}),
+            .net_recv => sim.refuseStream("NetRecv", h),
+            .net_send => sim.refuseStream("NetSend", h),
+            .net_shutdown => sim.refuseStream("NetShutdown", h),
+            else => sim.panic("sim: {s} on sim stream socket {d} is not simulated", .{ @tagName(c.op), h }),
+        }
+        sim.streamOpDone(c, id);
+    }
+
+    fn simAccepted(op: *NetAccept, a: sim.Accepted) void {
+        if (op.addr) |out| net.writeSimAddr(a.peer, out, op.addr_len orelse sim.panic("sim: accept with an address but no length", .{}));
+        op.c.setResult(.net_accept, a.fd);
+    }
+
+    /// Sim: a woken connect or accept at its harvest (design 17.6, the
+    /// harvest lists): its socket's generation first, then its result.
+    fn harvestSimStream(c: *Completion, id: u32) void {
+        const h = simOpHandle(c).?;
+        if (!sim.streamOpOnItsSocket(c, id, h)) return c.setError(error.FileDescriptorNotASocket);
+        switch (c.op) {
+            .net_connect => {
+                sim.streamHarvestConnect(h) catch |err| return c.setError(err);
+                c.setResult(.net_connect, {});
+            },
+            .net_accept => {
+                const op = c.cast(NetAccept);
+                simAccepted(op, sim.streamHarvestAccept(h, op.flags.nonblocking));
+            },
+            else => sim.panic("sim: a woken {s} on a stream socket: only a connect or an accept waits", .{@tagName(c.op)}),
+        }
+    }
+
     /// Does a datagram op now if it can; false when it must wait for a
     /// datagram. The socket layer's receive is called with `dontwait`: the
     /// op parks instead of the layer refusing a blocking receive.
@@ -1960,6 +2023,7 @@ pub const Loop = struct {
             // exact submit (pointer and op id) is still live.
             if (!sim.isLive(buf[i].c, buf[i].id)) continue;
             const c: *Completion = @ptrCast(@alignCast(buf[i].c));
+            if (!c.has_result and sim.isStreamOp(buf[i].c, buf[i].id)) harvestSimStream(c, buf[i].id);
             if (!c.has_result) dgram: {
                 // A parked datagram op that a landing or a close made due. It
                 // must still have the socket it was submitted on: an earlier

@@ -161,6 +161,7 @@ pub fn poll(fds: []pollfd, timeout: i32) PollError!usize {
 
 pub fn close(fd: fd_t) void {
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return sim.streamClose(fd);
         if (sim.isDgramFd(fd)) return sim.dgramClose(fd);
         sim.refuseSimFd(@src(), fd);
     }
@@ -203,6 +204,7 @@ pub const ShutdownError = error{
 
 pub fn shutdown(fd: fd_t, how: ShutdownHow) ShutdownError!void {
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("shutdown", fd);
         // An unconnected UDP socket: ENOTCONN, as Linux answers.
         if (sim.isDgramFd(fd)) return error.SocketUnconnected;
         sim.refuseSimFd(@src(), fd);
@@ -345,8 +347,11 @@ fn disableUdpResetReports(sock: fd_t) void {
 pub fn socket(domain: Domain, socket_type: Type, protocol: Protocol, flags: OpenFlags) OpenError!fd_t {
     if (comptime sim_layer) {
         if (sim.isRunning()) {
+            if (domain == .ipv4 and socket_type == .stream and (protocol == .ip or protocol == .tcp)) {
+                return sim.streamOpen(flags.nonblocking);
+            }
             if (domain != .ipv4 or socket_type != .dgram or (protocol != .ip and protocol != .udp)) {
-                sim.panic("sim: socket({t}, {t}, {t}) during a sim run: only IPv4 datagram sockets are simulated", .{ domain, socket_type, protocol });
+                sim.panic("sim: socket({t}, {t}, {t}) during a sim run: only IPv4 datagram and stream sockets are simulated", .{ domain, socket_type, protocol });
             }
             return sim.dgramOpen(flags.nonblocking);
         }
@@ -549,6 +554,7 @@ pub fn errnoToBindError(err: E) BindError {
 
 pub fn bind(fd: fd_t, addr: *const sockaddr, addr_len: socklen_t) BindError!void {
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return sim.streamBind(fd, simAddr("bind", addr, addr_len));
         if (sim.isSimFd(fd)) return sim.dgramBind(fd, simAddr("bind", addr, addr_len));
     }
     switch (builtin.os.tag) {
@@ -613,6 +619,7 @@ pub fn errnoToListenError(err: E) ListenError {
 
 pub fn listen(fd: fd_t, backlog: u31) ListenError!void {
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return sim.streamListen(fd, backlog);
         if (sim.isDgramFd(fd)) return error.OperationNotSupported;
         sim.refuseSimFd(@src(), fd);
     }
@@ -663,6 +670,9 @@ pub const ConnectError = error{
 
 pub fn connect(fd: fd_t, addr: *const sockaddr, addr_len: socklen_t) ConnectError!void {
     if (comptime sim_layer) {
+        // Under sim the loop dispatches NetConnect itself (`sim.streamConnect`);
+        // only the native backends call this.
+        if (sim.isStreamFd(fd)) sim.panic("sim: the socket layer's connect on sim stream socket {d}: not reached under sim (only the native backends call it)", .{fd});
         if (sim.isDgramFd(fd)) sim.panic("sim: connect on sim datagram socket {d}: connected UDP is not simulated", .{fd});
         sim.refuseSimFd(@src(), fd);
     }
@@ -705,6 +715,8 @@ pub const AcceptError = error{
 
 pub fn accept(fd: fd_t, addr: ?*sockaddr, addr_len: ?*socklen_t, flags: OpenFlags) AcceptError!fd_t {
     if (comptime sim_layer) {
+        // Under sim the loop dispatches NetAccept itself (`sim.streamAccept`).
+        if (sim.isStreamFd(fd)) sim.panic("sim: the socket layer's accept on sim stream socket {d}: not reached under sim (only the native backends call it)", .{fd});
         if (sim.isDgramFd(fd)) return error.OperationNotSupported;
         sim.refuseSimFd(@src(), fd);
     }
@@ -786,6 +798,7 @@ pub const GetSockNameError = error{Unexpected};
 
 pub fn getsockname(fd: fd_t, addr: *sockaddr, addr_len: *socklen_t) GetSockNameError!void {
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return writeSimAddr(sim.streamLocal(fd), addr, addr_len);
         if (sim.isSimFd(fd)) return writeSimAddr(sim.dgramLocal(fd), addr, addr_len);
     }
     switch (builtin.os.tag) {
@@ -816,6 +829,7 @@ pub const SetsockoptError = error{ OptionNotSupported, Unexpected };
 
 pub fn setsockopt(fd: fd_t, level: i32, optname: u32, optval: []const u8) SetsockoptError!void {
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return sim.streamSetOption(fd, level, optname, optval);
         if (sim.isSimFd(fd)) return sim.dgramSetOption(fd, level, optname, optval);
     }
     switch (builtin.os.tag) {
@@ -847,6 +861,7 @@ pub const GetsockoptError = error{Unexpected};
 
 pub fn getsockopt(fd: fd_t, level: i32, optname: u32, optval: []u8) GetsockoptError!void {
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return sim.streamGetOption(fd, level, optname, optval);
         if (sim.isSimFd(fd)) return sim.dgramGetOption(fd, level, optname, optval);
     }
     switch (builtin.os.tag) {
@@ -1166,6 +1181,7 @@ pub const RecvError = error{
 pub fn recv(fd: fd_t, buffers: []iovec, flags: RecvFlags) RecvError!usize {
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's receive", fd);
         if (sim.isDgramFd(fd)) return error.OperationNotSupported;
         sim.refuseSimFd(@src(), fd);
     }
@@ -1291,6 +1307,7 @@ pub const SendError = error{
 pub fn send(fd: fd_t, buffers: []const iovec_const, flags: SendFlags) SendError!usize {
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's send", fd);
         if (sim.isDgramFd(fd)) return error.OperationNotSupported;
         sim.refuseSimFd(@src(), fd);
     }
@@ -1821,6 +1838,7 @@ pub fn sendmsg(
 pub fn setNonBlocking(fd: fd_t, on: bool) error{Unexpected}!void {
     if (comptime builtin.os.tag == .windows) @compileError("setNonBlocking: not on Windows yet");
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return sim.streamSetNonBlocking(fd, on);
         if (sim.isSimFd(fd)) return sim.dgramSetNonBlocking(fd, on);
     }
     const fl = posix.system.fcntl(fd, posix.system.F.GETFL, @as(c_int, 0));
@@ -1843,6 +1861,7 @@ pub fn setNonBlocking(fd: fd_t, on: bool) error{Unexpected}!void {
 pub fn isNonBlocking(fd: fd_t) error{Unexpected}!bool {
     if (comptime builtin.os.tag == .windows) @compileError("isNonBlocking: Windows cannot read a socket's blocking mode back");
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return sim.streamIsNonBlocking(fd);
         if (sim.isSimFd(fd)) return sim.dgramIsNonBlocking(fd);
     }
     const fl = posix.system.fcntl(fd, posix.system.F.GETFL, @as(c_int, 0));
@@ -2053,7 +2072,7 @@ fn simPoll(fds: []pollfd, timeout: i32) ?usize {
     return ready;
 }
 
-fn simAddr(comptime what: []const u8, addr: *const sockaddr, len: socklen_t) sim.Ip4 {
+pub fn simAddr(comptime what: []const u8, addr: *const sockaddr, len: socklen_t) sim.Ip4 {
     // The family is checked once, in `simAddrIn`, before anything else reads
     // the address as IPv4.
     if (len < @sizeOf(sockaddr.in)) sim.panic("sim: " ++ what ++ " with an address of {d} bytes", .{len});
@@ -2071,7 +2090,7 @@ fn simSockaddr(a: sim.Ip4) sockaddr.in {
 
 /// As the kernel does: copies as much of the address as fits, and sets the
 /// length to the address's full size.
-fn writeSimAddr(a: sim.Ip4, out: *sockaddr, out_len: *socklen_t) void {
+pub fn writeSimAddr(a: sim.Ip4, out: *sockaddr, out_len: *socklen_t) void {
     const in = simSockaddr(a);
     const n = @min(@as(usize, @intCast(out_len.*)), @sizeOf(sockaddr.in));
     @memcpy(@as([*]u8, @ptrCast(out))[0..n], std.mem.asBytes(&in)[0..n]);

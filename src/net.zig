@@ -690,6 +690,10 @@ pub const IpAddress = extern union {
     }
 
     pub fn connect(self: IpAddress, options: ConnectOptions) !Stream {
+        // Under sim, before any side effect: on Linux the bind below would
+        // first set IP_BIND_ADDRESS_NO_PORT (design 17.4). Compiled out
+        // without sim.
+        if (options.local_address != null) @import("sim.zig").refuseConnectLocalAddress();
         var socket = try Socket.open(.stream, .fromPosix(self.any.family), .ip);
         errdefer socket.close();
 
