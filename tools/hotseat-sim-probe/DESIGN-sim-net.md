@@ -976,18 +976,67 @@ the mutants in its commits.
   holes; flows sharing a landing instant are still kept out of it).
 - Open and filed: t-4096 (zero-length receive on an empty sim pipe), t-4098
   (the op model's holes above).
-- **Next: the stream track (section 17).**
+- **The stream track (section 17).**
   - Revisions: 1 was 6e854fc; 2 was 2d987f7, with slice 0; 3 was 4e6459f.
-    Revision 3 answers the second outside review (`gpt-simnet10.md`) and
-    the profile ruling.
-  - The grader accepted 17.17's three points and the three open
-    questions of report 25 as recommended.
-  - The upstream sync (fabfbf1) is merged by 1070586. Only design text
-    sits on top of fabfbf1's code.
-  - **Slice 1 starts from this head, with a fresh seat, after the third
-    outside read of revision 3.**
-  - Also open for the sim seat: t-4096 (refuse a zero-room receive,
-    decided yes) and t-4106 (the spawn windows).
+    The grader accepted 17.17's three points and report 25's three open
+    questions as recommended. The third outside read (`gpt-simnet11.md`)
+    is answered slice by slice, with no fourth full round (the grader's
+    ruling).
+  - **Slice 1 is built (sitting 27).** a95fe60 fixed review 3's findings
+    1, 2, 8 and the accept part of 3 in section 17; d613fd1 built the
+    slice; 35972fb made the Windows test binary compile again. Protocol:
+    the comment above `pub const StreamProfile` in `src/sim.zig`. Tests:
+    `src/sim_stream_test.zig`, under the filter `sim: stream`; the
+    surface table is `sim: stream surface table`, the kernel rows `sim:
+    stream parity`. Mutants: `mut/27-s1.json` beside report 27, all
+    killed; d613fd1's message has their table and what was rejected.
+    Report 27 has the gates' commands and output.
+  - **Next: slice 2** (17.16: bytes, chunks, window, credit and
+    conservation; FIN and RST with data; the profiles' send and receive
+    rules; `.both`; linger 0; `getpeername`; `bytesReadable`; the window
+    and chunking settings). Section 17 first gets review 3's findings
+    that block it, one commit, then the code:
+    - **3, the send and receive lists:** split each into a call list
+      and a harvest list, as a95fe60 did for accept. The "unresolved"
+      guard is the call's only; at harvest the op is itself the
+      unresolved one, so the literal send list refuses every woken send
+      (rows 23 and 25).
+    - **4: own `SHUT_WR`, then a peer RST, before any peer FIN.** Under
+      `.linux`, send line 4 (`BrokenPipe`) comes before line 5 (consume
+      the pending reset), and a later read then reports a reset. **No
+      run measures this composed sequence.** Add it to the probe (3 runs
+      on each kernel) before writing the precedence.
+    - **5:** `.both`, then late data in two chunks, under `.linux`: the
+      second chunk can set the local reset again after the first was
+      read. Gate it on "never reported", not on an empty pending slot,
+      and say how a local reset joins the received and reported facts.
+    - **6:** close after a reset with unread bytes takes close line 1
+      and never discards them. Discard and count them on every close,
+      before retirement.
+    - **7:** `.macos`, `.both` with a full window of unread bytes and a
+      parked send: the discard frees room but no credit leaves and the
+      FIN does not wake the sender. Define a window release or a
+      terminal notice, keep reclaimed room apart from bytes read, and
+      keep row 17's trace.
+    - **9:** with no profile, a FIN then an RST, then close with no read
+      or send: the RST landing already chose a profile's answer. Slice 1
+      keeps it profile-neutral (`fin_before_reset`); say so in 17.8 and
+      move the choice to the call, or name the landing as a panic point.
+    - **10:** the probe's blocked-call proof has a hole at the return
+      boundary (the worker can return, pause, and read the event flag
+      late). Narrow 17.13's claim and state the uncertainty that
+      remains, unless syscall-boundary evidence is cheap to get (not
+      looked for in sitting 27).
+    - **11:** `failStream` with a send and a receive both unresolved:
+      say which ops get the failure, when it counts as reported, and
+      what later calls return, and keep the harvest lists consistent.
+
+    Slice 2's own gate (17.16): the op model for streams without faults,
+    under each profile and with no profile; parity rows 3, 5, 7 to 9, 16
+    to 29, 33 to 38; mutants; the gates of this section.
+  - Open for the sim seat, queued, not started: t-4096 (refuse a
+    zero-room receive, decided yes), t-4106 (the spawn windows), t-4115
+    (the bind cells slice 1 refuses as not measured).
 - **For hotseat, not zio:** ENet's receive returns 0 for an empty datagram,
   the same as would-block, so ENet's receive loop stops there for that
   service call. Later datagrams wait for the next call.
@@ -1037,6 +1086,14 @@ the mutants in its commits.
   ed2ecee).
 
 ### How to run things
+
+- **The stream tests:** the filter `sim: stream` in a sim build. `sim:
+  stream parity` also runs in a build without sim, on real sockets, and
+  checks the host kernel's column; on Linux run it in the default
+  binary (io_uring, with seccomp unconfined) and in a `-Dbackend=epoll`
+  one. Before `sim.end`, a stream test closes every stream socket and
+  sleeps while `sim.streamEntriesInFlight()` is not 0 (`drain` in
+  `src/sim_stream_test.zig`); `end` panics on what is left.
 
 - **zig:** `$(mise where zig@0.17.0)/zig`. Never `zig` by name;
   `~/.zvm/bin/zig` is 0.16.
@@ -1184,6 +1241,24 @@ the mutants in its commits.
   signature upstream changed compiles green under the `sim: ` filter; only
   `check.sh --ci` (no filter) finds it. In f0396b1 that was five tests in
   `src/net.zig` calling `dirDeleteFile` with the removed allocator.
+- **`if (skip)` is not `if (comptime skip)`.** With a plain const, Zig
+  still analyses the test body after the skip, so a POSIX body broke the
+  Windows test binary (d613fd1, fixed in 35972fb). Write `if (comptime
+  ...) return error.SkipZigTest;` as the sim's other tests do, and keep a
+  comptime block that takes a test's function pointer off Windows.
+- **zsh does not split an unquoted variable.** `o="-Dsim=true
+  -Dscheduling=pinned"; zig build $o` passes one argument, and the build
+  stops at its option parser. Write the flags out.
+- **Ctrl-C to a Rex pane that runs a bash loop of `docker run` does not
+  stop the loop.** docker passes the signal to the container and exits
+  normally, so bash starts the next run. Stop the script by its exact
+  PID (`ps -axo pid,command`); a container that cannot be stopped ends
+  with its run, and goes in the report's cleanup list.
+- **A Rex session holds at most 64 windows.** Close each tab when its
+  output is saved.
+- **The mutant runner edits files in place.** Point a copy of it (its
+  `ROOT`) at a scratch copy of the tree (rsync without `.zig-cache` and
+  `.git`); the worktree is then free for other builds while it runs.
 - **Tool rules for agents here:** a recursive `rm` of a path built from a
   variable is refused by a hook; make a new directory instead. Restoring a
   file with `git checkout <file>` is refused too, and would drop uncommitted
@@ -1192,7 +1267,8 @@ the mutants in its commits.
 
 ## 17. The stream track: simulated TCP on loopback (design check, revision 3)
 
-Status: **design only. Nothing in this section is built.** Revision 1 was
+Status: **slice 1 of 17.16 is built** (d613fd1, 35972fb; section 15 has
+the state). Slices 2 to 4 are design only. Revision 1 was
 6e854fc, revision 2 was 2d987f7, and revision 3 is sitting 25. It answers
 the second outside review, `gpt-simnet10.md`, and the grader's rulings on
 report 24. The third outside review, `gpt-simnet11.md`, is answered in
@@ -2051,6 +2127,11 @@ Loopback is too fast to catch it; the sim's rule is 17.6's.
 - Credit is paced at one departure per L.
 - Chunk sizes follow a declared pattern, not an MSS.
 - `shutdown(.receive)` and `SO_ERROR` are refused.
+- A passive closer's port is free at its close (a kernel holds it until
+  the last ACK, well under the probe's 50 ms on loopback).
+- `listen` on an unbound socket is refused (a kernel binds 0.0.0.0 and a
+  port); so is a bind with SO_REUSEADDR next to a holder whose answer
+  was not measured (t-4115).
 
 ### 17.15 Test plan
 
