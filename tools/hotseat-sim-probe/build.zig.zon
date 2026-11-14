@@ -1,0 +1,11 @@
+.{
+    .name = .hotseat_sim_probe,
+    .version = "0.0.0",
+    .fingerprint = 0x571fd4ef605bd542,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        // This worktree's own zio, so the probe measures the commit it sits on.
+        .zio = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
