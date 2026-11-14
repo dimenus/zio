@@ -1,6 +1,8 @@
 # Design brief: a sim network for zio (t-4086, t-4087), revision 3
 
-Status: **phase 1 (section 12) is being built; the rest is for review.**
+Status: **phase 1 (section 12) is built. One acceptance item falls short of
+its wording: group 7 has a second exception, SO_SNDBUF (section 15). The rest
+is for review.**
 
 Revision 2 (dd55885) was reviewed by another vendor's model. This revision
 takes the decisions made after that review. Section 13 lists what changed
@@ -484,30 +486,103 @@ The scripts the gates below use are beside them, in `zio-sim6-tools/` there
   imports); `src/sim_exits_test.zig` fails the build when one is missing. Its
   rules and hand lists are in its header comment; the cost against upstream is
   in ed2ecee's message.
+- **The C bridge tests (7833cee):** `src/enet_bridge_test.c` is an
+  ENet-shaped bridge over the layer (unix.c of cgutman/enet at aca87840b57f,
+  for the ten functions of section 3.2) with eleven C tests;
+  `src/enet_bridge_test.zig` exports the `zio_test_*` shims it calls and runs
+  each test, in a sim run in a sim build and on real loopback sockets without
+  sim. The test binary has its own root module in build.zig, so only it
+  compiles the C file. Protocol: the header comments of both files.
 
-### Next (phase 1): the C bridge in both builds, then close the seven groups
+### Phase 1 acceptance: what holds, group by group
 
-Where each acceptance group of section 11 stands (each item names the commit
-whose tests cover it):
+Every test named here runs under `zig build test -Dsim=true
+-Dscheduling=pinned -Dtest-filter="sim: "`. The `sim: enet bridge:` tests
+also run in a build without sim, against real sockets. A test's mutants are
+in the message of the commit that added it.
 
-| group | covered now, at the Zig level | still needed |
-|---|---|---|
-| 1 cross-interface | layer to ev and ev to layer, bytes, sources, two buffers each way (da0b4e1) | the same from C |
-| 2 bridge semantics | non-blocking read back, WouldBlock, empty datagram, truncation consumes, unsupported option, ENet-shaped host creation (1dab14f, ec6ec37) | from C, with ENet's return codes: 0, -2, -1, `ENET_SOCKET_WAIT_INTERRUPT` |
-| 3 addressing | all five items (1dab14f) | none |
-| 4 readiness | all six items (1dab14f, da0b4e1) | none |
-| 5 limits | all four items (ec6ec37) | none |
-| 6 isolation and replay | all seven items (da0b4e1, 31783f6, ed2ecee, the starh2 gate) | none |
-| 7 parity | the source-address case (4812568); the layer's metadata tests run against real sockets on macOS and Linux (1dab14f) | the same C bridge against the real layer, same return values |
+1. **Cross-interface exchange: holds, in both builds.** `sim: enet bridge: C
+   sends two buffers to a zio task's ev receive, which replies with two
+   buffers that C reads into two: bytes, sources, destination`. At the Zig
+   level also `sim: dgram ev: the layer sends two buffers to an ev receiver,
+   and an ev send of two buffers reaches the layer, whole, with sources`.
+2. **Bridge semantics from C: holds.** All `sim: enet bridge:`:
+   - `an ENet-shaped host creation: create, bind to port 0, NONBLOCK read
+     back, RCVBUF, SNDBUF, get_address, get_option ERROR, then a datagram
+     with its destination` (verified non-blocking state; host creation);
+   - `a receive with nothing queued is 0, errno EWOULDBLOCK, and writes no
+     address`;
+   - `an empty datagram is received as 0 with its source written, and the
+     next datagram is next`;
+   - `a datagram that does not fit is -2 and is consumed`;
+   - `SNDBUF (unsupported in a sim run), BROADCAST and reading TTL give -1
+     and change nothing`. The layer's unsupported class exists only in a sim
+     run; on real sockets the bridge's own -1 (an option it has no case for)
+     is what this checks;
+   - `enet_socket_wait with a zero timeout reports receive only once a
+     datagram is queued, and send always`;
+   - `real sockets only: a signal cuts a wait: ENET_SOCKET_WAIT_INTERRUPT
+     when asked for, -1 and EINTR when not`. It skips in a sim build: a sim
+     poll takes a zero timeout only, so nothing can cut it (section 10);
+   - `enet_socketset_select keeps the ready sockets of each set and counts
+     them`;
+   - `a bind to a port in use is -1 with EADDRINUSE, destroy frees the port,
+     destroy of ENET_SOCKET_NULL does nothing`.
+3. **Addressing: holds.** `sim: dgram: port 0 gives 49152, 49153, 49154 in
+   every run`; `sim: dgram: a bind conflict is AddressInUse, for an equal
+   address and across a wildcard`; `sim: dgram: a wildcard receiver gets the
+   destination address, a reply from it leaves from it, and a bad source is
+   AddressUnavailable`.
+4. **Readiness lifecycle: holds.** `sim: dgram ev: poll with a zero timeout
+   reports readable only once a datagram has landed, and writable always`;
+   `sim: dgram ev: a poll parked before the datagram is sent wakes when it
+   lands, with no second send, and rearms`; `sim: dgram ev: a parked receive
+   that is canceled gives Canceled, and the next datagram is still there for
+   the next receive`; `sim: dgram ev: close wakes an ev receive parked on the
+   socket`; `sim: dgram: a closed fd number is reused by the next open, which
+   does not see the old socket's data`.
+5. **Independent limits: holds.** `sim: dgram limits: a small byte budget
+   drops by bytes, raising SO_RCVBUF after open lets more in, and queued
+   datagrams keep their bytes`; `sim: dgram limits: with a large byte budget,
+   the packet limit drops empty datagrams`; `sim: dgram limits: one socket's
+   overflow does not drop or block another socket's datagrams`.
+6. **Isolation and replay: holds.** `sim: dgram ev refuses: a real fd in a
+   sim op`; `sim: exits refuse: a file close of a sim fd`; `sim: exits
+   refuse: File.fromFd(sim fd).close() in a loop callback, through the
+   blocking dispatch`; `sim: exits: every function in src/os that takes an fd
+   refuses a sim fd first, or has a sim branch`; the `sim: dgram refuses: a
+   socket ... from another thread` tests (open, bind, send, receive, close,
+   setNonBlocking, enableDestinationAddress, setsockopt); the `sim: fd
+   namespace:` tests; `sim: dgram trace: ten fresh processes with the heap
+   moved give one transcript, wire digest, trace and state digest`; `sim:
+   dgram trace: one changed payload byte gives a different wire digest, with
+   the seed, lengths and endpoints the same`; and starh2's three sim steps
+   (the gate below; its result is in the report of each sitting).
+7. **Production-path parity: holds for every check but one, so it does not
+   hold as section 11 words it.** All `sim: enet bridge:` tests run against
+   real sockets on macOS and Linux with the same expected values as in a sim
+   run (the `expect` table of `enet_bridge_test.c`). The source-address case
+   is apart, as section 11 says: `sim: enet bridge: a source address the
+   socket cannot use: the sim's column in a sim run, the kernel's otherwise`
+   (its `source_rows` table). **The check that differs and that section 11
+   does not list:** `ENET_SOCKOPT_SNDBUF` gives -1 in a sim run (section 8's
+   unsupported class) and 0 on real sockets (`expect_sndbuf`). ENet ignores
+   both. Proposed for the owner: add SO_SNDBUF to group 7's "not a parity
+   case" list. Until then, group 7 is not fully met.
 
-So what is left is one tiny C file, an ENet-shaped bridge over the layer
-(`_create`, `_bind`, `_get_address`, `_set_option`, `_get_option`, `_send`,
-`_receive`, `_wait`, `_destroy`, and `socketset_select`), returning ENet's
-codes (section 3.2). It calls the layer through `export fn` shims that only a
-test build compiles. The same C tests run against the sim (a sim build, in a
-run) and against real loopback sockets (a build without sim): groups 1, 2 and
-7 through C. Not done: how the test step compiles a C file (build.zig has no C
-sources in its test step today) is the first thing to settle.
+### Next
+
+- **The owner's call on SO_SNDBUF** (group 7, above).
+- **Section 3.2, `enet_socketset_select`:** ENet's unix.h has `typedef fd_set
+  ENetSocketSet`, and a sim fd (100000 and up) is past FD_SETSIZE, so
+  hotseat's bridge cannot implement it over the layer with ENet's type.
+  Neither ENet's core nor hotseat calls it. Proposed: hotseat's bridge drops
+  it, or its patched unix.h redefines the set (the test fixture uses a list
+  of sockets).
+- **For hotseat, not zio:** ENet's receive returns 0 for an empty datagram,
+  the same as would-block, so ENet's receive loop stops there for that
+  service call. Later datagrams wait for the next call.
+- **Phase 2** (section 12): faults, counters, validation, promises 2 and 3.
 
 ### Decided by the design's owner (2026-11-14, after reports 6-8)
 
@@ -539,14 +614,23 @@ sources in its test step today) is the first thing to settle.
   the working directory, so copy `src/os` into the image beside the binary
   (`/work/src/os`). `-Dtarget=x86_64-windows` compiles the Windows test
   binary.
+- **The C bridge tests in both builds:** the filter `sim: enet bridge`, once
+  with `-Dsim=true -Dscheduling=pinned` (10 run, the interrupt test skips)
+  and once without sim (all 11 run, on real sockets). On Linux, the same two
+  binaries in colima with `TEST_FILTER=sim: enet bridge`.
 - **Unchanged without sim:** `textcmp.sh <base commit> <src dir> <label>`
   builds the eight examples ReleaseFast from the base and from the src dir at
-  one path, and compares `__TEXT,__text`. When they differ,
+  one path, and compares `__TEXT,__text`. It swaps only `src/`; for a change
+  to `build.zig`, `textcmp-tree.sh <base commit> <tree dir> <label>` swaps
+  `build.zig`, `build.zig.zon` and `src/`. When they differ,
   `fndiff.py <a> <b>` lists the functions that differ, with only moved code
   and data normalized away. Control: the mutex's `locked` from 1 to 3.
 - **Mutants:** `mut/run.py <list.json> <out>`. A mutant counts only if it
   compiled and its named test is listed failed, or the test process crashed in
-  it. Check the reason line of each kill, not just the verdict.
+  it. Check the reason line of each kill, not just the verdict. It cuts each
+  reason line at 200 characters, which can drop a C test's failing line;
+  `mut/run-why.py` prints from `enet_bridge_test.c:` on. The bridge's mutant
+  list is made by `mut/gen-bridge.py`.
 - **starh2's three sim steps:** `starh2-setup.sh <zio commit> <label>` makes a
   `git archive` of starh2 429b2b3 whose two zio pins point at a `git archive`
   of that zio commit (never the live tree). `starh2-gate.sh <label> 10`, in a
@@ -579,3 +663,11 @@ sources in its test step today) is the first thing to settle.
   fit it.
 - **macOS has only 127.0.0.1 on loopback.** A test that needs a second local
   address runs on Linux only.
+- **libzio.a is not an instrument.** Its `__text` is empty in every build
+  (zio exports nothing), and two builds of one commit differ in 32 bytes (the
+  `builtin.zig` cache hash). The examples are what `textcmp` compares.
+- **`check.sh --ci` checks formatting before it runs a test,** and zig 0.17's
+  `zig fmt` rewrites `@intFromEnum` as `@backingInt`. Run `zig fmt` on new
+  files first.
+- **The C file builds with `-Werror`,** so a C mutant that leaves a parameter
+  unused does not compile. Keep it used: `n > 1 ? 1 : n`, not `1`.
