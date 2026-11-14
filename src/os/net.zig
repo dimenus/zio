@@ -811,7 +811,7 @@ pub const SetsockoptError = error{ OptionNotSupported, Unexpected };
 
 pub fn setsockopt(fd: fd_t, level: i32, optname: u32, optval: []const u8) SetsockoptError!void {
     if (comptime sim_layer) {
-        if (sim.isSimFd(fd)) sim.panic("sim: setsockopt(level {d}, option {d}) on sim fd {d}: socket options are not simulated yet", .{ level, optname, fd });
+        if (sim.isSimFd(fd)) return sim.dgramSetOption(fd, level, optname, optval);
     }
     switch (builtin.os.tag) {
         .windows => {
@@ -842,7 +842,7 @@ pub const GetsockoptError = error{Unexpected};
 
 pub fn getsockopt(fd: fd_t, level: i32, optname: u32, optval: []u8) GetsockoptError!void {
     if (comptime sim_layer) {
-        if (sim.isSimFd(fd)) sim.panic("sim: getsockopt(level {d}, option {d}) on sim fd {d}: socket options are not simulated yet", .{ level, optname, fd });
+        if (sim.isSimFd(fd)) return sim.dgramGetOption(fd, level, optname, optval);
     }
     switch (builtin.os.tag) {
         .windows => {

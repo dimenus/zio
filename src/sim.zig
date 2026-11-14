@@ -1018,6 +1018,9 @@ pub fn takeDue(out: []TakenDue) usize {
 //   and packets (`rcv_packet_limit`). A datagram costs its length plus
 //   `datagram_overhead` bytes, and one packet. One that does not fit is
 //   dropped and counted (`DatagramStats.dropped_rcvbuf`), never a panic.
+// - Socket options come in three classes (`dgramSetOption`): modelled,
+//   unsupported (`error.OptionNotSupported`, nothing changes, the caller may
+//   ignore it), and misuse (a panic naming the option).
 // - Receives are non-suspending here: an empty queue is `WouldBlock`, and a
 //   receive that would have to block refuses (the sim thread would never
 //   wake).
@@ -1090,8 +1093,14 @@ const WireDatagram = struct {
 };
 
 /// Socket queues and datagrams on the wire. Not the runtime's allocator: the
-/// socket layer has no runtime handle. Addresses never enter a trace.
-const net_alloc = std.heap.smp_allocator;
+/// socket layer has no runtime handle. Addresses never enter a trace. A
+/// `var` only so a test can make it fail (`testSetNetAllocator`).
+var net_alloc: std.mem.Allocator = std.heap.smp_allocator;
+
+fn testSetNetAllocator(a: std.mem.Allocator) void {
+    if (comptime !builtin.is_test) @compileError("testSetNetAllocator is for tests");
+    net_alloc = a;
+}
 
 var dgrams: [max_dgram]Dgram = @splat(.{});
 var next_port: u16 = first_ephemeral_port;
@@ -1390,6 +1399,119 @@ pub fn dgramIsOpen(fd: i32) bool {
 /// datagram socket is always writable (send pressure is not modelled).
 pub fn dgramReadable(fd: i32) bool {
     return dgramSlot("poll", fd).meta_len > 0;
+}
+
+// ---- Socket options (design section 8) ----
+
+const sys = std.posix.system;
+/// macOS's SO_NET_SERVICE_TYPE (sys/socket.h), which ENet's QoS option sets.
+const darwin_so_net_service_type: u32 = 0x1116;
+
+const OptionClass = enum { rcvbuf, dst_addr, so_error, unsupported, misuse };
+
+fn classifyOption(level: i32, name: u32) OptionClass {
+    if (level == sys.SOL.SOCKET) {
+        if (name == sys.SO.RCVBUF) return .rcvbuf;
+        if (name == sys.SO.ERROR) return .so_error;
+        if (name == sys.SO.SNDBUF or name == sys.SO.RCVLOWAT or name == sys.SO.REUSEADDR or
+            name == sys.SO.RCVTIMEO or name == sys.SO.SNDTIMEO) return .unsupported;
+        if (builtin.os.tag.isDarwin() and name == darwin_so_net_service_type) return .unsupported;
+        if (builtin.os.tag == .linux and name == sys.SO.PRIORITY) return .unsupported;
+        return .misuse;
+    }
+    if (level == sys.IPPROTO.IP) {
+        const dst_opt = if (builtin.os.tag == .linux) sys.IP.PKTINFO else sys.IP.RECVDSTADDR;
+        if (name == dst_opt) return .dst_addr;
+        if (name == sys.IP.TOS or name == sys.IP.TTL) return .unsupported;
+        return .misuse;
+    }
+    // ENet's QoS also sets the IPv6 traffic class on every socket.
+    if (level == sys.IPPROTO.IPV6 and name == sys.IPV6.TCLASS) return .unsupported;
+    return .misuse;
+}
+
+fn optionName(level: i32, name: u32) []const u8 {
+    if (level == sys.SOL.SOCKET) {
+        if (name == sys.SO.BROADCAST) return "SO_BROADCAST";
+        if (name == sys.SO.REUSEPORT) return "SO_REUSEPORT";
+        return "a SOL_SOCKET option";
+    }
+    if (level == sys.IPPROTO.IP) {
+        if (name == sys.IP.ADD_MEMBERSHIP) return "IP_ADD_MEMBERSHIP";
+        if (name == sys.IP.MULTICAST_IF) return "IP_MULTICAST_IF";
+        if (name == sys.IP.MULTICAST_TTL) return "IP_MULTICAST_TTL";
+        if (name == sys.IP.MULTICAST_LOOP) return "IP_MULTICAST_LOOP";
+        return "an IPPROTO_IP option";
+    }
+    if (level == sys.IPPROTO.TCP) return "a TCP option";
+    return "an option of an unknown level";
+}
+
+fn optionInt(comptime what: []const u8, fd: i32, val: []const u8) c_int {
+    if (val.len != @sizeOf(c_int)) panic("sim: " ++ what ++ " on sim fd {d} with a {d}-byte value (an int is {d})", .{ fd, val.len, @sizeOf(c_int) });
+    return std.mem.bytesToValue(c_int, val[0..@sizeOf(c_int)]);
+}
+
+/// `setsockopt` on a sim datagram socket. Modelled: `SO_RCVBUF` (the byte
+/// limit; the queue is re-provisioned), and the destination-address option
+/// (`IP_PKTINFO` on Linux, `IP_RECVDSTADDR` on macOS). Unsupported: send
+/// buffer, low-water mark, address reuse, timeouts, TOS, TTL, ENet's QoS
+/// options; `error.OptionNotSupported` and nothing changes. Anything else is
+/// misuse and refuses, naming the option: broadcast, multicast, port reuse,
+/// a TCP option, an unknown option or level.
+pub fn dgramSetOption(fd: i32, level: i32, name: u32, val: []const u8) error{OptionNotSupported}!void {
+    refuseOtherThread("sim socket setsockopt");
+    const d = dgramSlot("setsockopt", fd);
+    switch (classifyOption(level, name)) {
+        .rcvbuf => {
+            const v = optionInt("SO_RCVBUF", fd, val);
+            if (v <= 0) panic("sim: SO_RCVBUF {d} on sim fd {d}: the byte limit must be positive", .{ v, fd });
+            resizeQueue(d, @intCast(v));
+        },
+        .dst_addr => d.dst_addr = optionInt("the destination-address option", fd, val) != 0,
+        .unsupported => return error.OptionNotSupported,
+        .so_error, .misuse => panic("sim: setsockopt {s} (level {d}, option {d}) on sim fd {d} is misuse here", .{ optionName(level, name), level, name, fd }),
+    }
+}
+
+/// `getsockopt` on a sim datagram socket: `SO_RCVBUF` (the byte limit),
+/// `SO_ERROR` (always 0: nothing is pending), and the destination-address
+/// option. Every other read refuses: the layer's `GetsockoptError` has no
+/// "unsupported" to return.
+pub fn dgramGetOption(fd: i32, level: i32, name: u32, out: []u8) void {
+    const d = dgramSlot("getsockopt", fd);
+    const v: c_int = switch (classifyOption(level, name)) {
+        .rcvbuf => @intCast(d.byte_limit),
+        .so_error => 0,
+        .dst_addr => @intFromBool(d.dst_addr),
+        .unsupported, .misuse => panic("sim: getsockopt {s} (level {d}, option {d}) on sim fd {d} is not simulated", .{ optionName(level, name), level, name, fd }),
+    };
+    if (out.len != @sizeOf(c_int)) panic("sim: getsockopt on sim fd {d} into {d} bytes (an int is {d})", .{ fd, out.len, @sizeOf(c_int) });
+    @memcpy(out, std.mem.asBytes(&v));
+}
+
+/// A new byte limit. The ring is re-provisioned to hold `limit` bytes, or
+/// what is queued if that is more: nothing queued is dropped, and new
+/// datagrams are dropped until the queue is under the limit again. Out of
+/// memory refuses: `setsockopt` has no error for it in a build without sim
+/// (the design asks for SystemResources; see report 7).
+fn resizeQueue(d: *Dgram, limit: usize) void {
+    const cap = @max(limit, d.ring_used);
+    if (cap != d.ring.len) {
+        const ring = net_alloc.alloc(u8, cap) catch panic("sim: out of memory for a {d}-byte receive queue", .{cap});
+        var at: usize = 0;
+        var k: usize = 0;
+        while (k < d.meta_len) : (k += 1) {
+            const q = &d.meta[(d.meta_head + k) % d.meta.len];
+            ringRead(d, q.off, ring[at..][0..q.len]);
+            q.off = at;
+            at += q.len;
+        }
+        net_alloc.free(d.ring);
+        d.ring = ring;
+        d.ring_head = 0;
+    }
+    d.byte_limit = limit;
 }
 
 fn receiverOf(to: Ip4) ?*Dgram {
@@ -3326,6 +3448,21 @@ const dg = struct {
     const ev = @import("ev/root.zig");
     const io_common = @import("common.zig");
 
+    fn setInt(fd: i32, level: i32, name: u32, v: c_int) !void {
+        try os_net.setsockopt(fd, level, name, std.mem.asBytes(&v));
+    }
+
+    fn getInt(fd: i32, level: i32, name: u32) !c_int {
+        var v: c_int = -1;
+        try os_net.getsockopt(fd, level, name, std.mem.asBytes(&v));
+        return v;
+    }
+
+    fn sendN(fd: i32, to: os_net.sockaddr.in, n: usize, payload: []const u8) !void {
+        var k: usize = 0;
+        while (k < n) : (k += 1) _ = try sendFrom(fd, to, null, payload);
+    }
+
     /// zio's own receive (`net.Socket.receiveFrom`'s ev op), on a sim fd.
     fn evRecvFrom(fd: i32, buf: []u8) !struct { len: usize, from: Ip4 } {
         var iov: [1]os_net.iovec = undefined;
@@ -3852,18 +3989,6 @@ test "sim: dgram refuses: a send on a closed socket" {
     }.body);
 }
 
-test "sim: dgram refuses: a socket option, until options are simulated" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    try refusal("sim: dgram refuses: a socket option, until options are simulated", "sim: setsockopt(level", struct {
-        fn body() !void {
-            try r3.up();
-            const fd = try dg.open();
-            const v: c_int = 1;
-            try dg.os_net.setsockopt(fd, dg.os_net.SOL.SOCKET, dg.os_net.SO.REUSEADDR, std.mem.asBytes(&v));
-        }
-    }.body);
-}
-
 test "sim: dgram refuses: connect on a datagram socket" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     try refusal("sim: dgram refuses: connect on a datagram socket", "sim: connect on sim datagram socket 100032: connected UDP is not simulated", struct {
@@ -4267,6 +4392,313 @@ test "sim: dgram ev refuses: pollInterruptible with a positive timeout on a sim 
             try r3.up();
             const fd = try dg.open();
             _ = try dg.os_net.pollInterruptible(fd, dg.os_net.POLL.IN, 5);
+        }
+    }.body);
+}
+
+// ---- Phase 1, slice 3: socket options and receive limits (sections 6, 8) ----
+
+test "sim: dgram options: an ENet-shaped host creation: socket, non-blocking, RCVBUF, SNDBUF ignored, destination addresses, bind to port 0, getsockname" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            const fd = try dg.os_net.socket(.ipv4, .dgram, .udp, .{ .nonblocking = false });
+            try dg.os_net.setNonBlocking(fd, true);
+            try std.testing.expect(try dg.os_net.isNonBlocking(fd));
+            try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF, 256 * 1024);
+            // ENet ignores the -1 its bridge returns for this.
+            try std.testing.expectError(error.OptionNotSupported, dg.setInt(fd, sys.SOL.SOCKET, sys.SO.SNDBUF, 256 * 1024));
+            try dg.os_net.enableDestinationAddress(fd);
+            try dg.bindTo(fd, dg.addr(0, 0, 0, 0, 0));
+            try std.testing.expectEqual(Ip4{ .ip = .{ 0, 0, 0, 0 }, .port = 49152 }, try dg.local(fd));
+            try std.testing.expectEqual(@as(c_int, 256 * 1024), try dg.getInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF));
+            try std.testing.expectEqual(@as(c_int, 0), try dg.getInt(fd, sys.SOL.SOCKET, sys.SO.ERROR));
+            const dst_opt = if (builtin.os.tag == .linux) sys.IP.PKTINFO else sys.IP.RECVDSTADDR;
+            try std.testing.expectEqual(@as(c_int, 1), try dg.getInt(fd, sys.IPPROTO.IP, dst_opt));
+            try dg.setInt(fd, sys.IPPROTO.IP, dst_opt, 0);
+            try std.testing.expectEqual(@as(c_int, 0), try dg.getInt(fd, sys.IPPROTO.IP, dst_opt));
+            try dg.setInt(fd, sys.IPPROTO.IP, dst_opt, 1);
+            // It works: a datagram arrives with its destination address.
+            const tx = try dg.open();
+            _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 49152), null, "host");
+            try dg.settle();
+            var buf: [8]u8 = undefined;
+            try std.testing.expectEqual(@as(?[4]u8, .{ 127, 0, 0, 1 }), (try dg.recvInto(fd, &.{&buf})).info.to);
+        }
+    }.body);
+}
+
+test "sim: dgram options: an unsupported option returns OptionNotSupported and changes nothing" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            const fd = try dg.open();
+            const before = try dg.getInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF);
+            const unsupported = [_][2]i64{
+                .{ sys.SOL.SOCKET, sys.SO.SNDBUF },
+                .{ sys.SOL.SOCKET, sys.SO.RCVLOWAT },
+                .{ sys.SOL.SOCKET, sys.SO.REUSEADDR },
+                .{ sys.IPPROTO.IP, sys.IP.TOS },
+                .{ sys.IPPROTO.IP, sys.IP.TTL },
+                .{ sys.IPPROTO.IPV6, sys.IPV6.TCLASS },
+                .{ sys.SOL.SOCKET, if (builtin.os.tag.isDarwin()) darwin_so_net_service_type else sys.SO.PRIORITY },
+            };
+            for (unsupported) |o| {
+                try std.testing.expectError(error.OptionNotSupported, dg.setInt(fd, @intCast(o[0]), @intCast(o[1]), 1));
+            }
+            try std.testing.expectEqual(before, try dg.getInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF));
+            try dg.bindTo(fd, dg.addr(127, 0, 0, 1, 0));
+            const tx = try dg.open();
+            _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 49152), null, "still");
+            try dg.settle();
+            var buf: [8]u8 = undefined;
+            try std.testing.expectEqualStrings("still", buf[0..(try dg.recvInto(fd, &.{&buf})).info.len]);
+        }
+    }.body);
+}
+
+test "sim: dgram limits: with a large byte budget, the packet limit drops empty datagrams" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            const rx = try dg.open();
+            const tx = try dg.open();
+            try dg.setInt(rx, sys.SOL.SOCKET, sys.SO.RCVBUF, 1 << 20);
+            try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
+            try dg.sendN(tx, dg.addr(127, 0, 0, 1, 49152), rcv_packet_limit + 6, "");
+            try dg.settle();
+            try std.testing.expectEqual(@as(u64, rcv_packet_limit), datagramStats(rx).received);
+            try std.testing.expectEqual(@as(u64, 6), datagramStats(rx).dropped_rcvbuf);
+        }
+    }.body);
+}
+
+test "sim: dgram limits: a small byte budget drops by bytes, raising SO_RCVBUF after open lets more in, and queued datagrams keep their bytes" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            const rx = try dg.open();
+            const tx = try dg.open();
+            // 1000 bytes: two 150-byte datagrams (406 each) fit, a third does not.
+            try dg.setInt(rx, sys.SOL.SOCKET, sys.SO.RCVBUF, 1000);
+            try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
+            const to = dg.addr(127, 0, 0, 1, 49152);
+            var p: [150]u8 = undefined;
+            for (&p, 0..) |*b, i| b.* = @intCast(i);
+            var buf: [150]u8 = undefined;
+            // One datagram stays queued while six more go through, so each
+            // lands 150 bytes further on: the sixth starts at 900 and
+            // straddles the end of the 1000-byte ring.
+            _ = try dg.sendFrom(tx, to, null, &p);
+            try dg.settle();
+            var k: usize = 0;
+            while (k < 6) : (k += 1) {
+                p[0] = if (k == 5) 'W' else 0;
+                _ = try dg.sendFrom(tx, to, null, &p);
+                try dg.settle();
+                _ = try dg.recvInto(rx, &.{&buf});
+            }
+            p[0] = 'A';
+            try dg.sendN(tx, to, 2, &p);
+            try dg.settle();
+            try std.testing.expectEqual(@as(u64, 8), datagramStats(rx).received);
+            try std.testing.expectEqual(@as(u64, 1), datagramStats(rx).dropped_rcvbuf);
+            try dg.setInt(rx, sys.SOL.SOCKET, sys.SO.RCVBUF, 4000);
+            p[0] = 'B';
+            try dg.sendN(tx, to, 3, &p);
+            try dg.settle();
+            try std.testing.expectEqual(@as(u64, 11), datagramStats(rx).received);
+            try std.testing.expectEqual(@as(u64, 1), datagramStats(rx).dropped_rcvbuf);
+            // Every queued datagram came through the re-provision whole,
+            // the one that straddled the old ring's end ('W') included.
+            for ("WABBB") |w| {
+                const got = try dg.recvInto(rx, &.{&buf});
+                try std.testing.expectEqual(@as(usize, 150), got.info.len);
+                try std.testing.expectEqual(w, buf[0]);
+                for (buf[1..], 1..) |b, i| try std.testing.expectEqual(@as(u8, @intCast(i)), b);
+            }
+            try std.testing.expectError(error.WouldBlock, dg.recvInto(rx, &.{&buf}));
+        }
+    }.body);
+}
+
+test "sim: dgram limits: lowering SO_RCVBUF below what is queued drops nothing queued, and drops new datagrams until the queue is under the limit" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            const rx = try dg.open();
+            const tx = try dg.open();
+            try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
+            const to = dg.addr(127, 0, 0, 1, 49152);
+            var p: [100]u8 = @splat(7);
+            try dg.sendN(tx, to, 4, &p);
+            try dg.settle();
+            // Below the 400 payload bytes queued: the ring must keep them.
+            try dg.setInt(rx, sys.SOL.SOCKET, sys.SO.RCVBUF, 380);
+            try dg.sendN(tx, to, 1, &p);
+            try dg.settle();
+            try std.testing.expectEqual(@as(u64, 4), datagramStats(rx).received);
+            try std.testing.expectEqual(@as(u64, 1), datagramStats(rx).dropped_rcvbuf);
+            var buf: [100]u8 = undefined;
+            var k: usize = 0;
+            while (k < 4) : (k += 1) try std.testing.expectEqual(@as(usize, 100), (try dg.recvInto(rx, &.{&buf})).info.len);
+            // Under the limit again: one 100-byte datagram (356) fits in 380.
+            try dg.sendN(tx, to, 2, &p);
+            try dg.settle();
+            try std.testing.expectEqual(@as(u64, 5), datagramStats(rx).received);
+            try std.testing.expectEqual(@as(u64, 2), datagramStats(rx).dropped_rcvbuf);
+        }
+    }.body);
+}
+
+test "sim: dgram limits: one socket's overflow does not drop or block another socket's datagrams" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            const small = try dg.open();
+            const big = try dg.open();
+            const tx = try dg.open();
+            try dg.setInt(small, sys.SOL.SOCKET, sys.SO.RCVBUF, 300);
+            try dg.bindTo(small, dg.addr(127, 0, 0, 1, 0));
+            try dg.bindTo(big, dg.addr(127, 0, 0, 1, 0));
+            var k: usize = 0;
+            while (k < 20) : (k += 1) {
+                _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 49152), null, "x");
+                _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 49153), null, "y");
+            }
+            try dg.settle();
+            try std.testing.expectEqual(@as(u64, 1), datagramStats(small).received);
+            try std.testing.expectEqual(@as(u64, 19), datagramStats(small).dropped_rcvbuf);
+            try std.testing.expectEqual(@as(u64, 20), datagramStats(big).received);
+            try std.testing.expectEqual(@as(u64, 0), datagramStats(big).dropped_rcvbuf);
+        }
+    }.body);
+}
+
+test "sim: dgram limits: out of memory at open and at send is SystemResources, and the run goes on" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            const ok_fd = try dg.open();
+            var failing = std.testing.FailingAllocator.init(std.heap.smp_allocator, .{ .fail_index = 0 });
+            testSetNetAllocator(failing.allocator());
+            defer testSetNetAllocator(std.heap.smp_allocator);
+            try std.testing.expectError(error.SystemResources, dg.open());
+            try std.testing.expectError(error.SystemResources, dg.sendFrom(ok_fd, dg.addr(127, 0, 0, 1, 9), null, "x"));
+            // The second allocation of an open fails: the first is freed.
+            failing = std.testing.FailingAllocator.init(std.heap.smp_allocator, .{ .fail_index = 1 });
+            testSetNetAllocator(failing.allocator());
+            try std.testing.expectError(error.SystemResources, dg.open());
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            testSetNetAllocator(std.heap.smp_allocator);
+            _ = try dg.sendFrom(ok_fd, dg.addr(127, 0, 0, 1, 9), null, "x");
+        }
+    }.body);
+}
+
+test "sim: dgram options refuse: SO_BROADCAST" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram options refuse: SO_BROADCAST", "sim: setsockopt SO_BROADCAST", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.BROADCAST, 1);
+        }
+    }.body);
+}
+
+test "sim: dgram options refuse: SO_REUSEPORT" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram options refuse: SO_REUSEPORT", "sim: setsockopt SO_REUSEPORT", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.REUSEPORT, 1);
+        }
+    }.body);
+}
+
+test "sim: dgram options refuse: a multicast membership" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram options refuse: a multicast membership", "sim: setsockopt IP_ADD_MEMBERSHIP", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            var mreq: [8]u8 = @splat(0);
+            try dg.os_net.setsockopt(fd, sys.IPPROTO.IP, sys.IP.ADD_MEMBERSHIP, &mreq);
+        }
+    }.body);
+}
+
+test "sim: dgram options refuse: a TCP option on a datagram socket" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram options refuse: a TCP option on a datagram socket", "sim: setsockopt a TCP option", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            try dg.setInt(fd, sys.IPPROTO.TCP, 1, 1);
+        }
+    }.body);
+}
+
+test "sim: dgram options refuse: SO_RCVBUF of zero" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram options refuse: SO_RCVBUF of zero", "sim: SO_RCVBUF 0 on sim fd 100032: the byte limit must be positive", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF, 0);
+        }
+    }.body);
+}
+
+test "sim: dgram options refuse: a read of an option that is not simulated" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram options refuse: a read of an option that is not simulated", "sim: getsockopt a SOL_SOCKET option", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            _ = try dg.getInt(fd, sys.SOL.SOCKET, sys.SO.SNDBUF);
+        }
+    }.body);
+}
+
+test "sim: dgram options refuse: an option on a closed socket" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram options refuse: an option on a closed socket", "sim: setsockopt on sim fd 100032, which is closed", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            dg.os_net.close(fd);
+            try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF, 1000);
+        }
+    }.body);
+}
+
+test "sim: dgram options refuse: out of memory re-provisioning the receive queue" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram options refuse: out of memory re-provisioning the receive queue", "sim: out of memory for a 300000-byte receive queue", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            var failing = std.testing.FailingAllocator.init(std.heap.smp_allocator, .{ .fail_index = 0 });
+            testSetNetAllocator(failing.allocator());
+            try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF, 300000);
+        }
+    }.body);
+}
+
+test "sim: dgram refuses: a socket setsockopt from another thread" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: a socket setsockopt from another thread", "sim: sim socket setsockopt" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            dg_thread.fd = try dg.open();
+            try r3.other(struct {
+                fn f() void {
+                    dg.setInt(dg_thread.fd, sys.SOL.SOCKET, sys.SO.RCVBUF, 1000) catch {};
+                }
+            }.f);
         }
     }.body);
 }
