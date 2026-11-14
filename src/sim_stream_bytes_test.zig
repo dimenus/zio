@@ -350,11 +350,16 @@ test "sim: stream bytes: getpeername gives each end its peer, SocketUnconnected 
 // `tcpprobe4.c` ran it in C, with its answers written as tokens: a count,
 // or an error as the kernel names it (`EPIPE` for BrokenPipe, `ECONNRESET`,
 // `ENOTCONN` for SocketUnconnected, `TIMEOUT`). The expected columns are
-// the probes' answers on macOS 25.6 and Linux 6.8. In a build without sim
-// the host's column runs on real loopback sockets; in a sim build, each
-// column runs in a sim run with its profile. Waits are 50 ms, real or
-// virtual, as the probe waits. A blocked call is a task whose write or read
-// parks, as a thread blocked in the probe.
+// what zio gives on macOS 25.6 (kqueue) and Linux 6.8 (epoll and io_uring):
+// the sim shows what a zio program sees (t-4119's ruling). Where an op is
+// not parked they are also the probes' answers. Where an op is parked,
+// zio's readiness backends end it with SO_ERROR, so rows 23, 25 and 41
+// differ from the C probe on macOS; the probe stays the explanation of the
+// kernel, not the oracle. In a build without sim the host's column runs on
+// real loopback sockets; in a sim build, each column runs in a sim run with
+// its profile. Waits are 50 ms, real or virtual, as the probe waits. A
+// blocked call is a task whose write or read parks, as a thread blocked in
+// the probe.
 //
 // Not here: rows 1 to 4, 6, 10 to 15 (slice 1 or refused), 33 and 34
 // (SO_ERROR is refused in a sim run), and row 41's later sends on Linux
@@ -606,11 +611,12 @@ const prow = struct {
         rd(t, c);
         wr(t, c, "y");
     }
-    /// A send blocked on a full window in a task, then `event`.
-    fn blockedSend(t: *Tok, c: zio_net.Stream, timeout: @import("time.zig").Timeout, comptime event: fn () anyerror!void) !void {
+    /// A send blocked on a full window in a task, then `event` `wait_ms`
+    /// after the send started.
+    fn blockedSend(t: *Tok, c: zio_net.Stream, timeout: @import("time.zig").Timeout, wait_ms: u64, comptime event: fn () anyerror!void) !void {
         var b: Blocked = .{ .x = c, .is_send = true, .timeout = timeout };
         var h = try rt_mod.spawn(Blocked.run, .{&b});
-        try rt_mod.sleep(.fromMilliseconds(200));
+        try rt_mod.sleep(.fromMilliseconds(wait_ms));
         t.put(if (b.done) "NOT-BLOCKED" else "blocked");
         try event();
         h.join();
@@ -635,7 +641,7 @@ const prow = struct {
         const l, ev_c, ev_s = try connected();
         defer l.close();
         defer ev_c.close();
-        try blockedSend(t, ev_c, .none, peerResets);
+        try blockedSend(t, ev_c, .none, 200, peerResets);
         rd(t, ev_c);
         rd(t, ev_c);
     }
@@ -644,13 +650,13 @@ const prow = struct {
         defer l.close();
         defer ev_c.close();
         defer ev_s.close();
-        try blockedSend(t, ev_c, .none, ownShutWr);
+        try blockedSend(t, ev_c, .none, 200, ownShutWr);
     }
     fn r25(t: *Tok) !void {
         const l, ev_c, ev_s = try connected();
         defer l.close();
         defer ev_c.close();
-        try blockedSend(t, ev_c, .none, peerCloses);
+        try blockedSend(t, ev_c, .none, 200, peerCloses);
     }
     /// Rows 26, 26b and 27: the client acts before accept.
     fn beforeAccept(t: *Tok, comptime client: fn (zio_net.Stream) anyerror!void, comptime after: fn (*Tok, zio_net.Stream) void) !void {
@@ -827,28 +833,110 @@ const prow = struct {
         wr(t, c, "z");
         rd(t, c);
     }
+    /// Row 41: the receiver's SHUT_RDWR comes 600 ms after the send
+    /// started. On Linux that is after the sender's persist timer has sent
+    /// data into the last gap of the window (about 250 ms after the send
+    /// stalls on loopback; sitting 30's `r41x.c`), so the window is 0 and
+    /// the send stays blocked: the state the sim's window, which has no
+    /// segment size and so no gap, is always in.
     fn r41(t: *Tok) !void {
+        try row41(t, 600);
+    }
+    /// Row 41g: the same at 50 ms, while the gap is open. On Linux the
+    /// persist timer sends data into it about one RTO after the receiver's
+    /// FIN reaches the sender; the shut receiver resets, and the sender,
+    /// which has the FIN, gets EPIPE. The sim does not model this (design
+    /// 17.14): it runs on real sockets, and in a sim run only under
+    /// `.macos`.
+    fn r41g(t: *Tok) !void {
+        try row41(t, 50);
+    }
+    fn row41(t: *Tok, wait_ms: u64) !void {
         const l, ev_c, ev_s = try connected();
         defer l.close();
         defer ev_c.close();
         defer ev_s.close();
-        try blockedSend(t, ev_c, .fromSeconds(1), peerShutBoth);
+        try blockedSend(t, ev_c, .fromSeconds(1), wait_ms, peerShutBoth);
         rd(t, ev_c);
         rdData(t, ev_s);
     }
+    /// Row 42: a read parked in a task when the peer resets; then a read
+    /// and a send.
+    fn r42(t: *Tok) !void {
+        const l, const c, const s = try connected();
+        defer l.close();
+        defer c.close();
+        var b: Blocked = .{ .x = c, .is_send = false };
+        var h = try rt_mod.spawn(Blocked.run, .{&b});
+        try rt_mod.sleep(.fromMilliseconds(200));
+        t.put(if (b.done) "NOT-BLOCKED" else "blocked");
+        try linger0(s);
+        s.close();
+        h.join();
+        t.n(b.result);
+        rd(t, c);
+        wr(t, c, "x");
+    }
+    /// Row 43: one endpoint's send (on a full window) and read, both
+    /// parked, when the peer resets. Which op the kernel ends first is not
+    /// fixed, so the pair is one token: `one-reset` when exactly one of
+    /// them got ECONNRESET and the other its after-reset answer (EPIPE for
+    /// the send, 0 for the read). Then a read and a send.
+    fn r43(t: *Tok) !void {
+        const l, const c, const s = try connected();
+        defer l.close();
+        defer c.close();
+        var bs: Blocked = .{ .x = c, .is_send = true, .timeout = .fromSeconds(5) };
+        var br: Blocked = .{ .x = c, .is_send = false, .timeout = .fromSeconds(5) };
+        var hs = try rt_mod.spawn(Blocked.run, .{&bs});
+        var hr = try rt_mod.spawn(Blocked.run, .{&br});
+        try rt_mod.sleep(.fromMilliseconds(200));
+        t.put(if (bs.done) "NOT-BLOCKED" else "blocked");
+        t.put(if (br.done) "NOT-BLOCKED" else "blocked");
+        try linger0(s);
+        s.close();
+        hs.join();
+        hr.join();
+        const send_first = if (bs.result) |_| false else |e| e == error.ConnectionResetByPeer;
+        const recv_first = if (br.result) |_| false else |e| e == error.ConnectionResetByPeer;
+        const send_after = if (bs.result) |_| false else |e| e == error.BrokenPipe;
+        const recv_after = if (br.result) |v| v == 0 else |_| false;
+        if ((send_first and recv_after) or (recv_first and send_after)) t.put("one-reset") else {
+            t.put("send");
+            t.n(bs.result);
+            t.put("read");
+            t.n(br.result);
+        }
+        rd(t, c);
+        wr(t, c, "x");
+    }
+    /// Row 44: a read parked in a task when the peer's FIN lands.
+    fn r44(t: *Tok) !void {
+        const l, const c, const s = try connected();
+        defer l.close();
+        defer c.close();
+        defer s.close();
+        var b: Blocked = .{ .x = c, .is_send = false };
+        var h = try rt_mod.spawn(Blocked.run, .{&b});
+        try rt_mod.sleep(.fromMilliseconds(200));
+        t.put(if (b.done) "NOT-BLOCKED" else "blocked");
+        t.ok(s.shutdown(.send));
+        h.join();
+        t.n(b.result);
+        rd(t, c);
+    }
 
-    /// `macos` and `linux` are the design's columns: the probes' answers,
-    /// which a sim run must give under that profile. `macos_zio` and
-    /// `linux_zio`, where set, are what zio gives on that kernel's real
-    /// sockets when it differs from the probe: an open difference (t-4119),
-    /// asserted on both sides so that a change to either is seen.
+    /// `macos` and `linux` are the columns: what zio gives on that
+    /// kernel's real sockets, and what a sim run must give under that
+    /// profile. A null column is not run, on the kernel or in the sim.
+    /// `sim_linux` false: the `.linux` column runs on a Linux kernel only,
+    /// because the sim does not model that case (row 41g).
     const Row = struct {
         name: []const u8,
         f: *const fn (*Tok) anyerror!void,
-        macos: []const u8,
+        macos: ?[]const u8,
         linux: []const u8,
-        macos_zio: ?[]const u8 = null,
-        linux_zio: ?[]const u8 = null,
+        sim_linux: bool = true,
     };
     const rows = [_]Row{
         .{ .name = "5", .f = r5, .macos = "ok,0,1,1,EPIPE", .linux = "ok,0,1,1,EPIPE" },
@@ -862,11 +950,13 @@ const prow = struct {
         .{ .name = "20", .f = r20, .macos = "6,6,ECONNRESET,0,EPIPE", .linux = "6,6,ECONNRESET,0,EPIPE" },
         .{ .name = "21", .f = r21, .macos = "6,6,0,0", .linux = "6,6,0,0" },
         .{ .name = "22", .f = r22, .macos = "5,1,5,ECONNRESET,0,EPIPE", .linux = "5,1,5,0,0,EPIPE" },
-        // t-4119: zio's kqueue backend ends a parked send with SO_ERROR
-        // (ECONNRESET), which also clears it, so the reads give 0.
-        .{ .name = "23", .f = r23, .macos = "blocked,EPIPE,ECONNRESET,0", .linux = "blocked,ECONNRESET,0,0", .macos_zio = "blocked,ECONNRESET,0,0" },
+        // Rows 23, 25 and 41 under .macos: zio's kqueue backend ends the
+        // parked send with SO_ERROR (ECONNRESET), which also clears it, so
+        // the reads give 0. The C probe's blocked send gives EPIPE and its
+        // first read ECONNRESET (design 17.13).
+        .{ .name = "23", .f = r23, .macos = "blocked,ECONNRESET,0,0", .linux = "blocked,ECONNRESET,0,0" },
         .{ .name = "24", .f = r24, .macos = "blocked,EPIPE", .linux = "blocked,EPIPE" },
-        .{ .name = "25", .f = r25, .macos = "blocked,EPIPE", .linux = "blocked,ECONNRESET", .macos_zio = "blocked,ECONNRESET" },
+        .{ .name = "25", .f = r25, .macos = "blocked,ECONNRESET", .linux = "blocked,ECONNRESET" },
         .{ .name = "26", .f = r26, .macos = "ok,ECONNRESET,0", .linux = "ok,ECONNRESET,0" },
         .{ .name = "26b", .f = r26b, .macos = "ok,EPIPE,EPIPE,ECONNRESET,0", .linux = "ok,ECONNRESET,EPIPE,0,0" },
         .{ .name = "27", .f = r27, .macos = "ok,1,0,1", .linux = "ok,1,0,1" },
@@ -881,10 +971,14 @@ const prow = struct {
         .{ .name = "39u", .f = r39u, .macos = "EPIPE,EPIPE,ECONNRESET,0", .linux = "ECONNRESET,EPIPE,0,0" },
         .{ .name = "39w", .f = r39w, .macos = "ENOTCONN,ENOTCONN,ECONNRESET,0", .linux = "ENOTCONN,ENOTCONN,ECONNRESET,0" },
         .{ .name = "40", .f = r40, .macos = "ok,70000,0,0,0,EPIPE,ECONNRESET", .linux = "ok,70000,ECONNRESET,0,0,EPIPE,0" },
-        // t-4119: on Linux zio's parked send ends EPIPE about 215 ms after
-        // the receiver's SHUT_RDWR (one run with a 5 s timeout), where the
-        // probe's blocked send stayed blocked past 1 s. Not understood.
-        .{ .name = "41", .f = r41, .macos = "blocked,EPIPE,ECONNRESET,0", .linux = "blocked,TIMEOUT,0,data", .macos_zio = "blocked,ECONNRESET,0,0", .linux_zio = "blocked,EPIPE,0,data" },
+        .{ .name = "41", .f = r41, .macos = "blocked,ECONNRESET,0,0", .linux = "blocked,TIMEOUT,0,data" },
+        // 41g is the Linux gap case. On macOS its answer at 50 ms varied
+        // (1 run in 3: a second ECONNRESET at the read; t-4126), and it
+        // tests nothing on macOS that row 41 does not.
+        .{ .name = "41g", .f = r41g, .macos = null, .linux = "blocked,EPIPE,0,data", .sim_linux = false },
+        .{ .name = "42", .f = r42, .macos = "blocked,ECONNRESET,0,EPIPE", .linux = "blocked,ECONNRESET,0,EPIPE" },
+        .{ .name = "43", .f = r43, .macos = "blocked,blocked,one-reset,0,EPIPE", .linux = "blocked,blocked,one-reset,0,EPIPE" },
+        .{ .name = "44", .f = r44, .macos = "blocked,ok,0,0", .linux = "blocked,ok,0,0" },
     };
 
     var failed: usize = 0;
@@ -893,12 +987,18 @@ const prow = struct {
     fn body() !void {
         failed = 0;
         for (rows) |r| {
+            if (sim.isRunning() and column == .linux and !r.sim_linux) {
+                std.debug.print("parity row {s}, linux column: not run in a sim run: the sim does not model it (design 17.14)\n", .{r.name});
+                continue;
+            }
+            const want = (if (column == .macos) r.macos else r.linux) orelse {
+                std.debug.print("parity row {s}, {t} column: not run: no column for this kernel\n", .{ r.name, column });
+                continue;
+            };
             var t: Tok = .{};
             r.f(&t) catch |err| t.put(@errorName(err));
-            const design = if (column == .macos) r.macos else r.linux;
-            const zio_col = if (column == .macos) r.macos_zio else r.linux_zio;
-            const want = if (sim.isRunning()) design else zio_col orelse design;
-            if (zio_col) |z| std.debug.print("parity row {s}, {t}: open difference (t-4119): the design's column {s}, zio on the kernel {s}; this run checks the {s} one\n", .{ r.name, column, design, z, if (sim.isRunning()) "design's" else "kernel's" });
+            // Every row prints what it got, so a run shows what it checked.
+            std.debug.print("parity row {s}, {t} column, {s}: {s}\n", .{ r.name, column, if (sim.isRunning()) "sim" else "kernel", t.str() });
             if (!std.mem.eql(u8, want, t.str())) {
                 std.debug.print("parity row {s}, {t} column: want {s}\n                     got  {s}\n", .{ r.name, column, want, t.str() });
                 failed += 1;
@@ -914,7 +1014,7 @@ const prow = struct {
     }
 };
 
-test "sim: stream parity: slice 2's rows (5, 7 to 9, 16 to 29, 35 to 41) through zio.net, on this host's kernel without sim, in a sim run with its profile with sim" {
+test "sim: stream parity: slice 2's rows (5, 7 to 9, 16 to 29, 35 to 44) through zio.net, on this host's kernel without sim, in a sim run with its profile with sim" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     if (comptime sim.compiled_in) return prow.inSim(host_kernel);
     prow.column = host_kernel;
@@ -1420,9 +1520,10 @@ const owed_to_live_sender = struct {
         // receiver in the same instant, and its RST leaves then.
         try expectEqual(@as(usize, 1), try res[1]);
         try expectEqual(t1_ + 2 * L, at[1]);
-        // That RST lands at t1 + 3L. A FIN landed first: BrokenPipe on
-        // both kernels, so no profile.
-        try expectError(error.BrokenPipe, res[2]);
+        // That RST lands at t1 + 3L with "e" parked, and a FIN landed
+        // first: row 41's case, where zio on the two kernels differs
+        // (SO_ERROR is EPIPE on Linux, ECONNRESET on macOS).
+        try expectError(if (sim.streamProfile() == .linux) error.BrokenPipe else error.ConnectionResetByPeer, res[2]);
         try expectEqual(t1_ + 3 * L, at[2]);
         try t1.closeAll2(srv, c);
     }
@@ -1430,7 +1531,8 @@ const owed_to_live_sender = struct {
 
 test "sim: stream bytes: a credit owed when its receiver closes departs, and a sender still parked takes its room before the RST its bytes draw (outside review of slice 2, P2)" {
     if (comptime skip) return error.SkipZigTest;
-    try run(1, null, owed_to_live_sender.body);
+    try run(1, .linux, owed_to_live_sender.body);
+    try run(1, .macos, owed_to_live_sender.body);
 }
 
 /// P2 [PREMISE]: the window's changes. A grow wakes a parked send in the
@@ -1574,18 +1676,16 @@ const shared_reset = struct {
         n += 1;
     }
 
-    /// What each op must give, by profile and by which was harvested first.
+    /// What each op must give, by which was harvested first. The same under
+    /// both profiles: the first op ends with the reset (a parked send takes
+    /// it too, as zio's backends end a parked op with SO_ERROR; t-4119's
+    /// ruling), and the other then gets its after-reset answer. Parity row
+    /// 43 checks this through zio on both kernels.
     fn want(send_first: bool) struct { send: anyerror!usize, recv: anyerror!usize } {
-        return switch (profile) {
-            // One pending error, reported once by the first op that meets
-            // it; then a send gives BrokenPipe and a receive 0.
-            .linux => if (send_first)
-                .{ .send = error.ConnectionResetByPeer, .recv = 0 }
-            else
-                .{ .send = error.BrokenPipe, .recv = error.ConnectionResetByPeer },
-            // A send never reports the reset; the first read does.
-            .macos => .{ .send = error.BrokenPipe, .recv = error.ConnectionResetByPeer },
-        };
+        return if (send_first)
+            .{ .send = error.ConnectionResetByPeer, .recv = 0 }
+        else
+            .{ .send = error.BrokenPipe, .recv = error.ConnectionResetByPeer };
     }
 
     fn body() !void {
@@ -1696,6 +1796,20 @@ const refuse2 = struct {
         _, const c = try prow.resetPair();
         _ = try c.write("x", .none);
     }
+    /// The receiver sends its FIN, then resets (SO_LINGER {1, 0}) while
+    /// the sender's send is parked on a full window.
+    fn parkedSendFinReset() !void {
+        _, const c, const s = try pair();
+        sim.setStreamWindow(s.socket.handle, 1);
+        _ = try c.write("x", .none);
+        srv_keep = c;
+        _ = try rt_mod.spawn(writer, .{});
+        try s.shutdown(.send);
+        try prow.pause();
+        try prow.linger0(s);
+        s.close();
+        try prow.pause();
+    }
     fn readAfterFinReset() !void {
         _, const c, const s = try pair();
         s.close();
@@ -1741,8 +1855,11 @@ test "sim: stream refuses: a send whose chunks pass max_tcp_entries" {
 test "sim: stream refuses: a receive on a socket whose connect is parked" {
     try refusal("sim: stream refuses: a receive on a socket whose connect is parked", "sim: NetRecv on sim fd 100033, whose connection is in phase c_syn, not established", null, refuse2.recvCSyn);
 }
-test "sim: stream refuses: with no profile, a send that meets a reset with no FIN first (rows 23, 25, 26b, 36, 39)" {
-    try refusal("sim: stream refuses: with no profile, a send that meets a reset", "sim: rows 23, 25, 26b, 36 and 39, a send that meets a reset with no FIN before it: the kernels differ here", null, refuse2.sendMeetsReset);
+test "sim: stream refuses: with no profile, a send that meets a reset with no FIN first (rows 26b, 36, 39)" {
+    try refusal("sim: stream refuses: with no profile, a send that meets a reset", "sim: rows 26b, 36 and 39, a send that meets a reset with no FIN before it: the kernels differ here", null, refuse2.sendMeetsReset);
+}
+test "sim: stream refuses: with no profile, a send parked when a reset arrives after a FIN (row 41)" {
+    try refusal("sim: stream refuses: with no profile, a send parked when a reset arrives after a FIN", "sim: row 41, a send parked when a reset arrives after a FIN: the kernels differ here", null, refuse2.parkedSendFinReset);
 }
 test "sim: stream refuses: with no profile, a read that meets a reset after a FIN (rows 8, 22)" {
     try refusal("sim: stream refuses: with no profile, a read that meets a reset after a FIN", "sim: rows 8 and 22, a read that meets a reset after a FIN had landed: the kernels differ here", null, refuse2.readAfterFinReset);
@@ -1939,7 +2056,8 @@ pub const chk2 = struct {
     pub fn profiles() anyerror!void {
         try prow.inSim(.linux);
         try prow.inSim(.macos);
-        try sim.expectChildPanics("sim: stream refuses: with no profile, a send that meets a reset", "sim: rows 23, 25, 26b, 36 and 39, a send that meets a reset with no FIN before it: the kernels differ here");
+        try sim.expectChildPanics("sim: stream refuses: with no profile, a send that meets a reset", "sim: rows 26b, 36 and 39, a send that meets a reset with no FIN before it: the kernels differ here");
+        try sim.expectChildPanics("sim: stream refuses: with no profile, a send parked when a reset arrives after a FIN", "sim: row 41, a send parked when a reset arrives after a FIN: the kernels differ here");
     }
     pub fn shutdownRules() anyerror!void {
         try run(1, null, fin_after_chunks.body);

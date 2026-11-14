@@ -1842,8 +1842,24 @@ it: 70000 bytes in one send give one `ECONNRESET`, then 0, 0.
 
 **The profiles.** `sim.setStreamProfile(.linux | .macos)` is called before
 the run's first stream socket opens, and is set once per run; a change
-later panics. It is in the state digest. Each profile follows one
-kernel's measured joint trace on every row where the kernels differ:
+later panics. It is in the state digest. Each profile follows what a zio
+program sees on one kernel, on every row where the kernels differ
+(t-4119's ruling, sitting 30: the parity test, one test through zio on
+real sockets and in the sim, is the oracle; the C probes explain the
+kernel). Where no op is parked, zio sees the probe's answers. Where an op
+is parked, zio's readiness backends end it on an error or hang-up event by
+reading `SO_ERROR`, which reports the reset and clears it, so:
+
+- **A send parked when a reset arrives takes it** (line 3a of the send
+  evaluation, below): `ConnectionResetByPeer` with no FIN first, on both
+  kernels (rows 23, 25); after a FIN, `BrokenPipe` under `.linux` (its
+  `SO_ERROR` is `EPIPE`) and `ConnectionResetByPeer` under `.macos` (row
+  41). It sets `reset_reported`, so reads then give 0. "Parked" means
+  parked at the reset's landing; a send woken and not yet harvested then
+  is evaluated as a call (not measured: the two cannot be told apart on
+  loopback).
+
+The rest of each profile, for calls:
 
 - **`.linux`: one pending error, reported once by the first send or read
   that meets it.** The pending error exists while `reset_received` is set
@@ -1853,20 +1869,23 @@ kernel's measured joint trace on every row where the kernels differ:
   0) and a send reports as `BrokenPipe`. Reporting sets `reset_reported`.
   After that, reads give 0 and sends give `BrokenPipe`. Rows 7, 8, 17,
   18, 20, 22, 23, 25, 26, 26b, 36 and 39 to 40.
-- **`.macos`: after a reset, every send gives `BrokenPipe`.** This
-  includes a send parked at that moment. A send never reports the reset
-  and never sets `reset_reported`. The first read after the unread bytes
-  gives `ConnectionResetByPeer` once, whether or not a FIN landed first,
-  and sets `reset_reported`; later reads give 0. Rows 7, 8, 17, 18, 20,
-  22, 23, 25, 26, 26b, 36 and 39 to 41.
+- **`.macos`: after a reset, a send that is called gives `BrokenPipe`**
+  and never reports the reset (a parked send: above). The first read
+  after the unread bytes gives `ConnectionResetByPeer` once, whether or
+  not a FIN landed first, and sets `reset_reported`; later reads give 0.
+  Rows 7, 8, 17, 18, 20, 22, 23, 25, 26, 26b, 36 and 39 to 41. (Revision
+  3 said "this includes a send parked at that moment", from the probe's
+  blocking send; zio on macOS gives `ECONNRESET` there.)
 
 **Reaching a differing row with no profile panics and names the row.**
 Rows where the kernels agree need no profile, so an ordinary test that
 never meets one of these points needs none. The points, each at a call
 or at a landing, never earlier:
-- a send that meets a reset with no FIN before it and not yet reported
-  (rows 23, 25, 26b, 36, 39). After a FIN, or once a read reported it,
-  both kernels give `BrokenPipe`;
+- a send called after a reset with no FIN before it and not yet reported
+  (rows 26b, 36, 39). After a FIN, or once a read reported it, both
+  kernels give `BrokenPipe`. A send parked at a reset with no FIN first
+  needs no profile: zio gives `ECONNRESET` on both (rows 23, 25);
+- a send parked when a reset arrives after a FIN (row 41);
 - a read that meets a reset after a FIN had landed, with no unread bytes
   (rows 8, 22). Without a FIN first both give `ConnectionResetByPeer`
   once;
@@ -1951,6 +1970,11 @@ before the own FIN):
 1. The endpoint failed and has not reported it: the failure's error; now
    reported.
 2. The endpoint failed and has reported it: `BrokenPipe`.
+3a. A reset was received and not reported, and this is the harvest of the
+   send that was parked when it arrived (`reset_parked_send`): now
+   reported; `ConnectionResetByPeer` with no FIN first; after a FIN,
+   `.linux` `BrokenPipe`, `.macos` `ConnectionResetByPeer`, no profile
+   panic (row 41). (t-4119's ruling.)
 3. A reset was received: `.linux`: if it is not reported,
    `ConnectionResetByPeer` without a FIN first and `BrokenPipe` after one,
    and it is now reported; if it is reported, `BrokenPipe`. `.macos`:
@@ -2284,9 +2308,9 @@ Rows 39 to 41 are `tcpprobe4.c`'s new rows. The raw outputs are
 | 20 | RST behind 6 unread bytes | 6; `ECONNRESET`; 0; send `EPIPE` | the same | the same |
 | 21 | FIN behind 6 unread bytes | 6; 0; 0 | the same | the same |
 | 22 | peer sent 5 and closed; own send; reads | ok; 5; `ECONNRESET`; 0; send `EPIPE` | ok; 5; 0; 0; send `EPIPE` | profile |
-| 23 | send blocked, peer resets; then reads | `EPIPE`; `ECONNRESET`, 0 | `ECONNRESET`; 0, 0 | profile |
+| 23 | send blocked, peer resets; then reads | `EPIPE`; `ECONNRESET`, 0 | `ECONNRESET`; 0, 0 | zio's: `ECONNRESET`; 0, 0 on both (line 3a) |
 | 24 | send blocked, own `SHUT_WR` | `EPIPE` | `EPIPE` | `BrokenPipe` |
-| 25 | send blocked, peer closes with unread | `EPIPE` | `ECONNRESET` | profile |
+| 25 | send blocked, peer closes with unread | `EPIPE` | `ECONNRESET` | zio's: `ECONNRESET` on both (line 3a) |
 | 26 | client resets before accept; read first | accept ok; `ECONNRESET`; 0 | the same | the same |
 | 26b | the same; send first | send `EPIPE`, `EPIPE`; reads `ECONNRESET`, 0 | send `ECONNRESET`, `EPIPE`; reads 0, 0 | profile |
 | 27 | client sends 1 and closes before accept | accept ok; 1; 0; send ok | the same | the same |
@@ -2306,10 +2330,57 @@ Rows 39 to 41 are `tcpprobe4.c`'s new rows. The raw outputs are
 | 39u | own `SHUT_WR` after 1 byte the peer never reads; peer closes; as 39 | as 39 | as 39 | as 39 |
 | 39w | own `SHUT_WR`, peer resets; `SHUT_WR`, `SHUT_RDWR`; reads | `ENOTCONN`, `ENOTCONN`; `ECONNRESET`, 0 | the same | the same (shutdown line 2 before line 3) |
 | 40 | `SHUT_RDWR`, nothing unread; peer sends 70000 in one call; reads; peer sends, reads | 0, 0, 0; peer `EPIPE`, `ECONNRESET` | `ECONNRESET`, 0, 0; peer `EPIPE`, 0 | profile; one local reset, never re-armed |
-| 41 | send blocked on a full window, receiver (all unread) does `SHUT_RDWR`; then sends, read; receiver reads | wakes `EPIPE`; `EPIPE`, `EPIPE`; `ECONNRESET`; receiver 0, 0 | stays blocked (the 2 s guard ends it); sends `EAGAIN`; read 0; receiver reads the bytes | profile; under `.macos` the window release (17.7), with the limit of 17.14 |
+| 41 | send blocked on a full window, receiver (all unread) does `SHUT_RDWR`; then sends, read; receiver reads | wakes `EPIPE`; `EPIPE`, `EPIPE`; `ECONNRESET`; receiver 0, 0 | stays blocked (the 2 s guard ends it); sends `EAGAIN`; read 0; receiver reads the bytes | profile; `.macos` zio's: the window release (17.7), the parked send `ECONNRESET`, reads 0; `.linux` stays parked (the window has no gap: 41g) |
+| 41g | as 41 through zio, with the `SHUT_RDWR` 50 ms after the send starts, while the window still has a gap (Linux only) | not run (t-4126) | the parked send ends `EPIPE` about one RTO later; read 0; receiver reads the bytes | not modelled (17.14) |
+| 42 | read parked, peer resets; then read, send (through zio only) | `ECONNRESET`; 0; `EPIPE` | the same | the same |
+| 43 | send (full window) and read both parked on one endpoint, peer resets; then read, send (through zio only) | one op `ECONNRESET`, the other its after-reset answer (send `EPIPE`, read 0); 0; `EPIPE` | the same | the same: the harvest order picks the op (17.8, line 3a) |
+| 44 | read parked, peer's FIN (through zio only) | 0; 0 | the same | the same |
 
 **Not measured:** a listener closed while a SYN or SYN-ACK is in flight.
 Loopback is too fast to catch it; the sim's rule is 17.6's.
+
+**The ruling on t-4119 (sitting 30).** The sim shows what a zio program
+sees on a kernel, not what a blocking C call sees: both users reach the
+kernel only through zio. The parity table (17.15 item 5) is the oracle,
+with one expected column per kernel, measured through zio. The probes
+stay as the explanation of the kernel. Where an op is parked the two
+differ: zio's kqueue and epoll backends end a parked op on `EV_EOF` or
+`EPOLLERR`/`EPOLLHUP` by reading `SO_ERROR` (read: `handleKqueueError`,
+`handleEpollError`), and a later op that finds it 0 retries its call.
+Rows 23, 25 and 41 changed under `.macos` for this. Rows 42 to 44 are new
+cells where an op is parked that no probe ran; each was predicted from
+that mechanism and then measured through zio (sitting 30's report).
+
+**Linux row 41, measured (sitting 30, `r41x.c` beside its report, 3 runs
+per variant).** The probe's blocked send and zio's parked one differ
+because the window differs at the `SHUT_RDWR`, not because one is zio:
+- When a sender stalls, its window usually has a gap smaller than one
+  segment (the loopback MSS is about 64 KiB; the measured `snd_wnd` was
+  14464). About 250 ms later its persist timer sends data into the gap,
+  and the window is 0 (`tcp_info`'s `snd_wnd`, `last_data_sent`).
+- `SHUT_RDWR` after that: only zero-length window probes follow
+  (`TCPWinProbe` +4), and the send stays blocked. The probe's `fill()`
+  waits about 60 ms, then 200 ms more, so it is in this case; so is an
+  epoll writer or a blocking loop with the event at 300 or 600 ms.
+- `SHUT_RDWR` while the gap is open: about one RTO (about 206 ms) after the
+  receiver's FIN reaches the sender, the persist timer sends data into the
+  gap; the receiver, shut for reading, resets (`TCPAbortOnData` +1); the
+  sender has the FIN, so its error is `EPIPE`. An epoll writer and a
+  blocking loop both end `EPIPE` 207 to 216 ms after the event, with the
+  event at 50, 100 or 200 ms. zio's parity row waited 200 ms, so it was
+  in this case. `TCP_NODELAY` and a read before the event changed
+  nothing.
+- The kernel's mechanism (the persist timer's partial segment, the reset
+  on data after `RCV_SHUTDOWN`, `EPIPE` for an RST in `CLOSE_WAIT`) is my
+  reading of what the counters show, not read in the kernel's source.
+
+The sim's window has no segment size, so it never has the gap: it is
+always in the zero-window case, where the kernel keeps the send blocked.
+That is row 41's `.linux` column, now measured with the event at 600 ms.
+The gap case is row 41g, run on a Linux kernel only, and a fidelity limit
+(17.14). Modelling it would need a segment size, the persist timer and an
+RTO copied from the kernel; refusing it would also refuse the zero-window
+case, which the sim gets right.
 
 ### 17.14 Fidelity limits added to section 10
 
@@ -2325,12 +2396,19 @@ Loopback is too fast to catch it; the sim's rule is 17.6's.
 - There is no send buffer apart from the window: a send admits straight
   into the window and returns the count. So in row 41 under `.macos` the
   parked send is woken by the window release, admits and returns a
-  count, and the next send gives `BrokenPipe` once its bytes have drawn
-  the RST. macOS's blocked send itself returned `EPIPE`, because its
-  bytes waited behind a full send buffer. A program that loops until all
-  is written (zio's `writeAll`) sees `BrokenPipe` in both. Not measured
-  through zio's non-blocking path on a kernel.
+  count, and the next send parks until its bytes have drawn the RST,
+  which it then takes (`ConnectionResetByPeer`, 17.8 line 3a). macOS's
+  blocked send itself returned `EPIPE`, because its bytes waited behind a
+  full send buffer. A program that loops until all is written (zio's
+  `writeAll`) sees `ConnectionResetByPeer` in both: measured through zio
+  on macOS (parity row 41, sittings 29 and 30).
 - Chunk sizes follow a declared pattern, not an MSS.
+- There is no segment size, so a window is never left with a gap smaller
+  than one segment, and there is no persist timer. Under `.linux`,
+  `shutdown(.both)` with unread bytes while the sender's window still has
+  such a gap ends the sender's parked send `BrokenPipe` about one RTO
+  later on a kernel (parity row 41g); in the sim the send stays parked, as
+  on a kernel whose gap is already filled (row 41).
 - `shutdown(.receive)` and `SO_ERROR` are refused.
 - A passive closer's port is free at its close (a kernel holds it until
   the last ACK, well under the probe's 50 ms on loopback).

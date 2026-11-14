@@ -2167,12 +2167,29 @@ fn isFlowHead(rest: []const WireDatagram, k: usize) bool {
 //   names it: a bind with SO_REUSEADDR next to a listener on another
 //   address of the port (row 12), a rebind over a TIME_WAIT reservation
 //   that did not set SO_REUSEADDR (row 31), a connect to 127/8 other than
-//   127.0.0.1 (rows 15 and 30), a send that meets a reset with no FIN
-//   before it (rows 23, 25, 26b, 36, 39), a read that meets a reset after
-//   a FIN (rows 8, 22), shutdown(.both) with unread bytes (row 17), and
-//   data that lands after shutdown(.both) (row 18). The profiles follow the
-//   probes' blocking calls; for a send parked when an RST lands, zio's
-//   backends give another answer on real sockets (t-4119, open).
+//   127.0.0.1 (rows 15 and 30), a send called after a reset with no FIN
+//   before it (rows 26b, 36, 39), a send parked when a reset arrives after
+//   a FIN (row 41), a read that meets a reset after a FIN (rows 8, 22),
+//   shutdown(.both) with unread bytes (row 17), and data that lands after
+//   shutdown(.both) (row 18).
+// - What a profile follows (t-4119's ruling): what a zio program sees on
+//   that kernel, which is not always what a blocking C call sees. The two
+//   differ where an op is parked: zio's readiness backends (kqueue, epoll)
+//   end a parked op on an error or hang-up event by reading SO_ERROR, which
+//   reports the reset and clears it. So a send parked when a reset arrives
+//   takes it: ECONNRESET with no FIN first, on both kernels (rows 23, 25);
+//   after a FIN, ECONNRESET on macOS and EPIPE on Linux (row 41). Reads then
+//   give 0. A send called after the reset follows the kernel's send: EPIPE
+//   on macOS, the pending error once on Linux. The parity table in
+//   `sim_stream_bytes_test.zig` runs each row through zio on the kernel and
+//   in a sim run, with one expected column per kernel.
+// - Not modelled (design 17.14): under `.linux`, shutdown(.both) with unread
+//   bytes while the sender's window still has a gap smaller than one
+//   segment. The kernel's persist timer then sends data into the gap, the
+//   shut receiver resets, and the parked send ends EPIPE (parity row 41g).
+//   The sim's window has no segment size, so it never has that gap: it is
+//   always in the state the kernel reaches once the gap is filled, where the
+//   send stays parked (row 41).
 // - Settings, each in a run, on the sim thread: `setStreamWindow(fd, n)`
 //   (the window toward `fd`, 1 byte to 16 MiB, default 256 KiB, refused
 //   while the peer's send is woken and not harvested) and
@@ -2386,6 +2403,11 @@ const StreamEnd = struct {
     shut_rd: bool = false,
     /// An op returned the reset's error (design 17.8, the two facts).
     reset_reported: bool = false,
+    /// The op id of the send that was parked when the reset was received,
+    /// if one was. Set with `reset_received`, profile-neutral; the send
+    /// evaluation reads it at that op's harvest (design 17.8: a parked send
+    /// takes the reset, as zio's readiness backends end it with SO_ERROR).
+    reset_parked_send: ?u32 = null,
     /// Bytes landed and not read: `unread.items[unread_head..]`. Freed when
     /// the connection retires.
     unread: std.ArrayList(u8) = .empty,
@@ -3100,12 +3122,28 @@ fn sendEval(s: *StreamSock, bufs: anytype) StreamResult {
     const e = endOf(s);
     if (e.reset_received) {
         if (e.reset_reported) return .{ .err = error.BrokenPipe };
+        // Line 3a: the send that was parked when the reset arrived, at its
+        // harvest (it is the endpoint's one unresolved send then; at a
+        // call there is none). zio's readiness backends end a parked op
+        // with SO_ERROR, which reports the reset and clears it (t-4119's
+        // ruling: the sim follows zio on the kernel). With no FIN first,
+        // both kernels then give ECONNRESET (rows 23, 25). After a FIN,
+        // Linux's SO_ERROR is EPIPE and macOS's ECONNRESET (row 41).
+        const parked_at_reset = if (s.unresolved_send) |u| e.reset_parked_send == u.id else false;
+        if (parked_at_reset) {
+            e.reset_reported = true;
+            if (!e.fin_before_reset) return .{ .err = error.ConnectionResetByPeer };
+            return switch (needProfile("row 41, a send parked when a reset arrives after a FIN")) {
+                .linux => .{ .err = error.BrokenPipe },
+                .macos => .{ .err = error.ConnectionResetByPeer },
+            };
+        }
         if (e.fin_before_reset) {
             // Both kernels give EPIPE; Linux consumes its pending `pipe`.
             if (stream_profile == .linux) e.reset_reported = true;
             return .{ .err = error.BrokenPipe };
         }
-        switch (needProfile("rows 23, 25, 26b, 36 and 39, a send that meets a reset with no FIN before it")) {
+        switch (needProfile("rows 26b, 36 and 39, a send that meets a reset with no FIN before it")) {
             .linux => {
                 e.reset_reported = true;
                 return .{ .err = error.ConnectionResetByPeer };
@@ -3719,6 +3757,7 @@ fn landRst(ci: u16, at: Side) StreamOutcome {
             x.reset_received = true;
             x.fin_before_reset = x.fin_in;
             if (x.phase == .est) {
+                x.reset_parked_send = if (streams[x.slot].parked_send) |p| p.id else null;
                 wakeRecv(x.slot);
                 wakeSend(x.slot);
             }
@@ -3767,6 +3806,7 @@ fn landData(e: TcpEntry) StreamOutcome {
             // landed RST, set once; a later chunk takes line 2 above.
             x.reset_received = true;
             x.fin_before_reset = false;
+            x.reset_parked_send = if (streams[x.slot].parked_send) |ps| ps.id else null;
             stream_stats.local_resets += 1;
             wakeRecv(x.slot);
             wakeSend(x.slot);
@@ -4038,9 +4078,16 @@ fn digestStreams(h: *std.hash.Wyhash) void {
             f[15] = x.listener_slot;
             std.mem.writeInt(u32, f[16..20], x.listener_gen, .little);
             std.mem.writeInt(u64, f[20..28], x.queue_pos, .little);
-            f[28] = @intFromBool(x.linger0) | (@as(u8, @intFromBool(x.shut_rd)) << 1) | (@as(u8, @intFromBool(x.reset_reported)) << 2);
+            f[28] = @intFromBool(x.linger0) | (@as(u8, @intFromBool(x.shut_rd)) << 1) | (@as(u8, @intFromBool(x.reset_reported)) << 2) | (@as(u8, @intFromBool(x.reset_parked_send != null)) << 3);
             @memset(f[29..32], 0);
             h.update(&f);
+            // Hashed only when set, so a run that never sets it keeps its
+            // digests.
+            if (x.reset_parked_send) |id| {
+                var g: [4]u8 = undefined;
+                std.mem.writeInt(u32, &g, id, .little);
+                h.update(&g);
+            }
             std.mem.writeInt(u64, &b, x.unreadLen(), .little);
             h.update(&b);
             h.update(x.unread.items[x.unread_head..]);
