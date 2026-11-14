@@ -36,6 +36,8 @@ pub fn random(buffer: []u8) void {
     if (getCurrentExecutorOrNull()) |exec| {
         exec.random_state.csprng.fill(buffer);
     } else {
+        // Off an executor this is real entropy, which a seed cannot replay.
+        @import("sim.zig").refuseDuringRun("zio.random off an executor (real entropy)");
         os.getrandom(buffer) catch {
             const seed = time.Timestamp.now(.monotonic).toNanoseconds();
             var prng = std.Random.DefaultPrng.init(seed);
@@ -54,6 +56,10 @@ pub const RandomSecureError = error{EntropyUnavailable} || Cancelable;
 /// Future per-backend optimizations can skip the thread pool entirely: async
 /// reads from /dev/urandom on io_uring, and \Device\CNG via IOCP on Windows.
 pub fn randomSecure(buffer: []u8) RandomSecureError!void {
+    // Secure entropy is never replaced with replayable bytes; under sim it is
+    // refused instead (also through `std.Io`'s `randomSecure`, which comes
+    // here).
+    @import("sim.zig").refuseDuringRun("zio.randomSecure (real entropy)");
     // Result lives on our stack, defaulted to Canceled, so that if the work is
     // canceled before it runs we surface cancellation instead of a bogus value.
     var result: RandomSecureError!void = error.Canceled;

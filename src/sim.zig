@@ -203,8 +203,51 @@ pub fn begin(seed_value: u64) void {
     next_task_id = 1;
     task_id_len = 0;
     resetIo();
+    establishFdNamespace();
     // Last, so a thread that sees the owner also sees the seed.
     sim_thread.store(threadKey(), .release);
+}
+
+/// The soft `RLIMIT_NOFILE` before `begin` lowered it, restored by `end`.
+var saved_nofile_soft: ?std.posix.rlim_t = null;
+
+/// A sim fd is `fd_base + index`, a plain integer the kernel could also hand
+/// out: with a soft limit above `fd_base`, `dup2(real, fd_base)` succeeds
+/// (round 4: it did on macOS with the soft limit at 1048576). So `begin`
+/// lowers the soft limit to `fd_base`, after which the kernel never creates
+/// a descriptor at or above it and refuses `dup2` to one, reads it back, and
+/// checks that no descriptor is already open in the sim range. Code that
+/// raises the limit again during the run is caught at the next sim fd
+/// (`checkFdNamespace`). POSIX only: there are no sim fds on Windows.
+fn establishFdNamespace() void {
+    if (comptime builtin.os.tag == .windows) return;
+    const rl = std.posix.getrlimit(.NOFILE) catch |err| panic("sim: fd namespace: getrlimit failed: {t}", .{err});
+    saved_nofile_soft = null;
+    if (rl.cur > fd_base) {
+        std.posix.setrlimit(.NOFILE, .{ .cur = fd_base, .max = rl.max }) catch |err|
+            panic("sim: fd namespace: cannot lower the soft RLIMIT_NOFILE to {d}: {t}", .{ fd_base, err });
+        saved_nofile_soft = rl.cur;
+    }
+    checkFdNamespace();
+    var n: i32 = fd_base;
+    while (n < fd_base + max_ends) : (n += 1) {
+        if (std.c.fcntl(n, std.c.F.GETFD) != -1) panic("sim: fd namespace: real descriptor {d} is open in the sim fd range", .{n});
+    }
+}
+
+/// Panics unless the soft `RLIMIT_NOFILE` is at most `fd_base`.
+fn checkFdNamespace() void {
+    if (comptime builtin.os.tag == .windows) return;
+    const rl = std.posix.getrlimit(.NOFILE) catch |err| panic("sim: fd namespace: getrlimit failed: {t}", .{err});
+    if (rl.cur > fd_base) panic("sim: fd namespace: the soft RLIMIT_NOFILE is {d}, above the sim fd base {d}", .{ rl.cur, fd_base });
+}
+
+fn restoreFdNamespace() void {
+    if (comptime builtin.os.tag == .windows) return;
+    const soft = saved_nofile_soft orelse return;
+    saved_nofile_soft = null;
+    const rl = std.posix.getrlimit(.NOFILE) catch return;
+    std.posix.setrlimit(.NOFILE, .{ .cur = soft, .max = rl.max }) catch {};
 }
 
 fn threadKey() u64 {
@@ -285,6 +328,7 @@ fn resetIo() void {
 
 pub fn end() void {
     refuseOtherThread("sim.end");
+    restoreFdNamespace();
     sim_thread.store(0, .release);
     begun = false;
     clock_routed = true;
@@ -497,6 +541,7 @@ fn allocEnd() u8 {
 pub fn pipePair() [2]i32 {
     if (comptime !compiled_in) unreachable;
     refuseOtherThread("sim.pipePair");
+    checkFdNamespace();
     if (!begun) panic("sim: pipePair before begin", .{});
     const a = allocEnd();
     const b = allocEnd();
@@ -2423,6 +2468,101 @@ test "sim: refuses a DNS lookup during a run" {
             var storage: [4]@import("dns/root.zig").LookupResult = undefined;
             const host: @import("net.zig").HostName = .{ .bytes = "localhost" };
             _ = host.lookup(&storage, .{ .port = 80 }) catch {};
+        }
+    }.body);
+}
+
+// ---- Phase 1 (design rev 3, sections 3.3 and 7): fd namespace, entropy ----
+
+const p1 = struct {
+    const random_mod = @import("random.zig");
+
+    /// Whether this process could hold a real descriptor at a sim fd number.
+    /// Under `zig build test` on macOS the hard limit was 10240 (round 4), so
+    /// the kernel cannot reach the sim range at all and these tests have
+    /// nothing to set up: they skip there, and run when the test binary is
+    /// started from a shell whose hard limit is higher.
+    fn simRangeReachable() bool {
+        const rl = std.posix.getrlimit(.NOFILE) catch return false;
+        return rl.max >= fd_base + max_ends;
+    }
+
+    /// Raises this child's soft fd limit above `fd_base`, the state a
+    /// process is often in (it was 1048576 in the shell this was written in).
+    fn raiseSoftLimit() !void {
+        const rl = try std.posix.getrlimit(.NOFILE);
+        const want: std.posix.rlim_t = 200000;
+        if (rl.max < want) return error.SkipZigTest;
+        try std.posix.setrlimit(.NOFILE, .{ .cur = want, .max = rl.max });
+    }
+};
+
+test "sim: fd namespace: begin lowers the soft fd limit to the sim base, a real descriptor cannot take a sim number, and end restores the limit" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!isDeathChild() and !p1.simRangeReachable()) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildSucceeds("sim: fd namespace: begin lowers the soft fd limit to the sim base, a real descriptor cannot take a sim number, and end restores the limit");
+    noCoreDump();
+    try p1.raiseSoftLimit();
+    begin(1);
+    try std.testing.expect((try std.posix.getrlimit(.NOFILE)).cur <= fd_base);
+    try std.testing.expectEqual(@as(c_int, -1), std.c.dup2(0, fd_base));
+    try std.testing.expectEqual(@as(c_int, -1), std.c.dup2(0, fd_base + 5));
+    end();
+    try std.testing.expectEqual(@as(std.posix.rlim_t, 200000), (try std.posix.getrlimit(.NOFILE)).cur);
+    childDone("sim: fd namespace: begin lowers the soft fd limit to the sim base, a real descriptor cannot take a sim number, and end restores the limit");
+}
+
+test "sim: fd namespace: begin refuses when a real descriptor holds a sim fd number" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!isDeathChild() and !p1.simRangeReachable()) return error.SkipZigTest;
+    try refusal("sim: fd namespace: begin refuses when a real descriptor holds a sim fd number", "sim: fd namespace: real descriptor 100003 is open in the sim fd range", struct {
+        fn body() !void {
+            try p1.raiseSoftLimit();
+            if (std.c.dup2(0, fd_base + 3) != fd_base + 3) return error.DupFailed;
+            begin(1);
+        }
+    }.body);
+}
+
+test "sim: fd namespace: a sim fd made after the soft limit was raised again is refused" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!isDeathChild() and !p1.simRangeReachable()) return error.SkipZigTest;
+    try refusal("sim: fd namespace: a sim fd made after the soft limit was raised again is refused", "sim: fd namespace: the soft RLIMIT_NOFILE is 200000, above the sim fd base 100000", struct {
+        fn body() !void {
+            begin(1);
+            try p1.raiseSoftLimit();
+            _ = pipePair();
+        }
+    }.body);
+}
+
+test "sim: refuses zio.randomSecure during a run" {
+    try refusal("sim: refuses zio.randomSecure during a run", "sim: zio.randomSecure (real entropy) during a sim run", struct {
+        fn body() !void {
+            try r3.up();
+            var buf: [8]u8 = undefined;
+            p1.random_mod.randomSecure(&buf) catch {};
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io randomSecure during a run" {
+    try refusal("sim: refuses std.Io randomSecure during a run", "sim: zio.randomSecure (real entropy) during a sim run", struct {
+        fn body() !void {
+            try r3.up();
+            const io = r3.rt.io();
+            var buf: [8]u8 = undefined;
+            io.vtable.randomSecure(io.userdata, &buf) catch {};
+        }
+    }.body);
+}
+
+test "sim: refuses zio.random off an executor during a run" {
+    try refusal("sim: refuses zio.random off an executor during a run", "sim: zio.random off an executor (real entropy) during a sim run", struct {
+        fn body() !void {
+            begin(1);
+            var buf: [8]u8 = undefined;
+            p1.random_mod.random(&buf);
         }
     }.body);
 }
