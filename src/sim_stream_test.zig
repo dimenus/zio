@@ -134,6 +134,7 @@ const handshake = struct {
         // The first TCP port of a run, apart from UDP's counter.
         try expectEqual(@as(u16, 49152), portOf(server));
         var h = try rt_mod.spawn(acceptor, .{});
+        defer h.cancel();
         const t0 = sim.clockNs();
         const c = try connect(lo, 49152, .none);
         // The SYN-ACK lands two latencies after the SYN left.
@@ -339,7 +340,9 @@ const listener_close = struct {
         // fourth whose client is dead before the listener closes.
         const t0 = sim.clockNs();
         var h3 = try rt_mod.spawn(lateConnect, .{});
+        defer h3.cancel();
         var h4 = try rt_mod.spawn(deadConnect, .{});
+        defer h4.cancel();
         try rt_mod.sleep(.fromMicroseconds(16 * L / 10000));
         try expectEqual(t0 + 16 * L / 10, sim.clockNs());
         try expect(timed_out);
@@ -390,6 +393,7 @@ const close_wakes_accept = struct {
     fn body() !void {
         server = try listen(lo, 0, .{});
         var h = try rt_mod.spawn(acceptor, .{});
+        defer h.cancel();
         try rt_mod.sleep(.fromMicroseconds(10));
         server.close();
         h.join();
@@ -682,6 +686,7 @@ const port_reuse = struct {
         const first = try listen(lo, 7000, .{});
         const t0 = sim.clockNs();
         var h = try rt_mod.spawn(connector, .{});
+        defer h.cancel();
         // The SYN landed at L (provisional); close the listener at 1.5L, so
         // its RST follows the SYN-ACK, and bind the port again at once.
         try rt_mod.sleep(.fromMicroseconds(3 * L / 2000));
@@ -784,6 +789,7 @@ const std_io = struct {
         server = try std.Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true });
         try expectEqual(@as(u16, 49152), server.socket.address.getPort());
         var h = try rt_mod.spawn(acceptor, .{io});
+        defer h.cancel();
         const t0 = sim.clockNs();
         const client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream });
         try expectEqual(t0 + 2 * L, sim.clockNs());
@@ -943,7 +949,8 @@ const refuse_bodies = struct {
     }
     fn secondAccept() !void {
         server = try listen(lo, 0, .{});
-        _ = try rt_mod.spawn(accepter, .{});
+        var spawned = try rt_mod.spawn(accepter, .{});
+        defer spawned.cancel();
         try rt_mod.sleep(.fromMicroseconds(10));
         _ = try server.accept(.{});
     }
@@ -954,7 +961,8 @@ const refuse_bodies = struct {
     fn backlog() !void {
         const s = try listen(lo, 0, .{ .kernel_backlog = 1 });
         port = portOf(s);
-        _ = try rt_mod.spawn(connector, .{});
+        var spawned = try rt_mod.spawn(connector, .{});
+        defer spawned.cancel();
         _ = try connect(lo, port, .none);
         try rt_mod.sleep(.fromMilliseconds(1));
     }
@@ -1937,6 +1945,7 @@ const syn_in_flight = struct {
         result = error.NotRun;
         const first = try listen(lo, 7001, .{});
         var h = try rt_mod.spawn(connector, .{});
+        defer h.cancel();
         try rt_mod.sleep(.fromMicroseconds(L / 2000));
         first.close();
         if (!replace) {
@@ -2079,6 +2088,7 @@ const port_wrap = struct {
         // A connect from an unbound socket takes the next port after the
         // wrap, from the same counter.
         var h = try rt_mod.spawn(acceptOne, .{c});
+        defer h.cancel();
         const k = try connect(lo, portOf(c), .none);
         try expectEqual(sim.first_ephemeral_port + 1, (try localOf(k.socket.handle)).port);
         const acc = try h.join();

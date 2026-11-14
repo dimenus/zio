@@ -99,6 +99,7 @@ const round_trip = struct {
         var data: [20000]u8 = undefined;
         fill(&data, 3);
         var h = try rt_mod.spawn(reader, .{s});
+        defer h.cancel();
         const t0 = sim.clockNs();
         try c.writeAll(&data, .none);
         // The window (256 KiB) takes it all at once.
@@ -210,6 +211,7 @@ const window = struct {
         try expectEqual(@as(u32, 3000), (try dir(true)).window);
         const t0 = sim.clockNs();
         var h = try rt_mod.spawn(sender, .{c});
+        defer h.cancel();
         var buf: [1000]u8 = undefined;
         // The first send admits the window, 3000, and the second parks.
         try expectEqual(@as(usize, 1000), try s.read(&buf, .none));
@@ -1197,7 +1199,9 @@ const woken_send_cancel = struct {
         }
         // Both reads at L, both credits land at 2L, in one harvest.
         var h0 = try rt_mod.spawn(reader, .{s0});
+        defer h0.cancel();
         var h1 = try rt_mod.spawn(reader, .{s1});
+        defer h1.cancel();
         try h0.join();
         try h1.join();
         try rt_mod.sleep(.fromMicroseconds(2 * L / us));
@@ -1432,6 +1436,7 @@ const release = struct {
         sim.setStreamWindow(s.socket.handle, 3000);
         sim.setStreamChunking(c.socket.handle, .off);
         var h = try rt_mod.spawn(sender, .{c});
+        defer h.cancel();
         try rt_mod.sleep(.fromMicroseconds(L / us + 10));
         try expectEqual(@as(usize, 3000), sim.testStreamEnd(s.socket.handle).unread);
         const t0 = sim.clockNs();
@@ -1571,6 +1576,7 @@ const owed_to_live_sender = struct {
         try expectEqual(@as(usize, 2), try c.write("ab", .none));
         try rt_mod.sleep(.fromMicroseconds(L / us));
         var h = try rt_mod.spawn(writer, .{c});
+        defer h.cancel();
         var b: [1]u8 = undefined;
         const t1_ = sim.clockNs();
         try expectEqual(@as(usize, 1), try s.read(&b, .none));
@@ -1624,6 +1630,7 @@ const window_changes = struct {
         try expectEqual(@as(usize, 2), try c.write("ab", .none));
         // Grow: the parked send wakes and admits 2 at the same instant.
         var h0 = try rt_mod.spawn(writer, .{ c, 0, "cdef" });
+        defer h0.cancel();
         try rt_mod.sleep(.fromMicroseconds(10));
         if (done[0]) return error.SendDidNotParkOnAFullWindow;
         const t_grow = sim.clockNs();
@@ -1641,6 +1648,7 @@ const window_changes = struct {
         try expectEqual(@as(u64, 4), d.unread);
         try checkConserved();
         var h1 = try rt_mod.spawn(writer, .{ c, 1, "ef" });
+        defer h1.cancel();
         var b: [2]u8 = undefined;
         // A read of 2: its credit lands one L later, and 2 in use is still
         // more than the window, so the send stays parked.
@@ -1710,7 +1718,9 @@ const window_while_woken = struct {
             loop.add(&ops[i].c);
         }
         var h0 = try rt_mod.spawn(reader, .{s0});
+        defer h0.cancel();
         var h1 = try rt_mod.spawn(reader, .{s1});
+        defer h1.cancel();
         try h0.join();
         try h1.join();
         try rt_mod.sleep(.fromMicroseconds(2 * L / us));
@@ -1819,7 +1829,8 @@ const refuse2 = struct {
     fn secondRecv() !void {
         _, const c, _ = try pair();
         srv_keep = c;
-        _ = try rt_mod.spawn(reader, .{});
+        var spawned = try rt_mod.spawn(reader, .{});
+        defer spawned.cancel();
         try rt_mod.sleep(.fromMicroseconds(10));
         var b: [4]u8 = undefined;
         _ = try c.read(&b, .none);
@@ -1832,7 +1843,8 @@ const refuse2 = struct {
         sim.setStreamWindow(s.socket.handle, 1);
         _ = try c.write("y", .none);
         srv_keep = c;
-        _ = try rt_mod.spawn(writer, .{});
+        var spawned = try rt_mod.spawn(writer, .{});
+        defer spawned.cancel();
         try rt_mod.sleep(.fromMicroseconds(10));
         _ = try c.write("z", .none);
     }
@@ -1870,7 +1882,8 @@ const refuse2 = struct {
         sim.setStreamWindow(s.socket.handle, 1);
         _ = try c.write("x", .none);
         srv_keep = c;
-        _ = try rt_mod.spawn(writer, .{});
+        var spawned = try rt_mod.spawn(writer, .{});
+        defer spawned.cancel();
         try s.shutdown(.send);
         try prow.pause();
         try prow.linger0(s);
@@ -1951,6 +1964,7 @@ const replay = struct {
         var data: [9000]u8 = undefined;
         fill(&data, 7);
         var h = try rt_mod.spawn(echo, .{s});
+        defer h.cancel();
         try c.writeAll(&data, .none);
         try c.shutdown(.send);
         var buf: [256]u8 = undefined;
@@ -2061,6 +2075,7 @@ const std_io_bytes = struct {
         server = try std.Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true });
         defer server.deinit(io);
         var h = try rt_mod.spawn(peer, .{io});
+        defer h.cancel();
         const client = try std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream });
         defer client.close(io);
         var data: [10000]u8 = undefined;
@@ -2190,6 +2205,7 @@ const fin_wakes = struct {
     fn body() !void {
         const srv, const c, const s = try pair();
         var h = try rt_mod.spawn(reader, .{s});
+        defer h.cancel();
         try rt_mod.sleep(.fromMicroseconds(10));
         const t0 = sim.clockNs();
         try c.shutdown(.send);
