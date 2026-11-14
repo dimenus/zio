@@ -4,7 +4,8 @@ Status: **phase 1 (section 12) is built, and four rounds of outside review
 of it are closed (section 15). Section 15 is the acceptance record of phase
 1. Phase 2 (faults and replay) is built and accepted at 4aeb580 (section
 15); its API and rules are the comment above `pub const Endpoint` in
-`src/sim.zig`.**
+`src/sim.zig`.** **The stream track (TCP) is designed in section 17, not
+built.**
 
 Revision 2 (dd55885) was reviewed by another vendor's model. This revision
 takes the decisions made after that review. Section 13 lists what changed
@@ -24,9 +25,10 @@ The goal: code that opens its own sockets runs under the simulator
 - **Datagram track (t-4087), for hotseat:** UDP on 127.0.0.0/8, with message
   boundaries and truncation, `net_poll`, and seeded loss, delay, reorder and
   duplication. hotseat's ENet control link and its media run over it.
-- **Stream track (t-4086), for starh2:** `listen`, `connect`, `accept` and
-  `getpeername` on 127.0.0.0/8, so `dst-conn` can run through the accept
-  loop and admission (starh2 `tools/dst-conn/main.zig:982`).
+- **Stream track (t-4086), for starh2 and hotseat:** TCP on 127.0.0.0/8,
+  so `dst-conn` can run through the accept loop and admission (starh2
+  `tools/dst-conn/main.zig:982`), and hotseat's HTTPS and RTSP can run
+  against its in-process test host. Its design is section 17.
 
 ## 2. Non-goals
 
@@ -208,8 +210,8 @@ the draw, the counts, the records and the misuse list are the comment above
 `pub const Endpoint` in `src/sim.zig`; the reasoning is in the messages of
 3d35086 (the design check) and 24fcbeb to 2561a08 (the four slices).
 
-- **Stream track:** `setConnectOutcome(path, .accept | .refuse |
-  .no_answer)` comes with that track.
+- **Stream track:** `setConnectOutcome` is dropped; section 17.6 says
+  why.
 - `datagramPair` stays private to zio's tests.
 
 ## 6. Receive limits
@@ -464,9 +466,7 @@ Before hotseat replaces ENet's socket half in production:
      rule gives another digest.
 - **Phase 3 (hotseat's):** ENet over its bridge, under sim and with the
   production gate above.
-- **Stream track (starh2's):** shares the table, fds, ports, address rules,
-  the layer's sim branch, the op dispatch and the trace framework. It starts
-  after phase 1 has merged those.
+- **Stream track:** section 17.11, slices 0 to 5.
 
 ## 13. Changes from revision 2
 
@@ -976,6 +976,11 @@ the mutants in its commits.
   holes; flows sharing a landing instant are still kept out of it).
 - Open and filed: t-4096 (zero-length receive on an empty sim pipe), t-4098
   (the op model's holes above).
+- **Next: the stream track (section 17), designed in sitting 23 and not
+  built.** It waits for the grader's review and an outside review; then
+  slice 0 (measurements, no code). Filed for the users: t-4110 (hotseat's
+  test host makes its TLS identity with `randomSecure`), t-4111 (starh2's
+  raw `getpeername`, `TCP_NODELAY` and `FIONREAD` on accepted fds).
 - **For hotseat, not zio:** ENet's receive returns 0 for an empty datagram,
   the same as would-block, so ENet's receive loop stops there for that
   service call. Later datagrams wait for the next call.
@@ -1138,3 +1143,445 @@ the mutants in its commits.
   file with `git checkout <file>` is refused too, and would drop uncommitted
   work: let the mutant runner restore it. In zsh, a word that starts with
   `=` (`echo ====`) is a command lookup and fails; quote it.
+
+## 17. The stream track: simulated TCP on loopback (design check, sitting 23)
+
+Status: **design only. Nothing in this section is built.** It is for the
+grader and for an outside review before any code. Section 16 was retired
+in 3340b0f, so this is 17. Each claim says how it is known: **(read)** from
+the code at the file and line named, **(ran)** from a command whose output
+is in report 23, or **(not measured)**, which slice 0 must measure before
+code relies on it.
+
+### 17.1 Why, and for whom
+
+- **hotseat.** Every App start is HTTPS, then RTSP over TCP, to its host
+  (read: hotseat `src/session.zig:473-480, 524-527`; `src/app/app.zig:1575`).
+  The order is: HTTPS `/serverinfo`; for a launch, `/serverinfo` again;
+  HTTPS `/launch` or `/resume`; RTSP, one TCP connection per request;
+  then UDP and ENet; HTTPS `/cancel` if the start fails. Each HTTPS
+  request uses a new connection. hotseat is the client. Its tests run the
+  host in the same process (`TestHost`, `src/test_host.zig:328, 339`), so
+  a sim test holds both ends.
+- **starh2.** It is a server. Its sim tool `dst-conn` today puts one h2c
+  connection on a `sim.pipePair` (read: starh2
+  `tools/dst-conn/main.zig:618, 630, 811`), so the accept loop and
+  admission never run under sim (`main.zig:982`).
+
+### 17.2 What exists today (read, at 366ac57)
+
+- **Sim pipes** (`sim.pipePair`, `src/sim.zig:667`): two connected ends
+  with no address, a 4096-byte buffer per direction (`pipe_buf_cap`), end
+  of stream after `shutdown(.send)`, `close`, a reset injected by
+  `setSendFaults`, and short writes. Each pipe op completes after
+  `ioDelayNs()`, 1 ms or 5 ms **drawn from the run's RNG** (`:679`).
+  Only the ev ops reach a pipe end: `NetRecv`, `NetSend`, `NetShutdown`,
+  `NetClose` (`src/ev/loop.zig`, `submitSimIo`). Any other op on a pipe
+  end panics `sim: unsimulated I/O op`.
+- **`src/os/net.zig` under sim for a stream socket:**
+  - `socket(.ipv4, .stream, ...)` during a run panics: "only IPv4
+    datagram sockets are simulated" (`:347-351`).
+  - `listen`, `accept`, `send`, `recv` on a sim datagram fd return
+    `OperationNotSupported`; `connect` on one panics; `shutdown` on one
+    returns `SocketUnconnected` (`:207, 616, 666, 708, 1169, 1294`). On any
+    other sim fd they refuse as native exits (`refuseSimFd`).
+  - There is **no `getpeername`** in the layer at all (read: grep finds
+    none in `src/os/net.zig`, `src/net.zig`, `src/ev/`).
+  - `setNoDelay` (`:841`) calls `setsockopt` directly; on a sim fd it
+    reaches `dgramSetOption`, where a TCP option is misuse (section 8).
+- **The ev ops.** `NetListen`, `NetAccept`, `NetConnect` reach the sim
+  dispatch only on a datagram fd, where they panic `unsimulated I/O op ...
+  on a datagram socket` (`src/ev/loop.zig`, `tryDgramOp`).
+- **zio's stream API**, which both users call (read, `src/net.zig`):
+  - `IpAddress.listen` (`:673`): `NetOpen(.stream)`, `SO_REUSEADDR` and
+    `SO_REUSEPORT` if asked, `NetBind`, `setNoDelay(true) catch {}` on the
+    listener, `NetListen(backlog)`. Default backlog 128 (`:36`).
+  - `IpAddress.connect` (`:692`): `NetOpen`, an optional bind of
+    `local_address`, `NetConnect` with a timeout, `setNoDelay(true) catch
+    {}`.
+  - `Server.accept` (`:1245`): `NetAccept`, through
+    `waitForIoPreferInline` when there is no timeout; it retries
+    `ConnectionAborted` and never returns it.
+  - `Stream.read`, `write`, `readVec`, `writeVec`, `shutdown`, `close`;
+    `readBuf`, `writeBuf`, `writeSplatHeader` take a handle.
+- **zio's std.Io vtable** (read, `src/io.zig`): `netListenIpImpl`
+  (`:2234`) is a thin adapter over the same calls, and with
+  `reuse_address` it also calls `setReusePort(true) catch {}` (`:2248`).
+  `netConnectIpImpl` (`:2424`) opens, connects, then `os_net.setNoDelay`.
+  `netAcceptImpl` uses `NetAccept`. Stream reads and writes go through
+  `netReadOpImpl` and `netWriteOpImpl` (`:535-548`); that these end in
+  `NetRecv` and `NetSend` is an inference I did not trace to the end.
+
+### 17.3 What the two users call (read; file and line in their repos)
+
+hotseat pins zio 33b95ca (`build.zig.zon:8`); starh2 pins 3417a77
+(`build.zig.zon:7`). Both use ianic/tls.zig. The rows were collected by a
+read-only search, and 11 of them were checked by hand; one line number was
+corrected (hotseat's TLS reader and writer are at `gamestream.zig:261-262`).
+
+**hotseat (all TCP through `zio.net`):**
+
+| call | file:line | notes |
+|---|---|---|
+| `addr.connect(.{})`, by IP | `src/gamestream.zig:181`, `src/rtsp.zig:271` | deadline from `zio.AutoCancel` |
+| `HostName.connect(port, .{})`, DNS | `src/seat.zig:161` | the seat API, port 9443 |
+| `stream.writeAll(request, .none)` | `gamestream.zig:197`, `rtsp.zig:273` | |
+| `stream.read(&buf, .none)` until 0 | `gamestream.zig:200`, `rtsp.zig:278` | EOF ends the reply |
+| `stream.reader`, `stream.writer` for TLS | `gamestream.zig:261-262`, `tls.client` at `:273` | `.rng` from `io.random`, `.now` from the real clock (`:274-275`) |
+| `defer stream.close()` | `gamestream.zig:182`, `rtsp.zig:272`, `seat.zig:162` | no shutdown |
+| tests: `IpAddress.parseIp4("127.0.0.1", 0).listen(.{})` | `gamestream.zig:371`, `test_host.zig:328, 339, 1399`, `session.zig:1260` | backlog 128 |
+| tests: `server.accept(.{ .timeout = ... })` | `gamestream.zig:356`, `test_host.zig:608` | |
+| tests: `server.socket.address.ip` for the port | `gamestream.zig:375`, `test_host.zig:534` | the bound address |
+| tests: connect to 127.0.0.1:1, expect `ConnectionRefused` | `session.zig:2761` | |
+| tests: a raw libc listener that never accepts | `src/app/app.zig:2344-2351` | `std.c.listen(fd, 8)`: a real fd, stays a real-socket test |
+| AF_UNIX listen, connect, accept | `src/control_socket.zig:58-119`, `src/cli_stream.zig:301` | production control socket |
+
+hotseat calls no `setsockopt`, `getpeername`, `shutdown` or `poll` on a
+TCP fd (read: grep of `src/`).
+
+**starh2 (std.Io.net on zio's vtable, plus raw zio ops and raw libc):**
+
+| call | file:line | notes |
+|---|---|---|
+| `address.listen(io, .{ .reuse_address = true, .kernel_backlog = backlog })` | `src/edge/server.zig:1984` | backlog 4096 (`src/core/limits.zig:247`) |
+| `listener.accept(io)` | `server.zig:1317` | no timeout; cancel stops it |
+| `std.posix.system.setsockopt(..., TCP.NODELAY, ...)` per accepted socket | `server.zig:2020-2023` | **raw**, errno ignored |
+| `std.c.getpeername` per accepted socket | `src/edge/connection.zig:630` | **raw**; failure gives `.unknown` |
+| `std.c.ioctl(fd, FIONREAD, ...)` | `src/edge/h1.zig:661` | **raw**; lingering close |
+| `zio.net.readBuf(handle, ..., timeout)` | `server.zig:1929` | PROXY header |
+| `zio.net.writeSplatHeader` | `src/edge/wire_pump.zig:370` | |
+| `zio.ev.NetRecv` / `NetSend` on a CompletionQueue | `src/edge/tls.zig:1140, 1696`, `h1.zig:1137` | the TLS pump |
+| `stream.shutdown(io, .send)` (half-close) | `connection.zig:6168`, `h1.zig:683`, `src/http1/oneshot.zig:292, 325` | keeps reading after |
+| `stream.shutdown(io, .both)` | `connection.zig:5158, 6383`, `h1.zig:597, 1067, 1803, 2119` | |
+| `stream.close(io)` | `server.zig:1345-1383`, `connection.zig:3274` | |
+| outbound `address.connect(io, .{ .mode = .stream })` | `oneshot.zig:316` | the HTTP/1.1 client |
+| tests: `SO_LINGER` 0 (an RST) | `server.zig:2075-2078` | raw |
+| tests: `getsockopt` `TCP_NODELAY`, `TCP_INFO` | `server.zig:2043, 2121` | Linux backlog test |
+| tests: raw libc clients, `::1`, AF_UNIX | `tests/wire_client.zig`, `tests/hardening.zig` | real sockets |
+
+### 17.4 The API surface, decided per call
+
+A call **modelled** has its documented effect. A call **refused** panics
+with its name, as in section 9, unless the row says it returns an error.
+The rule from the brief: a thing neither user calls is refused, not
+built.
+
+| call | under sim | who needs it |
+|---|---|---|
+| `socket(.ipv4, .stream, .ip / .tcp)` | modelled: a sim fd | both |
+| `bind` (127/8 or 0.0.0.0, port 0 or fixed) | modelled; TCP ports are a separate table from UDP | both |
+| `listen(backlog)` | modelled; the backlog is stored (17.5) | both |
+| `accept` (ev `NetAccept`) | modelled; the peer address written | both |
+| `connect` (ev `NetConnect`), with a timeout | modelled; it waits for the handshake on the wire | both |
+| `connect` with `local_address` | refused (neither user passes it; on Linux it also sets `IP_BIND_ADDRESS_NO_PORT`) | nobody |
+| the layer's `connect` (EINPROGRESS, then poll, then `SO_ERROR`) | refused | nobody: both connect through `NetConnect` |
+| `send`, `recv` (ev `NetSend`, `NetRecv`, up to IOV_MAX buffers; `writeSplatHeader`) | modelled | both |
+| the layer's `send`, `recv` on a stream fd | refused | nobody |
+| `shutdown(.send)` | modelled: half-close | starh2 |
+| `shutdown(.both)` | modelled: a FIN, and the receive half closes; a parked receive completes with 0 (17.5) | starh2 |
+| `shutdown(.receive)` | refused: the kernels differ (17.9, row 6) | nobody |
+| `close` | modelled: a FIN, or an RST if unread bytes remain | both |
+| close with `SO_LINGER` {1, 0} (a reset) | modelled, once it goes through the layer | starh2's tests |
+| `poll` / `NetPoll` on a stream fd | refused | nobody (zio calls `NetPoll` only in sim tests: `src/sim.zig:4548, 6139, 6688`) |
+| `getsockname` | modelled | both (through `NetBind` and the listener's address) |
+| `getpeername` | a **new** layer function, modelled | starh2 (`connection.zig:630`) |
+| `FIONREAD` | a **new** layer function (`bytesReadable`), modelled | starh2 (`h1.zig:661`) |
+| `TCP_NODELAY = 1` | modelled: stored, read back as 1, inherited by accepted sockets; no effect (Nagle is not modelled) | both, through zio |
+| `TCP_NODELAY = 0` | unsupported, advisory (section 8) | nobody |
+| `SO_REUSEADDR = 1` | modelled (17.5, ports) | starh2 |
+| `SO_REUSEPORT = 1` on a stream socket | **unsupported, advisory** (`OptionNotSupported`), not misuse | zio's std.Io listen (`src/io.zig:2248`, `catch {}`) |
+| `getsockopt(TCP_NODELAY)`, `SO_ERROR` | modelled | starh2's tests; zio |
+| any other option (`SO_KEEPALIVE`, `SO_RCVBUF`, `SO_SNDBUF`, `SO_RCVTIMEO`, `TCP_INFO`, ...) on a stream socket | misuse, panics | nobody in a path that can run under sim |
+| AF_UNIX, IPv6, DNS (`HostName.connect`) | refused (section 2) | hotseat's control socket and seat API; starh2's `::1` tests |
+| the raw libc calls in 17.3 on a sim fd | not reachable by zio: the kernel answers `EBADF` (section 3.3) | t-4111 moves starh2's to the layer |
+
+**Section 8 changes for streams:** `SO_REUSEPORT` is misuse on a datagram
+socket and stays so. On a stream socket it must be advisory, or every
+std.Io listen with `reuse_address` panics, starh2's included.
+
+**A consumer's raw libc call on a sim fd fails toward silence:** starh2
+ignores `EBADF` from its NODELAY and FIONREAD calls and maps a failed
+`getpeername` to `.unknown`. zio cannot see those calls. The consumer's
+grep gate (section 3.2) is the only defence until t-4111 is done.
+
+### 17.5 The model of a connection
+
+**One socket table.** A stream socket takes a slot in the same table and
+fd range as a datagram socket, with a kind (unbound, listener, connected).
+One generation per slot, recorded at submit, as now
+(`dgramOpOnItsSocket`). Rejected: a second table with its own fd range
+and generation. Two copies of the slot code would drift (the rule in
+`real-dependencies-not-doubles`). What this depends on: datagram runs'
+digests stay equal (17.7); the promise 1 pins check it.
+
+**Ports.** TCP has its own port table and its own ephemeral counter from
+49152, as the kernels keep TCP and UDP ports apart. A separate counter
+also keeps every datagram run's ports unchanged. A connect from an
+unbound socket binds 127.0.0.1 and the next TCP port (measured on both
+kernels: the local address is 127.0.0.1; row 14).
+- Rebinding a TCP port that a socket used earlier in the run, without
+  `SO_REUSEADDR`: refused (section 8: TIME_WAIT is not modelled). With
+  it: allowed.
+- Two listeners on 127.0.0.1:P and 0.0.0.0:P: `AddressInUse`, even with
+  `SO_REUSEADDR`. macOS allows it and Linux does not (row 12); the sim
+  takes the strict answer, as in section 3.1.
+
+**The handshake, on the wire.** A connect puts a SYN on the wire. It
+lands after the wire latency (100 µs, `wire_latency_ns`) plus any fault
+delay.
+- At a listener with room in its queue: the connection is made, put in
+  the accept queue, and a SYN-ACK goes back. The connect completes when
+  that lands: one round trip. Bytes the client sends before `accept`
+  queue in the new socket, as in a kernel.
+- At no listener: an RST goes back, and the connect fails
+  `ConnectionRefused` one round trip later. Both kernels answer
+  `ECONNREFUSED` (rows 1 and 2).
+- **Backlog full: refused (panic).** Neither kernel refuses a connect
+  when the queue is full: both leave it pending, and they disagree on
+  how many fit (row 4: listen(1) took 1 on macOS and 2 on Linux). The
+  users' backlogs are 128 and 4096. Rejected: hold the connect until
+  room appears. That copies neither kernel's timing.
+- A connect to 127.0.0.2 (or any 127/8) reaches a wildcard listener.
+  macOS gave no answer in 1 s (lo0 has only 127.0.0.1); Linux connects
+  (row 15). The sim follows Linux, as section 3.1 does for datagrams.
+
+**Bytes.** A connection is two directions. Each has one number, the
+**window**: the bytes in flight plus the bytes landed and not yet read.
+- A send copies `min(len, window - used)` bytes and returns that count.
+  A short write is the normal result when room is short. With no room,
+  an ev send parks until a read frees room.
+- Each send puts **one** entry on the wire: no segmenting. Entries of one
+  direction always keep their order (the clamp of phase 2 is always on
+  for streams; reorder is refused).
+- A read takes any number of bytes up to what has landed, across entry
+  boundaries: no message boundaries.
+- Room returns to the sender **at the read**, not one latency later.
+  Rejected: a window update on the wire. It doubles the wire entries for
+  a fidelity nobody asked for. Stated in section 10 as a limit.
+- **The window size is declared, not copied from a kernel.** The kernels
+  vary too much: a non-reading peer took 319,020 and 548,188 bytes in two
+  macOS runs, and 2,612,608 on Linux (row 10). Default 256 KiB per
+  direction; a test sets another with a sim call
+  (`sim.setStreamWindow`). `SO_RCVBUF` and `SO_SNDBUF` on a stream socket
+  are misuse: no user sets them on a path that runs under sim.
+
+**End of stream and reset.** These follow the measured rows, where the
+two kernels agree:
+- `shutdown(.send)` and `close` put a FIN behind the queued bytes. The
+  peer reads them, then 0. The peer can still send back, and the half
+  that shut down can still read (row 5, both kernels).
+- A send after one's own `shutdown(.send)`: `BrokenPipe` (row 5, both).
+- `close` with unread bytes in one's own receive side sends an RST, not
+  a FIN. The peer's next read is `ConnectionResetByPeer`, and the read
+  after that is 0 (row 7, both).
+- A send to a peer that has closed: the first send succeeds, its bytes
+  reach a closed socket, and an RST comes back. The next send is
+  `BrokenPipe` (row 8, both). A read after that: macOS gives
+  `ECONNRESET` and Linux gives 0 (row 8). The sim gives
+  `ConnectionResetByPeer`: the strict answer, so a program must handle
+  the error.
+- `SO_LINGER` {1, 0}, then close: an RST at once; the peer reads
+  `ConnectionResetByPeer` (row 9, both).
+- **`shutdown(.both)`:** a FIN as for `.send`, and the receive half
+  closes. starh2 uses it to wake its own read pump, which is blocked in
+  another task (read: `connection.zig:5158-5160`, "Shutdown is
+  best-effort; task cancellation is the authoritative unblock"). So a
+  receive parked on the socket completes with 0, and every later read
+  gives 0. The receive half is where the kernels disagree (row 6: after
+  `SHUT_RD`, macOS reads 0, discards, and the peer's next send fails
+  `EPIPE`; Linux keeps delivering). **Recommended: macOS's answer**, the
+  strict one: unread bytes are discarded and counted, and bytes that land
+  later are discarded and answered with an RST, so the peer's next send
+  is `BrokenPipe`. A peer that keeps sending into a closed half then sees
+  an error, not silence. Rejected: refuse every read after `.both`
+  (it breaks starh2's wake), and Linux's answer (bytes delivered after
+  the program said it wants none). Open question 4 in report 23.
+
+**Accept.** One unresolved ev accept per listener, as one unresolved ev
+op per socket elsewhere. An accept with a connection queued completes at
+submit (no delay), so zio's inline path (`waitForIoPreferInline`) takes
+it, as upstream #872 intends. A queued connection whose client resets
+before `accept` stays in the queue, and its first read gives
+`ConnectionResetByPeer` (not measured; slice 0). The sim never produces
+`ConnectionAborted`, which zio hides anyway (`src/net.zig:1258`).
+
+**One unresolved op, and the generation.** Per connected socket, one
+unresolved ev receive and one unresolved ev send at a time (full duplex,
+as a pipe end); per listener, one unresolved accept. A second refuses at
+submit (round 3's rule). Every ev op records its slot's generation, and
+the harvest ends it `FileDescriptorNotASocket` when the generation moved
+(round 3's mechanism, unchanged). An accepted socket gets a new slot.
+
+**Close with ops parked:** as for datagrams: the parked op is ended at
+the next harvest with `FileDescriptorNotASocket`.
+
+### 17.6 One wire, one clock, the same fault rules
+
+- Stream entries (SYN, SYN-ACK, data, FIN, RST) go on the datagram wire,
+  in landing order, with the same latency. `nextDueIoRemaining` and the
+  poll's clock see them with no change. Rejected: a second wire. Two
+  landing orders would need a merge rule, and a second place that moves
+  the clock.
+- **No draw for unfaulted stream traffic.** A stream op never draws from
+  the run's RNG; pipes keep their `ioDelayNs` draws unchanged.
+- **Fault rules.** A rule gets a protocol: `.udp` (the default, so every
+  phase 2 run is unchanged) or `.tcp`. For `.tcp`:
+
+| kind | meaning for a stream |
+|---|---|
+| delay, jitter | modelled: every entry of the flow is later; the clamp keeps order |
+| partition, silence | modelled: entries are **held, not lost**, and sent when the rule is cleared. A SYN that is held makes a connect wait for its own deadline. This is what TCP's retransmission turns loss into, without its timing |
+| loss, burst | **refused** at `setRule`: TCP hides loss from the program; a "lost" segment is a delay of an unknown length, and that is what partition gives on purpose |
+| duplication, reorder | **refused**: TCP hides both |
+
+- `setConnectOutcome(path, .accept | .refuse | .no_answer)` (section 5)
+  is **dropped**. A connect to no listener already gives `.refuse`, and a
+  `.tcp` partition gives `.no_answer`. Two ways to say one thing is the
+  shape to avoid.
+- `requireEveryRuleMatched` counts `.tcp` rules too.
+
+### 17.7 Determinism
+
+- **Trace:** a new event kind, `stream`, at each landing of a stream
+  entry: kind (SYN, SYN-ACK, data, FIN, RST), ports, and length. Only a
+  run that opens a stream socket emits one.
+- **Wire digest:** stream records go into the same running hash with a
+  kind byte. Datagram records are unchanged, so a run with no stream
+  socket keeps its `wireDigest()`.
+- **State digest:** a stream part only for a run that opened a stream
+  socket (as `net_used` does for datagrams): each socket's kind,
+  addresses, flags, window use, unread bytes, FIN and RST state, parked
+  op ids and generation, and each listener's queue.
+- **Promise 1 holds by test:** the datagram pins (33b95ca), the two
+  pipe-only probes, and starh2's three sim steps keep their values.
+- **Promise 3 for streams:** ten fresh processes with the heap moved give
+  one byte transcript per direction, one wire digest, trace and state
+  digest. One changed byte gives another wire digest.
+
+### 17.8 What a consumer must do (not zio's work)
+
+- **hotseat (t-4110):** `TestHost` makes its TLS identity with
+  `Identity.generate`, which calls `io.randomSecure` (read: hotseat
+  `src/identity.zig:33`, and the mbedTLS callback at `:374`). The sim
+  refuses that during a run. The identities must be made before
+  `sim.begin`, or with a seeded source in tests. TLS itself is fine: its
+  `.rng` is `std.Random.IoSource`, which calls `io.random` (read: zig
+  0.17 `lib/std/Random.zig:49`), and that is seeded under sim.
+- **Certificate times:** the sim's real clock starts at 2023-11-14
+  22:13:20 UTC (`real_epoch_ns`, `src/sim.zig:405`; ran `date -u -r
+  1700000000`). A certificate made inside the run with that clock is
+  valid inside it. One made outside the run with the real date, then
+  checked inside it, is **not yet valid**. That decides how t-4110 is
+  done: make the identity with the sim's clock, or give the checker a
+  time.
+- **starh2 (t-4111):** move `getpeername`, `TCP_NODELAY` and `FIONREAD` to
+  zio's layer.
+- **hotseat's DNS (`seat.zig:161`) and both users' AF_UNIX sockets** stay
+  outside sim runs.
+
+### 17.9 Kernel differences a test author will trip on (ran)
+
+A C probe, `tcpprobe.c` (report 23), 15 cases, 3 runs on each of macOS
+25.6.0 arm64 and Linux 6.8.0 aarch64 (colima). Every row repeated in 3
+of 3 runs except where noted.
+
+| row | case | macOS | Linux | sim |
+|---|---|---|---|---|
+| 1 | non-blocking connect, no listener: poll | `HUP` only; `SO_ERROR` ECONNREFUSED | `OUT|ERR|HUP`; ECONNREFUSED | `ConnectionRefused` from `NetConnect` (no poll) |
+| 2 | blocking connect, no listener | ECONNREFUSED | ECONNREFUSED | the same |
+| 3 | non-blocking connect to a listener | EINPROGRESS, then writable | the same | `NetConnect` completes after one round trip |
+| 4 | listen(1), 6 connects, none accepted | 1 made, 5 pending | 2 made, 4 pending | panic at the first that does not fit |
+| 5 | half-close | peer reads 0, sends back; own send `EPIPE` | the same | the same |
+| 6 | `SHUT_RD` with 6 bytes queued, then the peer sends | read 0, then 0; peer's 2nd send `EPIPE` | read 6, then 5; peer sends fine | `shutdown(.receive)` refused |
+| 7 | close with unread bytes | peer: `ECONNRESET`, then 0 | the same | the same |
+| 8 | send to a closed peer, twice, then read | ok; `EPIPE`; read `ECONNRESET` | ok; `EPIPE`; read 0 | ok; `BrokenPipe`; `ConnectionResetByPeer` |
+| 9 | `SO_LINGER` 0 close; `getpeername` after | `ECONNRESET`; `EINVAL` | `ECONNRESET`; `ENOTCONN` | `ConnectionResetByPeer`; `SocketUnconnected` |
+| 10 | bytes taken before `EAGAIN`, peer not reading | 319,020 or 548,188 (varies by run) | 2,612,608 | the window, 256 KiB by default |
+| 11 | rebind after a server-side close, listener without reuse | no reuse `EADDRINUSE`; reuse ok | `EADDRINUSE` both ways | refused without reuse, allowed with it |
+| 12 | listeners 127.0.0.1:P and 0.0.0.0:P, both reuse | allowed | `EADDRINUSE` | `AddressInUse` |
+| 13 | `shutdown` of a listener | `ENOTCONN`; accept `EAGAIN` | ok; accept `EINVAL` | refused (nobody calls it) |
+| 14 | a client's local address after connect | 127.0.0.1 | 127.0.0.1 | 127.0.0.1 |
+| 15 | connect to 127.0.0.2, listener on 0.0.0.0 | no answer in 1 s | connects | connects |
+
+Row 11 on Linux is `EADDRINUSE` even with `SO_REUSEADDR` on the new
+socket. My inference, not checked: Linux wants the option on the old
+socket too, and the old listener lacked it. starh2 always sets it.
+
+**Not measured, for slice 0:** what a queued connection gives at accept
+when its client reset first; whether an RST discards bytes queued at the
+receiver; whether `shutdown(.both)` wakes a read blocked in another
+thread with 0 on both kernels, and what later reads and the peer's sends
+give (row 6 measured `SHUT_RD` alone, with no read blocked); the source address of
+a connect to 127.0.0.2 on Linux; a listener closed with connections in
+its queue.
+
+### 17.10 Test plan
+
+1. **Native exits, structurally.** `src/sim_exits_test.zig` already fails
+   when a function of `src/os/` that takes an fd has neither a sim branch
+   nor `refuseSimFd`. It cannot see a branch that routes on
+   `isDgramFd` and lets a stream fd fall to the generic refusal. Add a
+   table test: each layer function and each ev op, called with an fd of
+   each kind (datagram, unbound stream, listener, connected, pipe end),
+   must give its row's modelled result or its named refusal. The table
+   is derived from 17.4; a function missing from it fails the test.
+2. **An op model for streams**, in the shape of `sim_op_model_test.zig`:
+   random connects (to a listener, to none, under partition), accepts,
+   ev sends and receives with scatter and gather, shutdowns, closes with
+   and without unread bytes, resets, window changes, cancels, closes and
+   reopens inside a harvest, and `.tcp` fault rules. The model holds a
+   byte list per direction, each socket's state, and the landing time of
+   every wire entry. It checks every result and byte, every wake against
+   its deadline, every landing time, the poll's clock (366ac57's rule),
+   and at the end each waiting op's registration alone. Counters for
+   every case are required non-zero.
+3. **Replay.** Ten fresh processes with the heap moved (promise 3); one
+   changed byte gives another wire digest; a faulted stream run repeats.
+4. **Parity, both builds.** A Zig table test over real loopback without
+   sim and over the sim with it, for the rows where the kernels agree
+   (2, 3, 5, 7, 9's reset, 14). Where they differ, a column per build,
+   as group 7 does for datagrams, so a kernel change is seen.
+5. **Mutants** for every slice, listed in the slice's commit; a survivor
+   is either killed by a new check or explained.
+6. **The users.** starh2's three sim steps keep their hashes. A new
+   `dst-conn` step runs the real accept loop and admission with a
+   client through `connect`. hotseat: one `TestHost` HTTPS request and
+   one RTSP exchange under sim, after t-4110.
+
+### 17.11 Build order
+
+Each slice ends at a commit with every gate of section 15 and its own
+check.
+
+| slice | builds | its own check |
+|---|---|---|
+| 0 | measure the five open rows of 17.9 on both kernels, 3 runs each; no code | the table in 17.9 complete |
+| 1 | stream kinds in the socket table; TCP ports; `socket`, `bind`, `listen`, `NetConnect` (handshake on the wire, refused, no answer), `NetAccept`, `close` with no bytes; every other stream call refused; the table test of 17.10 item 1 | the table test; promise 1 pins; mutants |
+| 2 | bytes: `NetSend`, `NetRecv` (IOV_MAX), `writeSplatHeader`; the window; FIN, half-close, RST, linger 0; `shutdown(.both)`; one unresolved op; generation | the stream op model; mutants |
+| 3 | options and addresses: `TCP_NODELAY` (inherited, read back), `SO_REUSEADDR`, `SO_REUSEPORT` advisory, `getsockname`, the new `getpeername` and `bytesReadable` | the parity test in both builds, macOS and Linux |
+| 4 | `.tcp` fault rules: delay, jitter, partition, silence; the refusals; the op model learns them; promise 2 for streams | replay in ten fresh processes |
+| 5 | the users: starh2's `dst-conn` accept step; hotseat's `TestHost` under sim | starh2's gate; hotseat's test; an outside review |
+
+### 17.12 What I could not determine
+
+- That zio's std.Io stream reads and writes end in `NetRecv` and
+  `NetSend` (17.2): likely, not traced.
+- Whether starh2 runs more than one acceptor per listener. One accept
+  loop per listener is what I read (`server.zig:1317`); the
+  one-unresolved-accept rule depends on it.
+- The five rows of 17.9 marked not measured.
+- Which backend each user runs on Linux. It does not change the sim,
+  which replaces the backend.
+- The exact RTSP request order in hotseat; its test host answers
+  OPTIONS, DESCRIBE, three SETUPs, ANNOUNCE and PLAY.
+- Upstream (lalinsky/zio) has no simulator, and its issues, pull
+  requests and discussions say nothing about one (read: a search of 216
+  issues, 690 pull requests and 10 discussions, titles and bodies, and
+  the first 30 comments of each discussion; other comment threads were
+  not searched). Since our merge base c5716c4 it changed no stream-socket
+  code that this design rests on. #910 changed `NetSendFile`, which the
+  sim refuses. Upstream's stream decisions this design follows: NODELAY
+  on by default and inherited from the listener (#803, #870); accept
+  hides `ConnectionAborted` (#658); accept completes inline when a
+  connection waits (#872); `reuse_address` also sets `SO_REUSEPORT`
+  where it exists (#550).
