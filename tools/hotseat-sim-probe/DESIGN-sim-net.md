@@ -985,6 +985,39 @@ the mutants in its commits.
   the same as would-block, so ENet's receive loop stops there for that
   service call. Later datagrams wait for the next call.
 
+### Upstream: merged in, never rebased (ZIOSYNC1 and 2)
+
+- **The branch contains upstream zio 5357759 (v0.20.1) by merge commit
+  f0396b1** (upstream into the sim line at 5315249; 23 conflict hunks in 5
+  files, each named in its message), and the later sim work by merge
+  commit 2559c02 (6e854fc into f0396b1, no conflicts). The next upstream
+  catch-up is the same: `git merge origin/main`, never a rebase.
+- **Gates on 2559c02:** sim tests on macOS 275 passed, 2 skipped, 250
+  named `sim:` tests (3 verbose runs; 6e854fc alone gives the same);
+  `check.sh --ci` 858 passed, 282 skipped (3 verbose runs); Linux in
+  colima, sim build 265 passed, 1 skipped, and without sim 874 of 876, the
+  two failures being the DNS lookups that fail the same way on plain
+  origin/main in that container (3 runs each); the Windows test binary
+  compiles; the bridge tests 12 OK without sim and 11 OK, 1 skip with it,
+  on macOS and Linux; starh2's three steps exit 0, dst-zio 54 of 54 keys
+  equal to the reference over 10 runs, trace digest
+  c05b7576d516675ee650676f4af38437 (6e854fc alone gives the same); the
+  structural test counts 129 fd-taking functions (71 refuse first, 21 sim
+  branch, 2 delegate, 35 covered by callers), as before the merge.
+- **Machine code without sim:** against origin/main, the eight examples
+  differ in the functions the fork already differed in against its base
+  c5716c4, less `LocalRunQueue` push and refill (upstream took our fix as
+  #914), plus `AnyTask.releaseCoro`, `Executor.deinit` and
+  `Awaitable.destroy`, whose only change is a field offset 8 bytes on (the
+  fork's added `AnyTask.label` and `Executor.activity` fields, reached by
+  upstream #909's stack cache). The examples' `__text` at 2559c02 equals
+  that at f0396b1.
+- **What an upstream merge has to watch:** upstream #918 removed the
+  `allocator` parameter from 19 `src/os` path functions, each of which
+  carries the refusal line; keep upstream's signature and put the line
+  first. A new fd-taking function upstream fails the structural test until
+  it gets the line.
+
 ### Decided by the design's owner (2026-11-14, after reports 6-8)
 
 - **A bad source address:** the sim stays strict and host-independent; group
@@ -1138,6 +1171,12 @@ the mutants in its commits.
 - **A mutant's old text must be unique in the file**, and the test's own
   model copies of the fault code hold the same lines: pick text with the
   sim's own names in it (`faultDraw`, `fault_stats`).
+- **A filtered test build does not analyse the tests outside its filter.**
+  `-Dtest-filter` is compiled in, so a test that does not match is never
+  type-checked. After a merge, a fork test that calls a function whose
+  signature upstream changed compiles green under the `sim: ` filter; only
+  `check.sh --ci` (no filter) finds it. In f0396b1 that was five tests in
+  `src/net.zig` calling `dirDeleteFile` with the removed allocator.
 - **Tool rules for agents here:** a recursive `rm` of a path built from a
   variable is refused by a hook; make a new directory instead. Restoring a
   file with `git checkout <file>` is refused too, and would drop uncommitted
