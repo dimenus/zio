@@ -407,3 +407,84 @@ reorder by default.
 - hotseat's ENet build can drop `unix.c`'s socket half. The review judged this
   feasible; hotseat confirms it in its phase.
 - Phase 1 runs on macOS and Linux. Windows sim sockets are refused (2).
+
+## 15. State of the build (for whoever picks this up)
+
+Updated at the end of each sitting. Reports are written outside the repo, at
+`/private/tmp/claude-501/-Users-rsaunderson-Source-mine-hotseat/e4460054-682f-47b6-b854-5c24f700217b/scratchpad/zio-sim-report-N.md`.
+
+### Done
+
+- **Foreign-thread rule (t-4085).** `sim.refuseOtherThread` and
+  `refuseDuringRun`, with the rule and its coverage in their doc comments
+  (`src/sim.zig`). The enumeration tables are the appendices of 8498d89 and
+  7ab5299.
+- **Phase 1, slice 1 (7dbc10b, pushed in round 5):**
+  - the fd-namespace proof at `sim.begin`/`end`, re-checked in `pipePair`;
+  - `randomSecure` and off-executor `random` refused during a run.
+- **t-4092 (cdba949):** each task carries its sim id (`AnyTask.sim_id`, set at first
+  sighting by `sim.taskId(&task.sim_id)`). There is no address table any
+  more.
+
+### Next (phase 1, in this order)
+
+1. The socket table and the layer's sim branch: send, receive, boundaries,
+   truncation.
+2. Poll and the ev ops.
+3. Limits and flow order.
+4. Trace and `wireDigest`.
+5. The native-exit refusals, with their enumeration over `src/os/`.
+6. The C-bridge tests in both builds, and the seven acceptance groups.
+
+`AddressUnavailable` changes the normal build on purpose: say so in its
+commit, and show the normal build's diff is that and nothing else.
+
+### How to run things
+
+- **zig:** `$(mise where zig@0.17.0)/zig`. Never `zig` by name;
+  `~/.zvm/bin/zig` is 0.16.
+- **The sim tests:**
+  `zig build test -Dsim=true -Dscheduling=pinned -Dtest-filter="sim: "`.
+  Count them with `TEST_VERBOSE=true` and
+  `grep -c "^sim.test.sim:.* .. OK ("`.
+- **The normal suite:** `PATH="$(mise where zig@0.17.0):$PATH" ./check.sh --ci`.
+- **Unchanged without sim:** archive HEAD to a scratch directory, and build
+  `zig build examples -Doptimize=ReleaseFast` there. Copy this tree's `src/`
+  over the archive and build again at **the same path**. Compare
+  `otool -s __TEXT __text <bin>` for sleep, tcp-echo-server,
+  udp-echo-server, mutex-demo, producer-consumer, signal-demo, http-server and
+  ntp-client. Whole-file hashes differ between builds, so they are useless.
+  A control change (the mutex's `locked` from 1 to 3) proves the compare can
+  see a change.
+- **starh2's three sim steps:**
+  1. `git -C ~/Source/mine/starh2 archive 429b2b3 | tar -x -C <new dir>`;
+  2. point both zio pins (`build.zig.zon`, `tools/zio-dst/build.zig.zon`) at
+     this tree with `.path`;
+  3. `./zb build dst-transport`, `dst-zio`, `dst-conn`, in a Rex tab.
+
+  Since t-4092 (cdba949), `dst-zio`'s reference is **this branch at cdba949,
+  not the pin**. Every fixture whose pin run reused a task address changed
+  (cdba949's commit message lists them, with old and new values). All 23
+  fixtures now give one value in 20 of 20 fresh processes. Compare **sets
+  over 10 or more runs** wherever a value might vary.
+
+### Traps already hit (each cost a round)
+
+- **`-Dtest-filter` is compiled in, and it is one literal substring.**
+  - A `|` in it matches nothing.
+  - A child process runs the same binary, so a test the filter excluded is
+    not in it.
+  - "10 of 10 passed" can mean only the unnamed tests ran.
+- **A death test must match the panic's own line,** not any substring. The
+  stack trace prints the test's source, which holds the expected text.
+- **A success child must print `sim-child-done: <name>`,** and the parent
+  must see exactly one, naming it.
+- **Mutants that fail to compile do not count.** Remove a line with
+  `and false`, not by deleting what a variable needs.
+- **Under `zig build test` on macOS the child's hard fd limit is 10240,** so
+  the fd-namespace tests skip there. Run their binary from a shell
+  (`zig build test -Demit-test-bin -p <dir>`, then `TEST_FILTER=... <dir>/bin/test`).
+- **Never claim from one run of something that varies.** Round 3 did, and
+  was wrong.
+- **Don't edit `src/` while a starh2 copy or a mutant run is building from
+  this tree.**
