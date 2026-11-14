@@ -705,7 +705,8 @@ fix, then the fix and mutants. Each commit has the failing output.
   the same way for pipe sends at 3417a77 (the zio starh2 pins). zio's own
   task-level waits keep members deferred, so they do not reach it.
 - **F2, fixed in 7c0c22e:** a woken pipe receive whose bytes another receive
-  took parks again instead of reporting end of file.
+  took parks again instead of reporting end of file. Superseded in round 3:
+  that second receive now refuses at submit, and the repark is gone.
 - **F3, fixed in 35fda32:** pipe ev ops refuse every flag that differs from
   its default, except a receive's `dontwait`, by name from the type.
 - **F4, fixed in 5500807:** the state digest hashes each datagram socket's
@@ -749,6 +750,18 @@ F1's guard (`isLive`, `endOp`) was found sound.
   (`dgramOpOnItsSocket`). This replaces the `dgram_closed` due kind: one
   mechanism. The pipe side has no reuse; a callback that closes an end
   earlier in a batch leaves a later receive its bytes (tested).
+- **Findings 2 and 3, by the owner's decision (no multiple waiters):** a
+  pipe end takes one unresolved ev receive and one unresolved ev send at a
+  time, and a datagram socket one unresolved ev receive or poll for
+  reading. Unresolved means parked, or woken and not yet harvested. A second
+  one refuses at submit, whatever it would do, and the refusal names the
+  first op's state (`refuseSecondPipeWaiter`, `dgramRefuseSecondWaiter`).
+  Only an ev receive takes a pipe's bytes and only an ev send fills its
+  room, so the pipe reparks are gone: an empty end at a receive's harvest,
+  or a full pipe at a send's, is now an invariant panic. The datagram
+  repark stays, for a layer receive (`recvDatagram`) that takes the
+  datagram first. starh2's gate with the rule: no refusal. A receive with no
+  room no longer wakes the parked send (it freed nothing).
 
 ### Next
 

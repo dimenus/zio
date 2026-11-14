@@ -117,6 +117,10 @@ const End = struct {
     buf_len: usize = 0,
     pending_recv: ?Parked = null,
     pending_send: ?Parked = null,
+    /// The ev receive (send) on this end that has no result yet: parked, or
+    /// woken and not yet harvested. One at a time (`refuseSecondPipeWaiter`).
+    unresolved_recv: ?Parked = null,
+    unresolved_send: ?Parked = null,
     faults: SendFaults = .{},
     stats: FaultStats = .{},
 };
@@ -677,6 +681,7 @@ pub fn endOp(c: *anyopaque, id: u32) void {
         if (live[i].c == c and live[i].id == id) {
             live[i] = live[live_len - 1];
             live_len -= 1;
+            resolve(c, id);
             return;
         }
     }
@@ -690,10 +695,39 @@ pub fn takeOpId(c: *anyopaque) ?u32 {
             const id = live[i].id;
             live[i] = live[live_len - 1];
             live_len -= 1;
+            resolve(c, id);
             return id;
         }
     }
     return null;
+}
+
+/// The op (`c`, `id`) has its result or was cancelled: it no longer holds
+/// its pipe end's or socket's one unresolved slot.
+fn resolve(c: *anyopaque, id: u32) void {
+    for (&ends) |*e| {
+        if (e.unresolved_recv) |u| {
+            if (u.c == c and u.id == id) e.unresolved_recv = null;
+        }
+        if (e.unresolved_send) |u| {
+            if (u.c == c and u.id == id) e.unresolved_send = null;
+        }
+    }
+    for (&dgrams) |*d| {
+        if (d.unresolved) |u| {
+            if (u.c == c and u.id == id) d.unresolved = null;
+        }
+    }
+}
+
+/// A sim pipe end takes one unresolved ev receive and one unresolved ev
+/// send at a time; a second refuses at submit, whatever it would do (take
+/// bytes, park, or would-block). A kernel lets several readers or writers
+/// wait on one descriptor; the sim does not model that (owner's decision,
+/// round 3): an op woken and not yet harvested would otherwise find its
+/// bytes taken, or its room filled, and a newer op parked in its slot.
+fn refuseSecondPipeWaiter(comptime what: []const u8, fd: i32, old: Parked, parked: bool, new_id: u32) noreturn {
+    panic("sim: a second ev " ++ what ++ " while one is {s}, on sim pipe fd {d} (op {d}; the new op {d}): a sim pipe end takes one unresolved ev " ++ what ++ " at a time", .{ if (parked) "parked" else "woken and not yet harvested", fd, old.id, new_id });
 }
 
 fn pushDueKind(c: *anyopaque, kind: DueKind, id: u32) void {
@@ -829,6 +863,9 @@ fn copySend(fd: i32, src: []const []const u8, send_c: *anyopaque, id: u32, sched
         if (schedule) pushDueKind(send_c, .send, id);
         return .bad_fd;
     };
+    if (schedule) {
+        if (ends[i].unresolved_send) |u| refuseSecondPipeWaiter("send", fd, u, ends[i].pending_send != null, id);
+    }
     if (ends[i].reset) {
         noteSendFailure(i);
         if (schedule) pushDueKind(send_c, .send, id);
@@ -862,8 +899,12 @@ fn copySend(fd: i32, src: []const []const u8, send_c: *anyopaque, id: u32, sched
     }
     const space = pipe_buf_cap - ends[p].buf_len;
     if (space == 0) {
-        if (ends[i].pending_send != null) panic("sim: two sends parked on one fd", .{});
+        // At a harvest the send was woken by a drain, and only another ev
+        // send on this end fills the room again, which the sim refuses
+        // while this one is unresolved.
+        if (!schedule) panic("sim: a woken ev send on sim pipe fd {d} found the pipe full: only another ev send fills it, and that refuses while this one is unresolved", .{fd});
         ends[i].pending_send = .{ .c = send_c, .id = id };
+        ends[i].unresolved_send = ends[i].pending_send;
         return .parked;
     }
     limit = @min(limit, space);
@@ -905,6 +946,7 @@ pub fn recvInto(fd: i32, dst: []const []u8, recv_c: *anyopaque, dont_wait: bool)
         pushDueKind(recv_c, .recv, id);
         return .bad_fd;
     };
+    if (ends[i].unresolved_recv) |u| refuseSecondPipeWaiter("receive", fd, u, ends[i].pending_recv != null, id);
     if (ends[i].reset) {
         pushDueKind(recv_c, .recv, id);
         return .reset;
@@ -915,13 +957,14 @@ pub fn recvInto(fd: i32, dst: []const []u8, recv_c: *anyopaque, dont_wait: bool)
             return .eof;
         }
         if (dont_wait) return .would_block;
-        if (ends[i].pending_recv != null) panic("sim: two recvs parked on one fd", .{});
         ends[i].pending_recv = .{ .c = recv_c, .id = id };
+        ends[i].unresolved_recv = ends[i].pending_recv;
         return .parked;
     }
     const n = drainBuf(fd, dst);
     pushDueKind(recv_c, .recv, id);
-    wakeSender(i);
+    // A receive with no room takes nothing and frees no room.
+    if (n > 0) wakeSender(i);
     return .{ .due = n };
 }
 
@@ -952,19 +995,19 @@ pub fn drainBuf(fd: i32, dst: []const []u8) usize {
     return n;
 }
 
-/// A woken pipe receive at its harvest: its bytes, or null when another
-/// receive took them first and the end is open and not at end of stream. Then
-/// it parks again with its submit id, as a kernel reader keeps waiting. A
-/// receive with no buffer room completes with 0, as before (t-4096).
-pub fn harvestRecv(fd: i32, dst: []const []u8, c: *anyopaque, id: u32) ?usize {
+/// A woken pipe receive at its harvest, not reset and not at end of stream:
+/// its bytes. A receive with no buffer room completes with 0 (t-4096).
+///
+/// Its bytes are still there: only an ev receive takes a pipe's bytes (the
+/// socket layer refuses a sim pipe fd), and a second one on this end refuses
+/// at submit while this one is unresolved. Before that rule (round 3,
+/// findings 2 and 3) another receive could take them, and this one parked
+/// again (7c0c22e); now an empty end here is a broken invariant.
+pub fn harvestRecv(fd: i32, dst: []const []u8) usize {
     const i = endIndex(fd) orelse panic("sim: a harvested receive on sim fd {d}, which is not a pipe end", .{fd});
     var room: usize = 0;
     for (dst) |d| room += d.len;
-    if (ends[i].buf_len == 0 and room > 0) {
-        if (ends[i].pending_recv != null) panic("sim: two recvs parked on one fd", .{});
-        ends[i].pending_recv = .{ .c = c, .id = id };
-        return null;
-    }
+    if (ends[i].buf_len == 0 and room > 0) panic("sim: a woken ev receive on sim pipe fd {d} found no bytes, no end of stream and no reset: only another ev receive takes bytes, and that refuses while this one is unresolved", .{fd});
     return drainForRecv(fd, dst);
 }
 
@@ -1205,6 +1248,9 @@ const Dgram = struct {
     /// An ev op waiting for a datagram (a receive, or a poll for reading):
     /// a landing or a close makes it due now.
     parked: ?DgramParked = null,
+    /// That op until it has its result: parked, or woken and not yet
+    /// harvested. One at a time (`dgramRefuseSecondWaiter`).
+    unresolved: ?DgramParked = null,
 };
 
 const WireDatagram = struct {
@@ -1602,7 +1648,26 @@ const DgramParked = struct {
 pub fn dgramPark(fd: i32, c: *anyopaque, id: u32, wait: DgramWait) void {
     const d = dgramSlot("an ev receive or poll", fd);
     if (d.parked != null) panic("sim: two ev ops parked on sim datagram socket {d}", .{fd});
+    if (d.unresolved) |u| {
+        if (u.c != c or u.id != id) panic("sim: op {d} parks on sim datagram socket {d}, whose unresolved op is {d}", .{ id, fd, u.id });
+    }
     d.parked = .{ .c = c, .id = id, .wait = wait };
+    d.unresolved = d.parked;
+}
+
+/// A sim datagram socket takes one unresolved ev receive or poll for
+/// reading at a time (parked, or woken and not yet harvested); a second
+/// refuses at submit, whatever it would do. Between a landing and a woken
+/// op's harvest, a callback earlier in the batch could otherwise submit one
+/// that takes the datagram and another that parks, and the woken op's
+/// harvest would find its slot taken (round 3, the datagram side of findings
+/// 2 and 3). A layer receive (`recvDatagram`) can still take the datagram;
+/// then the woken op parks again.
+pub fn dgramRefuseSecondWaiter(fd: i32, new_id: u32) void {
+    if (!dgramIsOpen(fd)) return;
+    const d = &dgrams[dgramIndex(fd)];
+    const u = d.unresolved orelse return;
+    panic("sim: a second ev receive or poll while one is {s}, on sim datagram socket {d} (op {d}; the new op {d}): a sim datagram socket takes one unresolved ev receive or poll for reading at a time", .{ if (d.parked != null) "parked" else "woken and not yet harvested", fd, u.id, new_id });
 }
 
 pub fn dgramIsOpen(fd: i32) bool {
@@ -4463,12 +4528,15 @@ test "sim: pipe: the pipe buffer matches a list of bytes under random sends, rec
                 if (n == 0) no_slice_sends += 1;
                 if (n >= 4) wide += 1;
                 const want = try models[1 - from].send(gpa, src[0..n]);
-                switch (copySend(fds[from], src[0..n], &dummy, 0, false)) {
+                // A submit, as an ev send makes it; the cancel ends the op
+                // (due or parked) so the next send is the end's only one.
+                const outcome = sendBytes(fds[from], src[0..n], &dummy);
+                _ = cancelIo(&dummy);
+                switch (outcome) {
                     .due => |got| try std.testing.expectEqual(want, got),
                     .parked => {
                         try std.testing.expectEqual(@as(?usize, null), want);
                         parks += 1;
-                        _ = cancelIo(&dummy);
                     },
                     else => |o| {
                         std.debug.print("send: {t}\n", .{o});
@@ -5673,70 +5741,6 @@ test "sim: dgram ev: a race group of two sends that finish without deferral comp
     try dg.run(1, dg_race.body);
 }
 
-/// Round 2 of the outside review, F2: a pipe receive R1 parked on an empty
-/// end is woken by a send, but a second receive R2 takes the bytes before
-/// R1's wake is harvested. R1 must wait for more bytes, not report end of
-/// file on an open pipe.
-const pipe_stale = struct {
-    var fds: [2]i32 = undefined;
-    var got: [2][16]u8 = undefined;
-    var len: [2]usize = .{ 0, 0 };
-    var r2_first: bool = false;
-
-    fn recvOne(k: usize) !void {
-        var iov: [1]dg.os_net.iovec = undefined;
-        var op = dg.ev.NetRecv.init(fds[0], .fromSlice(&got[k], &iov), .{});
-        try dg.io_common.waitForIo(&op.c);
-        len[k] = try op.getResult();
-    }
-
-    fn send(bytes: []const u8) !void {
-        var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice(bytes)};
-        var op = dg.ev.NetSend.init(fds[1], .{ .iovecs = &iov }, .{});
-        try dg.io_common.waitForIo(&op.c);
-        if (try op.getResult() != bytes.len) return error.ShortSend;
-    }
-
-    fn body() !void {
-        fds = pipePair();
-        len = .{ 0, 0 };
-        var r1 = try dg.runtime.spawn(recvOne, .{0});
-        try dg.rt_mod.sleep(.fromMilliseconds(1));
-        try send("first");
-        var r2 = try dg.runtime.spawn(recvOne, .{1});
-        try dg.rt_mod.sleep(.fromMilliseconds(20));
-        r2_first = len[1] == 5;
-        try send("second");
-        try r1.join();
-        try r2.join();
-        for (len, 0..) |n, k| {
-            if (n == 0) {
-                std.debug.print("receive {d} returned 0 (end of file) on an open pipe\n", .{k + 1});
-                return error.FalseEndOfFile;
-            }
-        }
-        var all: [32]u8 = undefined;
-        const first: usize = if (r2_first) 1 else 0;
-        @memcpy(all[0..len[first]], got[first][0..len[first]]);
-        @memcpy(all[len[first]..][0..len[1 - first]], got[1 - first][0..len[1 - first]]);
-        try std.testing.expectEqualStrings("firstsecond", all[0 .. len[0] + len[1]]);
-    }
-};
-
-test "sim: pipe: a receive woken by bytes another receive took waits for more, and never reports end of file on an open pipe" {
-    if (comptime !compiled_in) return error.SkipZigTest;
-    var stale_cases: usize = 0;
-    for (1..17) |s| {
-        dg.run(s, pipe_stale.body) catch |err| {
-            std.debug.print("seed {d}: {t}\n", .{ s, err });
-            return err;
-        };
-        if (pipe_stale.r2_first) stale_cases += 1;
-    }
-    std.debug.print("16 seeds; in {d} the second receive took the first bytes\n", .{stale_cases});
-    try std.testing.expect(stale_cases > 0);
-}
-
 test "sim: dgram ev: close wakes an ev receive parked on the socket" {
     if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
     try dg.run(1, struct {
@@ -5793,9 +5797,151 @@ test "sim: dgram ev refuses: a real fd in a sim op" {
     }.body);
 }
 
+/// Round 3 of the outside review, findings 2 and 3: a second ev op behind a
+/// woken one. Raw ops on the test task's loop, each with a callback (a
+/// completion with none would be read as a task wake).
+const second_waiter = struct {
+    const Raw = union { recv: dg.ev.NetRecv, send: dg.ev.NetSend, recvfrom: dg.ev.NetRecvFrom };
+    var ops: [6]Raw = undefined;
+    var iovs: [6][1]dg.os_net.iovec = undefined;
+    var ciovs: [6][1]dg.os_net.iovec_const = undefined;
+    var bufs: [6][4096]u8 = undefined;
+    var fds: [2]i32 = undefined;
+    var first: bool = true;
+
+    fn noop(_: *dg.ev.Loop, _: *dg.ev.Completion) void {}
+
+    fn recv(k: usize, fd: i32, room: usize) *dg.ev.Completion {
+        ops[k] = .{ .recv = dg.ev.NetRecv.init(fd, .fromSlice(bufs[k][0..room], &iovs[k]), .{}) };
+        ops[k].recv.c.callback = noop;
+        return &ops[k].recv.c;
+    }
+
+    fn send(k: usize, fd: i32, len: usize) *dg.ev.Completion {
+        ops[k] = .{ .send = dg.ev.NetSend.init(fd, .fromSlice(bufs[k][0..len], &ciovs[k]), .{}) };
+        ops[k].send.c.callback = noop;
+        return &ops[k].send.c;
+    }
+
+    /// R1 parks on end 0; S copies into it and wakes R1, due after the
+    /// seeded delay. R2 is submitted before R1's harvest. Before the rule,
+    /// R2 took the bytes, R3 parked, and R1's harvest found R3 in its slot.
+    fn receives() !void {
+        fds = pipePair();
+        const loop = &dg.rt_mod.getCurrentExecutor().loop;
+        loop.add(recv(0, fds[0], 16));
+        loop.add(send(1, fds[1], 4));
+        loop.add(recv(2, fds[0], 16));
+        loop.add(recv(3, fds[0], 16));
+        try dg.rt_mod.sleep(.fromMilliseconds(20));
+    }
+
+    /// S0 fills end 0's buffer; S1 parks on end 1; R drains 100 bytes and
+    /// wakes S1. S2 is submitted before S1's harvest. Before the rule, S2
+    /// took the room, S3 parked, and S1's harvest found S3 in its slot.
+    fn sends() !void {
+        fds = pipePair();
+        const loop = &dg.rt_mod.getCurrentExecutor().loop;
+        loop.add(send(0, fds[1], pipe_buf_cap));
+        loop.add(send(1, fds[1], 10));
+        loop.add(recv(2, fds[0], 100));
+        loop.add(send(3, fds[1], 100));
+        loop.add(send(4, fds[1], 10));
+        try dg.rt_mod.sleep(.fromMilliseconds(20));
+    }
+
+    /// Receives on sockets X and Y woken by landings at one time. The first
+    /// one's callback submits two receives on the other's socket, whose
+    /// receive is woken and later in the batch. Before the rule, the first
+    /// took the datagram, the second parked, and the woken receive's harvest
+    /// found it in its slot.
+    fn onDgram(loop: *dg.ev.Loop, c: *dg.ev.Completion) void {
+        if (!first) return;
+        first = false;
+        const k: usize = @intFromPtr(c.userdata.?) - 1;
+        for (2..4) |j| {
+            ops[j] = .{ .recvfrom = dg.ev.NetRecvFrom.init(fds[1 - k], .fromSlice(&bufs[j], &iovs[j]), .{}, null, null) };
+            ops[j].recvfrom.c.callback = noop;
+            loop.add(&ops[j].recvfrom.c);
+        }
+    }
+
+    fn dgrams() !void {
+        first = true;
+        const loop = &dg.rt_mod.getCurrentExecutor().loop;
+        const tx = try dg.open();
+        for (0..2) |k| {
+            fds[k] = try dg.open();
+            try dg.bindTo(fds[k], dg.addr(127, 0, 0, 1, 0));
+            ops[k] = .{ .recvfrom = dg.ev.NetRecvFrom.init(fds[k], .fromSlice(&bufs[k], &iovs[k]), .{}, null, null) };
+            ops[k].recvfrom.c.flags.defer_callback = false;
+            ops[k].recvfrom.c.callback = onDgram;
+            ops[k].recvfrom.c.userdata = @ptrFromInt(k + 1);
+            loop.add(&ops[k].recvfrom.c);
+        }
+        for (0..2) |k| _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, (try dg.local(fds[k])).port), null, "x");
+        try dg.rt_mod.sleep(.fromMilliseconds(1));
+    }
+};
+
+/// A receive with no room on a full pipe takes no bytes, so it frees no room
+/// and must not wake the send parked on the other end: that send's harvest
+/// would find the pipe still full. A receive with room then wakes it.
+const pipe_zero_room = struct {
+    fn body() !void {
+        const w = second_waiter;
+        w.fds = pipePair();
+        const loop = &dg.rt_mod.getCurrentExecutor().loop;
+        loop.add(w.send(0, w.fds[1], pipe_buf_cap));
+        loop.add(w.send(1, w.fds[1], 10));
+        try dg.rt_mod.sleep(.fromMilliseconds(10));
+        // S0 is done, S1 parked on the full pipe.
+        try std.testing.expectEqual(@as(usize, pipe_buf_cap), try w.ops[0].send.getResult());
+        try std.testing.expect(!w.ops[1].send.c.has_result);
+        loop.add(w.recv(2, w.fds[0], 0));
+        try dg.rt_mod.sleep(.fromMilliseconds(10));
+        try std.testing.expectEqual(@as(usize, 0), try w.ops[2].recv.getResult());
+        try std.testing.expect(!w.ops[1].send.c.has_result);
+        loop.add(w.recv(3, w.fds[0], 100));
+        try dg.rt_mod.sleep(.fromMilliseconds(10));
+        try std.testing.expectEqual(@as(usize, 100), try w.ops[3].recv.getResult());
+        try std.testing.expectEqual(@as(usize, 10), try w.ops[1].send.getResult());
+    }
+};
+
+test "sim: pipe: a receive with no room on a full pipe does not wake the send parked on it, and one with room does" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    for (1..9) |s| try dg.run(s, pipe_zero_room.body);
+}
+
+test "sim: pipe refuses: a second ev receive on an end whose receive is woken and not yet harvested" {
+    try refusal("sim: pipe refuses: a second ev receive on an end whose receive is woken and not yet harvested", "sim: a second ev receive while one is woken and not yet harvested, on sim pipe fd 100000", struct {
+        fn body() !void {
+            try dg.run(1, second_waiter.receives);
+        }
+    }.body);
+}
+
+test "sim: pipe refuses: a second ev send on an end whose send is woken and not yet harvested" {
+    try refusal("sim: pipe refuses: a second ev send on an end whose send is woken and not yet harvested", "sim: a second ev send while one is woken and not yet harvested, on sim pipe fd 100001", struct {
+        fn body() !void {
+            try dg.run(1, second_waiter.sends);
+        }
+    }.body);
+}
+
+test "sim: dgram ev refuses: a second ev receive on a socket whose receive is woken and not yet harvested, from a callback earlier in the batch" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram ev refuses: a second ev receive on a socket whose receive is woken and not yet harvested, from a callback earlier in the batch", "sim: a second ev receive or poll while one is woken and not yet harvested, on sim datagram socket", struct {
+        fn body() !void {
+            try dg.run(1, second_waiter.dgrams);
+        }
+    }.body);
+}
+
 test "sim: dgram ev refuses: two ev ops parked on one socket" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    try refusal("sim: dgram ev refuses: two ev ops parked on one socket", "sim: two ev ops parked on sim datagram socket 100032", struct {
+    try refusal("sim: dgram ev refuses: two ev ops parked on one socket", "sim: a second ev receive or poll while one is parked, on sim datagram socket 100032", struct {
         fn body() !void {
             try r3.up();
             dg_park.rx = try dg.open();

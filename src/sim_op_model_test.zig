@@ -575,7 +575,9 @@ fn buildDgramRecv(i: u8, sock_idx: u8, allow_dontwait: bool) ?*Slot {
     const sk = &M.socks[sock_idx];
     const r = M.r();
     const dontwait = allow_dontwait and r.uintLessThan(u8, 5) == 0;
-    if (sk.qlen() == 0 and !dontwait and sk.waiting != null) return null;
+    // One unresolved ev receive or poll for reading per socket: any second
+    // one refuses (`sim.dgramRefuseSecondWaiter`).
+    if (sk.waiting != null) return null;
     const s = initSlot(i, .d_recv);
     s.fd = sk.fd;
     s.target = sock_idx;
@@ -604,7 +606,7 @@ fn buildDgramRecv(i: u8, sock_idx: u8, allow_dontwait: bool) ?*Slot {
 
 fn buildDgramPoll(i: u8, sock_idx: u8, for_recv: bool) ?*Slot {
     const sk = &M.socks[sock_idx];
-    if (for_recv and sk.qlen() == 0 and sk.waiting != null) return null;
+    if (for_recv and sk.waiting != null) return null;
     const s = initSlot(i, if (for_recv) .d_poll_recv else .d_poll_send);
     s.fd = sk.fd;
     s.target = sock_idx;
@@ -622,6 +624,8 @@ fn buildDgramPoll(i: u8, sock_idx: u8, for_recv: bool) ?*Slot {
 
 fn buildPipeSend(i: u8, e: u8) ?*Slot {
     const peer = &M.ends[1 - e];
+    // One unresolved ev send per pipe end (`sim.refuseSecondPipeWaiter`).
+    if (M.ends[e].waiting_send != null) return null;
     const s = initSlot(i, .p_send);
     s.fd = M.ends[e].fd;
     s.target = e;
@@ -630,10 +634,6 @@ fn buildPipeSend(i: u8, e: u8) ?*Slot {
     if (s.total == 0) {
         s.at_submit = .{ .n = 0 };
     } else if (space == 0) {
-        if (M.ends[e].waiting_send != null) {
-            s.used = false;
-            return null;
-        }
         M.ends[e].waiting_send = s;
         M.c.parked += 1;
         M.c.pipe_parked_sends += 1;
@@ -653,14 +653,14 @@ fn buildPipeRecv(i: u8, e: u8, allow_dontwait: bool) ?*Slot {
     const r = M.r();
     const dontwait = allow_dontwait and r.uintLessThan(u8, 5) == 0;
     const level = end.buf.items.len;
-    if (level == 0 and !dontwait and end.waiting_recv != null) return null;
+    // One unresolved ev receive per pipe end.
+    if (end.waiting_recv != null) return null;
     const s = initSlot(i, .p_recv);
     s.fd = end.fd;
     s.target = e;
     s.dontwait = dontwait;
     randomBufs(s, true);
     if (level > 0) {
-        if (end.waiting_recv != null) M.c.f2_shape += 1;
         const n = @min(s.room(), level);
         s.want = M.gpa().dupe(u8, end.buf.items[0..n]) catch @panic("oom");
         end.buf.replaceRange(M.gpa(), 0, n, &.{}) catch @panic("oom");
@@ -1434,7 +1434,7 @@ test "sim: op model: datagram sockets and a pipe under random sends, receives, p
     for (total.steps, 0..) |n, k| {
         if (n == 0) fail("no step of kind {t} ran", .{@as(StepKind, @fromBackingInt(@intCast(k)))});
     }
-    inline for (.{ "parked", "canceled", "closed_hit", "reused_number_ops", "closed_then_reused", "f1_shape_groups", "followups_into_canceled_due", "f2_shape", "empty_dgrams", "truncated", "scatter_recvs", "dropped_rcvbuf", "dropped_nosock", "discarded_at_close", "landed_in_new_socket", "pipe_parked_sends" }) |name| {
+    inline for (.{ "parked", "canceled", "closed_hit", "reused_number_ops", "closed_then_reused", "f1_shape_groups", "followups_into_canceled_due", "empty_dgrams", "truncated", "scatter_recvs", "dropped_rcvbuf", "dropped_nosock", "discarded_at_close", "landed_in_new_socket", "pipe_parked_sends" }) |name| {
         if (@field(total, name) == 0) fail("the counter {s} is 0: that case never ran", .{name});
     }
     sim.childDone(child_name);

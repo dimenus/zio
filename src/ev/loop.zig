@@ -1830,6 +1830,17 @@ pub const Loop = struct {
         }
     }
 
+    /// Sim: an op that can park on a datagram socket: a receive or a poll
+    /// for reading, also one with `dontwait` (the one-waiter rule counts
+    /// every such submit, as on a pipe end).
+    fn simDgramMayWait(c: *Completion) bool {
+        return switch (c.op) {
+            .net_recvfrom, .net_recvmsg => true,
+            .net_poll => c.cast(NetPoll).event == .recv,
+            else => false,
+        };
+    }
+
     /// Sim: what a parked datagram op waits for: only a receive or a poll
     /// for reading ever parks (`tryDgramOp`).
     fn simDgramWait(c: *const Completion) sim.DgramWait {
@@ -1867,6 +1878,7 @@ pub const Loop = struct {
     /// pipe, a datagram's timing is the wire's (`sim.wire_latency_ns`).
     fn submitSimDgram(c: *Completion) void {
         const id = sim.dgramOpStart(c, simOpHandle(c));
+        if (simDgramMayWait(c)) sim.dgramRefuseSecondWaiter(simOpHandle(c).?, id);
         if (tryDgramOp(c)) {
             sim.dgramOpDone(c, id);
         } else {
@@ -1979,9 +1991,9 @@ pub const Loop = struct {
                             c.setError(error.ConnectionResetByPeer);
                         } else if (sim.recvIsEof(op.handle)) {
                             c.setResult(.net_recv, 0);
-                        } else if (sim.harvestRecv(op.handle, readSlices(op.buffers, &sl), c, buf[i].id)) |got| {
-                            c.setResult(.net_recv, got);
-                        } else continue;
+                        } else {
+                            c.setResult(.net_recv, sim.harvestRecv(op.handle, readSlices(op.buffers, &sl)));
+                        }
                     },
                     .net_send => {
                         // Capacity-woken send: copy into the peer buffer.
@@ -1993,7 +2005,7 @@ pub const Loop = struct {
                             .due => |sent| c.setResult(.net_send, sent),
                             .eof => c.setError(error.BrokenPipe),
                             .reset => c.setError(error.ConnectionResetByPeer),
-                            .parked => continue,
+                            .parked => unreachable,
                             .would_block => unreachable,
                             .bad_fd => c.setError(error.FileDescriptorNotASocket),
                         }
