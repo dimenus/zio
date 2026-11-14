@@ -18,6 +18,11 @@ pub const EventKind = enum(u8) {
     cq_pop = 4,
     io_complete = 5,
     preempt = 6,
+    /// A datagram reached its landing time (`land`): landed or dropped.
+    /// `a`: the source port, and the outcome in bits 16-23 (0 landed,
+    /// 1 no socket, 2 the receive queue was full). `b`: the destination port
+    /// in the high 16 bits, the length in the low 16 (at most 65507).
+    dgram = 7,
 };
 
 var begun: bool = false;
@@ -495,7 +500,39 @@ pub fn stateDigest() u64 {
         buf[12] = @backingInt(due[d].kind);
         h.update(buf[0..13]);
     }
+    if (net_used) digestNet(&h);
     return h.final();
+}
+
+/// The datagram table, in `stateDigest`, for a run that opened a socket:
+/// the wire digest, the port counter, the drop count, what is still on the
+/// wire, and each socket's address, flags, limit, queue and stats.
+fn digestNet(h: *std.hash.Wyhash) void {
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b, wireDigest(), .little);
+    h.update(&b);
+    std.mem.writeInt(u64, &b, (@as(u64, next_port) << 48) | (@as(u64, @intCast(wire.items.len)) << 16), .little);
+    h.update(&b);
+    std.mem.writeInt(u64, &b, dropped_no_socket, .little);
+    h.update(&b);
+    for (wire.items) |w| {
+        std.mem.writeInt(u64, &b, w.due_at, .little);
+        h.update(&b);
+        h.update(w.bytes);
+    }
+    for (dgrams) |s| {
+        var e: [24]u8 = undefined;
+        e[0] = @intFromBool(s.used) | (@as(u8, @intFromBool(s.bound)) << 1) | (@as(u8, @intFromBool(s.nonblocking)) << 2) | (@as(u8, @intFromBool(s.dst_addr)) << 3) | (@as(u8, @intFromBool(s.parked != null)) << 4);
+        @memcpy(e[1..5], &s.local.ip);
+        std.mem.writeInt(u16, e[5..7], s.local.port, .little);
+        std.mem.writeInt(u32, e[7..11], @intCast(s.byte_limit), .little);
+        std.mem.writeInt(u32, e[11..15], @intCast(s.charged), .little);
+        std.mem.writeInt(u16, e[15..17], @intCast(s.meta_len), .little);
+        std.mem.writeInt(u32, e[17..21], @intCast(s.stats.received), .little);
+        std.mem.writeInt(u16, e[21..23], @intCast(s.stats.dropped_rcvbuf & 0xffff), .little);
+        e[23] = @truncate(s.stats.sent);
+        h.update(&e);
+    }
 }
 
 pub fn panic(comptime fmt: []const u8, args: anytype) noreturn {
@@ -1105,6 +1142,14 @@ fn testSetNetAllocator(a: std.mem.Allocator) void {
 var dgrams: [max_dgram]Dgram = @splat(.{});
 var next_port: u16 = first_ephemeral_port;
 var dropped_no_socket: u64 = 0;
+/// Whether this run opened a datagram socket. Only then does
+/// `stateDigest` cover the datagram table, so a run with none keeps the
+/// digest it had before datagram sockets existed (design section 7, promise
+/// 1).
+var net_used: bool = false;
+/// Every datagram that reached its landing time, in landing order: when,
+/// the flow, the outcome, the length and the bytes (`wireDigest`).
+var wire_hasher: std.hash.Wyhash = std.hash.Wyhash.init(0);
 /// Datagrams not yet landed, sorted by (due_at, seq): landing order.
 var wire: std.ArrayList(WireDatagram) = .empty;
 var wire_seq: u64 = 0;
@@ -1117,6 +1162,8 @@ fn resetNet() void {
     next_port = first_ephemeral_port;
     dropped_no_socket = 0;
     wire_seq = 0;
+    net_used = false;
+    wire_hasher = std.hash.Wyhash.init(0);
 }
 
 /// Frees every socket and every datagram still on the wire, at `end`.
@@ -1206,6 +1253,7 @@ pub fn dgramOpen(nonblocking: bool) error{SystemResources}!i32 {
     errdefer net_alloc.free(ring);
     const meta = net_alloc.alloc(Queued, rcv_packet_limit) catch return error.SystemResources;
     dgrams[j] = .{ .used = true, .nonblocking = nonblocking, .ring = ring, .meta = meta };
+    net_used = true;
     return fd_base + max_ends + @as(i32, @intCast(j));
 }
 
@@ -1524,16 +1572,44 @@ fn receiverOf(to: Ip4) ?*Dgram {
     return wildcard;
 }
 
+const LandOutcome = enum(u8) { landed = 0, no_socket = 1, rcvbuf = 2 };
+
+/// Records a datagram at its landing time in the trace and the wire digest.
+fn recordLanding(w: WireDatagram, outcome: LandOutcome) void {
+    emit(.dgram, @as(u32, w.from.port) | (@as(u32, @backingInt(outcome)) << 16), (@as(u32, w.to.port) << 16) | @as(u32, @intCast(w.bytes.len)));
+    var h: [25]u8 = undefined;
+    std.mem.writeInt(u64, h[0..8], w.due_at, .little);
+    @memcpy(h[8..12], &w.from.ip);
+    std.mem.writeInt(u16, h[12..14], w.from.port, .little);
+    @memcpy(h[14..18], &w.to.ip);
+    std.mem.writeInt(u16, h[18..20], w.to.port, .little);
+    h[20] = @backingInt(outcome);
+    std.mem.writeInt(u32, h[21..25], @intCast(w.bytes.len), .little);
+    wire_hasher.update(&h);
+    wire_hasher.update(w.bytes);
+}
+
+/// A hash of every datagram that reached its landing time in this run, in
+/// landing order: the time, both addresses and ports, landed or dropped, the
+/// length, and every payload byte. Two runs with equal digests delivered the
+/// same bytes to the same places at the same times.
+pub fn wireDigest() u64 {
+    return wire_hasher.final();
+}
+
 fn land(w: WireDatagram) void {
     const d = receiverOf(w.to) orelse {
         dropped_no_socket += 1;
+        recordLanding(w, .no_socket);
         return;
     };
     const cost = w.bytes.len + datagram_overhead;
     if (d.meta_len == d.meta.len or d.charged + cost > d.byte_limit) {
         d.stats.dropped_rcvbuf += 1;
+        recordLanding(w, .rcvbuf);
         return;
     }
+    recordLanding(w, .landed);
     const off = (d.ring_head + d.ring_used) % d.ring.len;
     ringWrite(d, off, w.bytes);
     d.meta[(d.meta_head + d.meta_len) % d.meta.len] = .{ .off = off, .len = w.bytes.len, .from = w.from, .to = w.to.ip };
@@ -4701,4 +4777,176 @@ test "sim: dgram refuses: a socket setsockopt from another thread" {
             }.f);
         }
     }.body);
+}
+
+// ---- Phase 1, slice 4: datagrams in the trace, and the wire digest (section 7) ----
+
+// Measured at ec6ec37, before datagrams entered the trace or the state digest
+// (3 of 3 runs gave these). A run that opens no datagram socket must keep
+// them: promise 1 of design section 7.
+test "sim: dgram trace: a run with no datagram socket keeps the trace and state digest it had before" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    const a = runWakeOrderProbe(1, .a);
+    const c = runCancelOrderProbe(3, .b);
+    try std.testing.expectEqual(@as(u64, 0x4095dc9a3d186e85), a.trace);
+    try std.testing.expectEqual(@as(u64, 0x90bbdaa79a2b64f7), a.state);
+    try std.testing.expectEqual(@as(u64, 0xabf05a246f5166cb), c.trace);
+    try std.testing.expectEqual(@as(u64, 0x77327e95ccaf1e7a), c.state);
+}
+
+const dg_wire = struct {
+    var flip = false;
+    var transcript: [256]u8 = undefined;
+    var transcript_len: usize = 0;
+    const Out = struct { wire: u64, trace: u64, state: u64 };
+    var out: Out = undefined;
+
+    /// Three senders, four datagrams each, to one wildcard receiver, sent
+    /// at one time so their flows interleave by the seed. One ev receive
+    /// waits first and takes the first to land. The receiver writes its own
+    /// transcript: for each datagram, the source port's low byte, the
+    /// length, and the bytes.
+    fn body() !void {
+        const rx = try dg.open();
+        try dg.bindTo(rx, dg.addr(0, 0, 0, 0, 7000));
+        try dg.os_net.enableDestinationAddress(rx);
+        var senders: [3]i32 = undefined;
+        for (&senders) |*fd| fd.* = try dg.open();
+        transcript_len = 0;
+        var h = try dg.runtime.spawn(evFirst, .{rx});
+        try dg.rt_mod.sleep(.fromMilliseconds(1));
+        for (0..4) |k| {
+            for (senders, 0..) |fd, i| {
+                var p: [6]u8 = .{ 'd', @intCast('0' + i), @intCast('0' + k), 'x', 'y', 'z' };
+                if (flip and i == 1 and k == 2) p[4] ^= 1;
+                _ = try dg.sendFrom(fd, dg.addr(127, 0, 0, @intCast(1 + i), 7000), null, p[0 .. 3 + k]);
+            }
+        }
+        try h.join();
+        try dg.settle();
+        var buf: [16]u8 = undefined;
+        while (dg.recvInto(rx, &.{&buf})) |got| {
+            note(@truncate(got.from.port), buf[0..got.info.len]);
+        } else |err| if (err != error.WouldBlock) return err;
+        out = .{ .wire = wireDigest(), .trace = traceHash(), .state = stateDigest() };
+    }
+
+    fn evFirst(rx: i32) !void {
+        var buf: [16]u8 = undefined;
+        const got = try dg.evRecvFrom(rx, &buf);
+        note(@truncate(got.from.port), buf[0..got.len]);
+    }
+
+    fn note(port_low: u8, bytes: []const u8) void {
+        transcript[transcript_len] = port_low;
+        transcript[transcript_len + 1] = @intCast(bytes.len);
+        @memcpy(transcript[transcript_len + 2 ..][0..bytes.len], bytes);
+        transcript_len += 2 + bytes.len;
+    }
+
+    fn run(seed_value: u64, flip_byte: bool) !Out {
+        flip = flip_byte;
+        try dg.run(seed_value, body);
+        return out;
+    }
+};
+
+test "sim: dgram trace: one changed payload byte gives a different wire digest, with the seed, lengths and endpoints the same" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    const base = try dg_wire.run(5, false);
+    var base_buf: [256]u8 = undefined;
+    const base_transcript = base_buf[0..dg_wire.transcript_len];
+    @memcpy(base_transcript, dg_wire.transcript[0..dg_wire.transcript_len]);
+    // 12 datagrams, each its source byte, its length and 3 to 6 bytes.
+    try std.testing.expectEqual(@as(usize, 78), base_transcript.len);
+    const again = try dg_wire.run(5, false);
+    try std.testing.expectEqual(base, again);
+    const flipped = try dg_wire.run(5, true);
+    try std.testing.expect(base.wire != flipped.wire);
+    // The state digest covers the datagram table, the wire digest with it.
+    try std.testing.expect(base.state != flipped.state);
+    // The trace and the transcript's shape do not see payload bytes: the
+    // digest is what catches the change.
+    try std.testing.expectEqual(base.trace, flipped.trace);
+    try std.testing.expectEqual(base_transcript.len, dg_wire.transcript_len);
+    try std.testing.expect(!std.mem.eql(u8, base_transcript, dg_wire.transcript[0..dg_wire.transcript_len]));
+}
+
+test "sim: dgram trace: a landing is a trace event: interleaves that differ give different traces, and the same seed the same" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    const Seen = struct { order: [6]u8, trace: u64 };
+    var seen: [12]Seen = undefined;
+    var seed_value: u64 = 1;
+    while (seed_value <= 12) : (seed_value += 1) {
+        const o = try dg_order.orderFor(seed_value);
+        const t = traceHash();
+        _ = try dg_order.orderFor(seed_value);
+        try std.testing.expectEqual(t, traceHash());
+        seen[seed_value - 1] = .{ .order = o, .trace = t };
+    }
+    var pairs_with_different_orders: usize = 0;
+    for (seen, 0..) |a, i| {
+        for (seen[i + 1 ..]) |b| {
+            if (std.mem.eql(u8, &a.order, &b.order)) continue;
+            pairs_with_different_orders += 1;
+            try std.testing.expect(a.trace != b.trace);
+        }
+    }
+    try std.testing.expect(pairs_with_different_orders > 0);
+}
+
+test "sim: dgram trace: ten fresh processes with the heap moved give one transcript, wire digest, trace and state digest" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    const name = "sim: dgram trace: ten fresh processes with the heap moved give one transcript, wire digest, trace and state digest";
+    if (isDeathChild()) {
+        noCoreDump();
+        const shift = std.fmt.parseInt(usize, std.mem.span(std.c.getenv("ZIO_SIM_HEAP_SHIFT") orelse "0"), 10) catch 0;
+        if (shift > 0) _ = try std.heap.page_allocator.alloc(u8, shift * 4096 + 7);
+        const o = try dg_wire.run(9, false);
+        var line_buf: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&line_buf);
+        try w.print("sim-dgram: wire={x:0>16} trace={x:0>16} state={x:0>16} transcript=", .{ o.wire, o.trace, o.state });
+        for (dg_wire.transcript[0..dg_wire.transcript_len]) |b| try w.print("{x:0>2}", .{b});
+        try w.writeByte('\n');
+        _ = std.c.write(2, w.buffered().ptr, w.buffered().len);
+        childDone(name);
+        return;
+    }
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_len = try std.process.executablePath(io, &exe_buf);
+    var first: ?[]u8 = null;
+    defer if (first) |f| gpa.free(f);
+    var k: usize = 1;
+    while (k <= 10) : (k += 1) {
+        var env: std.process.Environ.Map = .init(gpa);
+        defer env.deinit();
+        if (std.c.getenv("PATH")) |path| try env.put("PATH", std.mem.span(path));
+        try env.put("TEST_FILTER", name);
+        try env.put(death_child_env, "1");
+        var shift_buf: [16]u8 = undefined;
+        try env.put("ZIO_SIM_HEAP_SHIFT", try std.fmt.bufPrint(&shift_buf, "{d}", .{k * 13}));
+        const res = try std.process.run(gpa, io, .{
+            .argv = &.{exe_buf[0..exe_len]},
+            .environ_map = &env,
+            .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } },
+        });
+        defer gpa.free(res.stdout);
+        defer gpa.free(res.stderr);
+        try checkDoneMarkers(name, res.stderr);
+        const at = std.mem.indexOf(u8, res.stderr, "sim-dgram: ") orelse return error.NoLine;
+        const end_at = std.mem.indexOfScalarPos(u8, res.stderr, at, '\n') orelse return error.NoLine;
+        const got = res.stderr[at..end_at];
+        if (first) |f| {
+            if (!std.mem.eql(u8, f, got)) {
+                std.debug.print("child {d}: {s}\nchild 1: {s}\n", .{ k, got, f });
+                return error.ChildrenDiffer;
+            }
+        } else first = try gpa.dupe(u8, got);
+    }
+    // The transcript holds all 12 datagrams: 78 bytes, 156 hex digits.
+    const t_at = (std.mem.indexOf(u8, first.?, "transcript=") orelse return error.NoTranscript) + "transcript=".len;
+    try std.testing.expectEqual(@as(usize, 156), first.?.len - t_at);
+    std.debug.print("10 children: {s}\n", .{first.?[0..@min(first.?.len, 90)]});
 }
