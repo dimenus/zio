@@ -86,8 +86,28 @@ sim socket table, or does what the row says.
 | `connect`, `listen`, `accept`, `shutdown`, `send`, `recv` on a datagram fd | refused (`error.OperationNotSupported`) | as the kernel answers |
 
 **Send errors keep the distinctions a consumer needs:** `SendError` gains
-`AddressUnavailable` (`EADDRNOTAVAIL`). Today it falls into `Unexpected`
-(`src/os/net.zig:956-1003`). ENet treats it as transient and returns 0.
+`AddressUnavailable` (`EADDRNOTAVAIL`), done in 696d880. Before, it fell into
+`Unexpected`. ENet treats it as transient and returns 0.
+
+**A source address the socket cannot use.** The kernels disagree. Every row
+below was run, 3 times each, on 2026-11-14 (macOS 25.6.0 arm64; Linux 6.8.0
+aarch64 in colima), through zio's `sendDatagram`:
+
+| socket bound to | source asked for | macOS | Linux 6.8 | sim |
+|---|---|---|---|---|
+| 0.0.0.0 | 127.0.0.1 | sent | sent | sent |
+| 0.0.0.0 | 127.0.0.2 | EADDRNOTAVAIL (lo0 has only 127.0.0.1) | sent, from 127.0.0.2 | sent (all of 127/8 is local) |
+| 127.0.0.1 | 127.0.0.2 | EADDRNOTAVAIL | sent, from 127.0.0.2 | `AddressUnavailable` |
+| 0.0.0.0 | 192.0.2.1 (no host has it) | EADDRNOTAVAIL | ENETUNREACH | `AddressUnavailable` |
+
+**The sim models the strict answer, macOS's, on every host:** a source must
+be an address the socket can receive on (its bound address, or any 127/8
+address for a wildcard socket), else `AddressUnavailable`. Why: a peer that
+replies from an address it does not own is a bug the sim should catch, and a
+sim whose answers depend on the host OS would give one seed two behaviours.
+Where the sim's 127/8 is wider than macOS's lo0 (the second row), it follows
+Linux, so tests can use more than one loopback address. Acceptance group 7
+treats this case apart (section 11).
 
 ### 3.2 Consumers, in every build
 
@@ -199,8 +219,12 @@ empty one costs something, and 1 against the packet limit.
 - A later `SO_RCVBUF` re-provisions it. Datagrams already queued stay; if
   they now exceed the new limit, nothing is dropped, but new ones are dropped
   until the queue is under the limit.
-- If the allocation fails, `setsockopt` returns `error.SystemResources`, the
-  error a kernel gives, and the old limit stays.
+- If the allocation fails, the sim panics. `setsockopt`'s error set has no
+  `SystemResources` in a build without sim, and only `AddressUnavailable` may
+  change that build. A kernel never fails `SO_RCVBUF` for memory (it stores a
+  number), so there is no kernel answer to copy; a harness out of memory is
+  broken anyway. Running out of memory at open or at send is
+  `error.SystemResources`, which those error sets have.
 
 **Overflow is a counted receive loss (`dropped_rcvbuf`), never a panic.** A
 harness asserts its own budget (`dropped_rcvbuf == 0`) separately.
@@ -250,13 +274,19 @@ harness asserts its own budget (`dropped_rcvbuf == 0`) separately.
 | class | under sim | examples |
 |---|---|---|
 | **modelled** | the option has its documented effect | `SO_RCVBUF` (byte limit), non-blocking, `enableDestinationAddress`, `TCP_NODELAY = 1` and `SO_REUSEADDR = 1` (stream track) |
-| **unsupported, advisory** | returns `error.OptionUnsupported`; nothing changes; the caller may ignore it | `SO_SNDBUF`, `IP_TOS`, ENet's QoS option, `SO_RCVLOWAT`, `TCP_NODELAY = 0` |
-| **misuse** | panics with the option's name | an option on a closed or unknown fd; `SO_REUSEPORT` sharing a port; broadcast and multicast options; an option level the layer does not know |
+| **unsupported, advisory** | returns `error.OptionNotSupported` (zio's existing name); nothing changes; the caller may ignore it | `SO_SNDBUF`, `SO_RCVLOWAT`, `SO_REUSEADDR` on a datagram socket, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `IP_TOS`, `IP_TTL`, `IPV6_TCLASS`, and ENet's QoS option (`SO_NET_SERVICE_TYPE` on macOS, `SO_PRIORITY` on Linux), `TCP_NODELAY = 0` (stream track) |
+| **misuse** | panics with the option's name | an option on a closed or unknown fd; `SO_REUSEPORT`; broadcast and multicast options; a TCP option on a datagram socket; any other option or level; a non-positive `SO_RCVBUF` |
+
+**Reading an option** (`getsockopt`): modelled are `SO_RCVBUF` (the byte
+limit), `SO_ERROR` (always 0) and the destination-address option. Reading any
+other option panics: `getsockopt`'s error set is only `Unexpected` in a build
+without sim, so there is no "unsupported" to return. ENet's core reads no
+option, and hotseat's bridge will not; `IP_TTL` is not modelled.
 
 - An unsupported option returns an error, so ENet's ignored -1 works
   (`host.c:66-68`).
 - hotseat's Darwin tests that need a 1-byte `SO_SNDBUF` to get `EMSGSIZE`
-  stay real-socket tests. Under sim they would see `OptionUnsupported`, and
+  stay real-socket tests. Under sim they would see `OptionNotSupported`, and
   their sends would succeed. Send pressure is not modelled (section 10).
 - **TIME_WAIT is not modelled.** Stream rebinding without `SO_REUSEADDR` is
   refused (stream track). starh2's listeners set `reuse_address = true`
@@ -347,6 +377,11 @@ repo's suite under `sim: `.
    layer in a normal build (real loopback sockets), with the same return
    values and the same metadata checks (destination address, source address,
    truncation, would-block).
+   - **Not a parity case: a source address the socket cannot use** (section
+     3.1's table). On macOS the normal build must match the sim exactly. On
+     Linux the test records and asserts what the kernel does (ENETUNREACH for
+     192.0.2.1; sent for 127.0.0.2, from a wildcard socket and from one bound
+     to 127.0.0.1), so a kernel change is seen.
 
 **Phase 1 passing is not approval to replace hotseat's production ENet
 sockets.** hotseat's phase has its own gate.
@@ -458,19 +493,15 @@ The scripts the gates below use are beside them, in `zio-sim6-tools/` there
    the refusal nor a sim branch. Then a new exit cannot be added without it.
 2. **The C-bridge tests in both builds, and the seven acceptance groups.**
 
-### Open design points (each needs a decision)
+### Decided by the design's owner (2026-11-14, after reports 6-8)
 
-- **Two departures in ec6ec37:** re-provisioning out of memory refuses (the
-  design says `SystemResources`, which `SetsockoptError` lacks), and reading
-  an unsupported option refuses (`GetsockoptError` has only `Unexpected`).
-  Widening either error set would change a build without sim. Report 7.
-- **A bad source address (before group 7):** for a send from a source
-  address the socket cannot use, the sim answers `AddressUnavailable`
-  (section 3.1). Measured: macOS answers EADDRNOTAVAIL too; **Linux 6.8
-  answers ENETUNREACH** for an address the host does not have, and **sends
-  from any local address**, even one the socket is not bound to. Group 7 (the
-  same bridge, the same return values, in both builds) cannot hold on Linux as
-  the design stands. Report 6.
+- **A bad source address:** the sim stays strict and host-independent; group
+  7 treats that case apart (sections 3.1 and 11).
+- **Out of memory re-provisioning a queue panics; reading an option that is
+  not modelled panics;** `IP_TTL` is not modelled (sections 6 and 8).
+- **The native-exit refusals go inside each fd-taking function of
+  `src/os/`,** one helper call first in the body, nothing else changed in
+  those files, with a structural test that fails toward noise (step 1 below).
 
 ### How to run things
 

@@ -2588,3 +2588,23 @@ test "pollInterruptible: a signal during the wait is .interrupted, where poll wo
     t.join();
     try std.testing.expectEqual(PollOutcome.interrupted, try outcome);
 }
+
+// The sim refuses this send, as macOS does (`sim.dgramSend`). Linux sends from
+// any local address, so on Linux this records the kernel's answer: a change
+// in it shows here.
+test "datagram metadata: a socket bound to 127.0.0.1 sending from 127.0.0.2: macOS AddressUnavailable, Linux sends from 127.0.0.2" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const rx = try real_dgram.open();
+    defer close(rx);
+    const tx = try real_dgram.open();
+    defer close(tx);
+    const port = try real_dgram.bindAt(rx, .{ 0, 0, 0, 0 });
+    _ = try real_dgram.bindAt(tx, .{ 127, 0, 0, 1 });
+    const sent = real_dgram.send1(tx, real_dgram.in4(.{ 127, 0, 0, 1 }, port), .{ 127, 0, 0, 2 }, "hi");
+    if (builtin.os.tag != .linux) return std.testing.expectError(error.AddressUnavailable, sent);
+    _ = try sent;
+    var buf: [4]u8 = undefined;
+    var from: sockaddr.in = undefined;
+    _ = try real_dgram.recv1(rx, &buf, .{}, &from);
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 2 }, @as([4]u8, @bitCast(from.addr)));
+}
