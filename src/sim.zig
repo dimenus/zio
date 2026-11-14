@@ -1491,6 +1491,8 @@ pub fn dgramIsOpen(fd: i32) bool {
 
 /// `poll` with a zero timeout: readable when a datagram is queued; a
 /// datagram socket is always writable (send pressure is not modelled).
+/// Refuses a pipe end and a closed socket, so a poll calls it for every
+/// entry, whatever its events.
 pub fn dgramReadable(fd: i32) bool {
     return dgramSlot("poll", fd).meta_len > 0;
 }
@@ -4665,6 +4667,61 @@ test "sim: dgram ev refuses: a poll that mixes sim and real fds" {
             const fd = try dg.open();
             var fds = [2]dg.os_net.pollfd{ .{ .fd = fd, .events = dg.os_net.POLL.IN, .revents = 0 }, .{ .fd = 0, .events = dg.os_net.POLL.IN, .revents = 0 } };
             _ = try dg.os_net.poll(&fds, 0);
+        }
+    }.body);
+}
+
+test "sim: dgram ev refuses: a poll for writing on a closed sim socket" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram ev refuses: a poll for writing on a closed sim socket", "sim: poll on sim fd 100032, which is closed", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            dg.os_net.close(fd);
+            _ = try dg.pollNow(fd, dg.os_net.POLL.OUT);
+        }
+    }.body);
+}
+
+test "sim: dgram ev refuses: a poll for writing on a sim pipe fd" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram ev refuses: a poll for writing on a sim pipe fd", "sim: poll on sim fd 100000, which is not a datagram socket", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = pipePair()[0];
+            _ = try dg.pollNow(fd, dg.os_net.POLL.OUT);
+        }
+    }.body);
+}
+
+test "sim: dgram ev refuses: an ev poll for sending on a closed sim socket" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram ev refuses: an ev poll for sending on a closed sim socket", "sim: poll on sim fd 100032, which is closed", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            dg.os_net.close(fd);
+            try dg.evPoll(fd, .send);
+        }
+    }.body);
+}
+
+test "sim: dgram ev: a negative fd in a poll set is ignored, as the kernel does, beside a sim socket" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            const fd = try dg.open();
+            const P = dg.os_net.POLL;
+            var fds = [3]dg.os_net.pollfd{
+                .{ .fd = -1, .events = P.IN | P.OUT, .revents = 0x7 },
+                .{ .fd = fd, .events = P.OUT, .revents = 0 },
+                .{ .fd = -5, .events = P.OUT, .revents = 0 },
+            };
+            try std.testing.expectEqual(@as(usize, 1), try dg.os_net.poll(&fds, 0));
+            try std.testing.expectEqual(@as(i16, 0), fds[0].revents);
+            try std.testing.expectEqual(@as(i16, P.OUT), fds[1].revents);
+            try std.testing.expectEqual(@as(i16, 0), fds[2].revents);
+            dg.os_net.close(fd);
         }
     }.body);
 }

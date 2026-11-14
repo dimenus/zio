@@ -1995,18 +1995,28 @@ pub fn pollInterruptible(fd: fd_t, events: i16, timeout_ms: i32) PollError!PollO
 /// readable when a datagram is queued, and always writable. Nothing can land
 /// while the sim thread waits, so only a zero timeout is allowed, and real and
 /// sim fds cannot be mixed in one call.
+/// `poll` of a set that holds a sim fd. Every non-negative fd in it must be
+/// an open sim datagram socket: a real fd, a sim pipe end or a closed socket
+/// refuses, whatever the events asked for. A negative fd is skipped with
+/// revents 0, as the kernel does. Null when the set holds no sim fd.
 fn simPoll(fds: []pollfd, timeout: i32) ?usize {
     var sim_fds: usize = 0;
+    var skipped: usize = 0;
     for (fds) |f| {
-        if (sim.isSimFd(f.fd)) sim_fds += 1;
+        if (f.fd < 0) {
+            skipped += 1;
+        } else if (sim.isSimFd(f.fd)) sim_fds += 1;
     }
     if (sim_fds == 0) return null;
-    if (sim_fds != fds.len) sim.panic("sim: a poll of {d} sim fds and {d} real fds: they cannot be mixed", .{ sim_fds, fds.len - sim_fds });
+    if (sim_fds + skipped != fds.len) sim.panic("sim: a poll of {d} sim fds and {d} real fds: they cannot be mixed", .{ sim_fds, fds.len - sim_fds - skipped });
     if (timeout != 0) sim.panic("sim: a poll with a timeout of {d} ms on sim fds: only a zero timeout is allowed", .{timeout});
     var ready: usize = 0;
     for (fds) |*f| {
         f.revents = 0;
-        if (f.events & POLL.IN != 0 and sim.dgramReadable(f.fd)) f.revents |= POLL.IN;
+        if (f.fd < 0) continue;
+        // Refuses a pipe end or a closed socket before any event is read.
+        const readable = sim.dgramReadable(f.fd);
+        if (f.events & POLL.IN != 0 and readable) f.revents |= POLL.IN;
         if (f.events & POLL.OUT != 0) f.revents |= POLL.OUT;
         if (f.revents != 0) ready += 1;
     }

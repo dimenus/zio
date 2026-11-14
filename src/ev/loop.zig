@@ -1894,7 +1894,9 @@ pub const Loop = struct {
             },
             .net_poll => {
                 const op = c.cast(NetPoll);
-                if (op.event == .recv and !sim.dgramReadable(op.handle)) return false;
+                // Read for every event: it refuses a closed socket.
+                const readable = sim.dgramReadable(op.handle);
+                if (op.event == .recv and !readable) return false;
                 c.setResult(.net_poll, {});
             },
             else => sim.panic("sim: unsimulated I/O op {s} on a datagram socket", .{@tagName(c.op)}),
