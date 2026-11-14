@@ -2105,16 +2105,22 @@ fn checkSockStats(sk: *MSock) void {
 }
 
 fn pollOnce(cap_ns: u64) void {
-    // A poll moves the clock at most to the next landing the model predicts:
-    // a sim that scheduled it later would pass it (round 5, finding 2).
+    // A poll moves the clock forward, by at most its cap, and at most to the
+    // next landing the model predicts: a sim that scheduled the landing later
+    // would pass it (round 5, finding 2), and one that ignored the cap could
+    // stop exactly at the landing and pass the landing check (round 6).
     const earliest: ?u64 = if (M.wire.items.len > 0) M.wire.items[0].due else null;
+    const before = sim.clockNs();
     M.in_poll = true;
     M.loop.poll(.fromNanoseconds(cap_ns)) catch |e| fail("poll: {t}", .{e});
     M.in_poll = false;
     M.polls += 1;
     M.c.polls += 1;
+    const after = sim.clockNs();
+    if (after < before) fail("a poll moved the clock back, from {d} ns to {d} ns", .{ before, after });
+    if (after - before > cap_ns) fail("a poll capped at {d} ns moved the clock {d} ns, from {d} ns to {d} ns", .{ cap_ns, after - before, before, after });
     if (earliest) |e| {
-        if (sim.clockNs() > e) fail("a poll moved the clock to {d} ns, past a landing the model has at {d} ns", .{ sim.clockNs(), e });
+        if (after > e) fail("a poll moved the clock to {d} ns, past a landing the model has at {d} ns", .{ after, e });
     }
     checkWire();
     const now = sim.clockNs();

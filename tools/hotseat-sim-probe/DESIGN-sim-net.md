@@ -2,8 +2,9 @@
 
 Status: **phase 1 (section 12) is built, and four rounds of outside review
 of it are closed (section 15). Section 15 is the acceptance record of phase
-1. Phase 2 (faults and replay) is built (section 15); its API and rules
-are the comment above `pub const Endpoint` in `src/sim.zig`.**
+1. Phase 2 (faults and replay) is built and accepted at 4aeb580 (section
+15); its API and rules are the comment above `pub const Endpoint` in
+`src/sim.zig`.**
 
 Revision 2 (dd55885) was reviewed by another vendor's model. This revision
 takes the decisions made after that review. Section 13 lists what changed
@@ -952,8 +953,25 @@ the mutants in its commits.
     seed); faults that change at a timer; sends predicted to fail; source
     address overrides (`from`); more than 6 rules; `flowClash` across
     different destination ports.
+- **Phase 2 accepted by the grader at 4aeb580** (report 22's review). The
+  grader's own recompute: 275 of 275 sim tests in 3 of 3 runs;
+  `check.sh --ci` exit 0 with 853 tests; four of the grader's mutants
+  caught; the machine code of the 8 example binaries the same as 33b95ca,
+  with the control differing.
+- **Round 6 of the outside review (gpt-simnet8.md, of 4aeb580): no
+  simulator defect; one P2 gap in the op model, closed in sitting 23.**
+  `pollOnce` accepted a poll that moved the clock past its own cap and
+  stopped exactly at the model's earliest landing (send at 0, landing at
+  100 µs, `pollOnce(20 µs)` advancing to 100 µs). It now saves the clock
+  before the poll and fails a clock that moves back or moves more than the
+  poll's cap, beside the earliest-landing check. The mutant of the review's
+  case, in the sim branch of `Loop.poll` (wait to the next landing when it
+  comes before every timer, past the caller's cap), survived all 16 seeds
+  of the old model and is killed at seed 1 step 34. A wider one (the sim
+  branch sets the wait from the timers alone) let a poll capped at 1 ms
+  jump 60 s with the old model green. Seeds 1 to 8 keep their counts.
 - **Phase 2 is built and reviewed.** This section is its acceptance record:
-  the slices above, the gates in each commit, and round 5. Not done in it, by decision: NAT rebinding
+  the slices above, the gates in each commit, and rounds 5 and 6. Not done in it, by decision: NAT rebinding
   (t-4100). Still open from phase 1: t-4096, t-4098 (the op model's
   holes; flows sharing a landing instant are still kept out of it).
 - Open and filed: t-4096 (zero-length receive on an empty sim pipe), t-4098
