@@ -1002,8 +1002,9 @@ the mutants in its commits.
   - **Next: slice 2** (17.16: bytes, chunks, window, credit and
     conservation; FIN and RST with data; the profiles' send and receive
     rules; `.both`; linger 0; `getpeername`; `bytesReadable`; the window
-    and chunking settings). Section 17 first gets review 3's findings
-    that block it, one commit, then the code:
+    and chunking settings). **Review 3's findings that blocked it
+    are fixed in section 17 (sitting 29, with rows 39 to 41 measured; the
+    commit message has the reasoning).** What each one was:
     - **3, the send and receive lists:** split each into a call list
       and a harvest list, as a95fe60 did for accept. The "unresolved"
       guard is the call's only; at harvest the op is itself the
@@ -1294,8 +1295,9 @@ report 24. The third outside review, `gpt-simnet11.md`, is answered in
 place, slice by slice, with no fourth full round (the grader's ruling):
 its findings 1, 2, 8 and the accept part of 3 are fixed here before slice
 1 (17.5, 17.6, 17.8's RST list, 17.15 item 3). Its findings 3 (send and
-receive), 4 to 7, 9, 10 and 11 are fixed before slice 2; section 15 lists
-them. Each claim says how it is known: **(read)** from the code at
+receive), 4 to 7, 9, 10 and 11 are fixed before slice 2 (sitting 29), in
+17.7, 17.8, 17.9 and 17.13; finding 4 and 7's rules come from rows 39 to 41,
+measured in sitting 29. Each claim says how it is known: **(read)** from the code at
 the file and line named, **(ran)** from the probes kept beside the
 sitting's report, or **(not measured)**.
 
@@ -1670,6 +1672,15 @@ retry. So no other connection, and no UDP traffic, can shift it. Chunk k
 lands at `T0 + k × 1 µs`, so each chunk lands in its own poll, and a
 reader sees a prefix first.
 
+**Order within a direction.** An entry lands no earlier than the entry
+sent before it in the same direction: its landing time is
+`max(its own time, the landing time of the direction's previous entry)`.
+Equal times land in sequence order (17.6's equal-time order). So a FIN,
+an RST or a credit sent in the same instant as a chunked send lands after
+its last chunk, never between its chunks. Without this, a FIN sent with a
+five-chunk send would land at `T0` and the chunks after it. Slice 1's
+entries are all `clock + L` in send order, so this changes none of them.
+
 **Chunk modes**, set with `sim.setStreamChunking(fd, mode)`, and for
 connections made later with `setStreamChunkingDefault(mode)`:
 - `.hashed`, the default;
@@ -1693,12 +1704,30 @@ credited`. A send with no room parks.
 not ACKed separately.
 - A read of n bytes adds n to the receiver's `read` count for that
   direction.
-- A credit entry carries the `read` count at its departure. The count is
-  frozen once the entry has left.
+- **A window release** (review 3, finding 7): unread bytes that `.both`
+  discards under `.macos` add to the receiver's `reclaimed` count, apart
+  from `read`. They free window room exactly as a read does, so they owe a
+  credit too. Without it, a sender parked on a full window whose receiver
+  discards everything is never woken: no read makes credit, and a FIN
+  does not wake a send. Row 41 measured it on macOS: the blocked send
+  wakes, and its data draws an RST (17.13).
+- A credit entry carries `read + reclaimed` at its departure. The count
+  is frozen once the entry has left.
 - At most one credit departs per direction per L (100 µs) of virtual
   time. A read inside that interval does not send a credit; it sets
   "owed", and the owed credit departs at `last departure + L` with the
   count at that moment. It never travels faster than the wire.
+- An owed departure is processed in the harvest of the poll that reaches
+  its time, after the entries that land at that instant, in (`conn_id`,
+  direction) order. It is not an entry: it has no sequence number until it
+  departs, and nothing is recorded until its credit lands.
+- An owed credit survives its receiver's close: it departs at its time,
+  and the connection does not retire until it has (17.5). A kernel's FIN
+  carries the same window, so a sender parked when its peer read and then
+  closed is woken, sends, and meets the RST of a closed endpoint. It is
+  discarded only by `failStream` on the receiver (17.9), or when the
+  receiver's own direction toward the sender is terminal at departure
+  time; then nothing leaves (`stale_credit`).
 - When a credit lands, `credited = max(credited, count)`, which is
   idempotent. If room appears, a parked send is woken.
 - Held credits of one direction coalesce to the newest. That is
@@ -1730,7 +1759,9 @@ The causes are named:
 - `failed_receiver`: data that lands at a failed endpoint, plus its
   unread bytes;
 - `closed_receiver`: data that lands at a closed endpoint;
-- `unread_at_close`: unread bytes when a close sends an RST;
+- `unread_at_close`: unread bytes at any close of the descriptor,
+  whatever else the close does (review 3, finding 6: also after a reset,
+  when nothing goes on the wire);
 - `shut_receiver`: data that lands after `.both`;
 - `both_discard`: unread bytes at `.both`, under `.macos`;
 - `after_reset`: data that lands after a reset was received;
@@ -1741,42 +1772,65 @@ Credit is applied exactly once per landing, by `max`. Once a direction is
 RST), its window accounting ends: no more admission is possible, and a
 credit that lands later is dropped and counted (`stale_credit`). It
 never wakes a send, and it never touches another connection. The op model
-checks the equation after every step, and checks `credited <= read`.
+checks the equation after every step, and checks `credited <= read +
+reclaimed` (`reclaimed` is the part of `both_discard` that freed room).
 
 ### 17.8 Endpoint rules, reset, shutdown, and the profiles (requirements A, C)
 
 **Two facts for reset (requirement C).** An endpoint has `reset_received`
-(an RST landed) and `reset_reported` (an op returned the reset error).
-Each is set once and never cleared. A second RST that lands is dropped
-and counted, and it never re-arms a reported error. An endpoint sends at
-most one RST in its life (`rst_sent`). So reads go reset, then EOF, and
-never reset again.
+(an RST landed, or a local reset, below) and `reset_reported` (an op
+returned the reset's error). Each is set once and never cleared. A second
+RST that lands is dropped and counted, and it never re-arms a reported
+error. An endpoint sends at most one RST in its life (`rst_sent`). So
+reads go reset, then EOF, and never reset again.
+
+**An RST landing is profile-neutral** (review 3, finding 9). It sets
+`reset_received`, and records `fin_before_reset`: whether a FIN had
+landed on the endpoint first. It chooses no answer. The profile is read
+at the call that meets the reset, so a run with no profile that never
+calls a send or a read after a FIN-then-RST needs none.
+
+**A local reset** (review 3, finding 5). Under `.linux`, a data chunk that
+lands after the endpoint's own `.both` resets it (row 18: the next read
+fails). It sets the same facts as a landed RST: `reset_received`, with
+`fin_before_reset` false. It is set only if `reset_received` is not
+already set, which also means it was never reported. So a second chunk of
+the same send (or any later one) is dropped by the "reset received" line
+of the data landing list and never re-arms the error. Row 40 measured
+it: 70000 bytes in one send give one `ECONNRESET`, then 0, 0.
 
 **The profiles.** `sim.setStreamProfile(.linux | .macos)` is called before
 the run's first stream socket opens, and is set once per run; a change
 later panics. It is in the state digest. Each profile follows one
 kernel's measured joint trace on every row where the kernels differ:
 
-- **`.linux`: one pending error, reported once by the first call that
-  meets it.** An RST that lands sets the pending error to
-  `ConnectionResetByPeer` if no FIN has landed on the endpoint. If a FIN
-  has landed, it sets the error to `pipe`: a read does not report `pipe`
-  and gives 0, and a send reports it as `BrokenPipe`. The first send or
-  read that reports the error consumes it. After that, reads give 0 and
-  sends give `BrokenPipe`. Rows 7, 17, 18, 20, 22, 23, 25, 26, 26b and 36.
-- **`.macos`: after an RST lands, every send gives `BrokenPipe`.** This
-  includes a send parked at that moment. A send never consumes anything.
-  The first read after the unread bytes gives `ConnectionResetByPeer`
-  once, whether or not a FIN landed; later reads give 0. Rows 7, 17, 18,
-  20, 22, 23, 25, 26, 26b and 36.
+- **`.linux`: one pending error, reported once by the first send or read
+  that meets it.** The pending error exists while `reset_received` is set
+  and `reset_reported` is not. Its kind comes from `fin_before_reset`:
+  without a FIN first it is `ConnectionResetByPeer`, reported by a read or
+  a send; after a FIN it is `pipe`, which a read does not report (it gives
+  0) and a send reports as `BrokenPipe`. Reporting sets `reset_reported`.
+  After that, reads give 0 and sends give `BrokenPipe`. Rows 7, 8, 17,
+  18, 20, 22, 23, 25, 26, 26b, 36 and 39 to 40.
+- **`.macos`: after a reset, every send gives `BrokenPipe`.** This
+  includes a send parked at that moment. A send never reports the reset
+  and never sets `reset_reported`. The first read after the unread bytes
+  gives `ConnectionResetByPeer` once, whether or not a FIN landed first,
+  and sets `reset_reported`; later reads give 0. Rows 7, 8, 17, 18, 20,
+  22, 23, 25, 26, 26b, 36 and 39 to 41.
 
 **Reaching a differing row with no profile panics and names the row.**
 Rows where the kernels agree need no profile, so an ordinary test that
-never meets one of these points needs none. The points are:
-- a send that meets a received reset (rows 23, 25, 26b, 36);
-- a read that meets a reset after a FIN had landed (row 22);
-- `.both` with unread bytes, or a byte that lands after `.both` (rows 17
-  and 18);
+never meets one of these points needs none. The points, each at a call
+or at a landing, never earlier:
+- a send that meets a reset with no FIN before it and not yet reported
+  (rows 23, 25, 26b, 36, 39). After a FIN, or once a read reported it,
+  both kernels give `BrokenPipe`;
+- a read that meets a reset after a FIN had landed, with no unread bytes
+  (rows 8, 22). Without a FIN first both give `ConnectionResetByPeer`
+  once;
+- `.both` with unread bytes (row 17), and a data chunk that lands after
+  `.both` (row 18, a landing);
 - a rebind in the differing combination (row 31);
 - two listeners on one port with different addresses (row 12);
 - a connect to 127/8 other than 127.0.0.1 (rows 15 and 30).
@@ -1794,55 +1848,90 @@ never meets one of these points needs none. The points are:
 | 15, 30 under `.macos` | refused: macOS's answer (no answer) depends on lo0's aliases, not on TCP. `.linux` connects from 127.0.0.1 |
 
 **The cost of profiles.** It is 6 decision points in the sim:
-- what an RST landing sets;
 - a send that meets a reset;
 - a read that meets a reset;
-- `.both` and unread bytes;
-- `.both` and late data;
-- the rebind rule.
+- `.both` and unread bytes (discard and release, or keep);
+- `.both` and late data (local reset, or not);
+- the rebind rule;
+- row 12 and rows 15 and 30 (refusals under `.macos`).
 
-Add 2 refusals under `.macos`, about 80 lines by my estimate, and a
-parity column per profile, each run on its own host. What it gives:
-starh2 gets Linux's whole trace, hotseat on a Mac gets macOS's, and no run
-mixes two kernels. I think it is worth it.
+What it gives: starh2 gets Linux's whole trace, hotseat on a Mac gets
+macOS's, and no run mixes two kernels.
 
-**`NetRecv(fd)`**, at the call, and again at harvest for a woken receive
-(then step 2 is skipped):
+**Calls and harvests are two lists** (review 3, finding 3; 17.6 says
+why). A receive or a send is checked at the call by its call list. If it
+parks and is woken, its harvest list runs. Both end in the same shared
+evaluation, so the call and the harvest cannot disagree about a state.
+
+**`NetRecv(fd)` at the call:**
 1. The fd is not an endpoint in `est`, or the total buffer length is 0
    (t-4096's ruling): refused.
 2. A receive is unresolved (parked, or woken and not harvested): refused.
-3. The endpoint failed and has not reported it: the failure's error
-   (`ConnectionResetByPeer` or `ConnectionTimedOut`); it is now reported.
-4. The endpoint failed and has reported it: 0.
-5. There are unread bytes: they are returned (up to the buffers), and a
-   credit is owed.
-6. A pending error that a read reports (`.linux`: reset; `.macos`: reset,
-   not yet reported): the error; it is now reported.
-7. A FIN landed, the endpoint did `.both`, or a reset was received: 0.
-8. Otherwise: it parks. At harvest this line is an invariant panic: a
-   woken receive always has a result, because only the receive itself
-   consumes bytes.
+3. The receive evaluation, below. If it parks, the op parks.
 
-**`NetSend(fd)`**, at the call, and again at harvest for a woken send:
-1. The fd is not an endpoint in `est`: refused. A length of 0 returns 0.
-2. A send is unresolved: refused.
-3. The endpoint failed and has not reported it: the failure's error; it
-   is now reported.
-4. The endpoint failed, or its own FIN went out: `BrokenPipe`.
-5. A reset was received: by profile. `.linux` reports the pending error
-   if it has not been consumed, else `BrokenPipe`. `.macos` gives
-   `BrokenPipe`.
-6. There is room: admit (17.7), and return the count.
-7. Otherwise: it parks. At harvest, room 0 here is an invariant panic,
-   because a window change while a send is woken is refused (17.7).
+**`NetRecv` at the harvest of a woken receive:**
+1. The socket's generation no longer matches (closed, or the number
+   reused): `FileDescriptorNotASocket`.
+2. The receive evaluation. Its park line is an invariant panic here: a
+   woken receive always has a result, because only a receive consumes
+   bytes, and a second receive refuses while this one is unresolved.
 
-**What wakes a parked op.** It is then evaluated by the list above at
-harvest.
+**The receive evaluation**, in order:
+1. The endpoint failed and has not reported it: the failure's error
+   (`ConnectionResetByPeer` or `ConnectionTimedOut`); now reported.
+2. The endpoint failed and has reported it: 0.
+3. There are unread bytes: they are returned (up to the buffers), `read`
+   grows, and a credit is owed (17.7).
+4. A reset was received and is not reported: `.linux`: without a FIN
+   first, `ConnectionResetByPeer`, now reported; after a FIN, 0 (the
+   pending `pipe` stays for a send). `.macos`: `ConnectionResetByPeer`,
+   now reported. No profile: as `.linux` without a FIN first; after a
+   FIN, panic (row 22).
+5. A FIN landed, the endpoint did `.both`, or a reset was received: 0.
+6. Otherwise: park.
+
+**`NetSend(fd)` at the call:**
+1. The fd is not an endpoint in `est`: refused.
+2. The total length is 0: 0, and nothing else is checked or changed (not
+   measured on a kernel; zio's own writers return before they submit
+   one).
+3. A send is unresolved: refused.
+4. The send evaluation, below. If it parks, the op parks.
+
+**`NetSend` at the harvest of a woken send:**
+1. The generation no longer matches: `FileDescriptorNotASocket`.
+2. The send evaluation. Its park line is an invariant panic here: a
+   woken send always has a result, because only a send uses room, a
+   second send refuses, and a window change while a send is woken is
+   refused (17.7).
+
+**The send evaluation**, in order (review 3, finding 4: the reset comes
+before the own FIN):
+1. The endpoint failed and has not reported it: the failure's error; now
+   reported.
+2. The endpoint failed and has reported it: `BrokenPipe`.
+3. A reset was received: `.linux`: if it is not reported,
+   `ConnectionResetByPeer` without a FIN first and `BrokenPipe` after one,
+   and it is now reported; if it is reported, `BrokenPipe`. `.macos`:
+   `BrokenPipe`, and nothing is reported. No profile: `BrokenPipe` after a
+   FIN or once reported; otherwise panic (rows 23, 25, 26b, 36, 39).
+4. Its own FIN went out (`shutdown(.send)` or `.both`): `BrokenPipe`.
+5. There is room: admit (17.7), and return the count.
+6. Otherwise: park.
+
+Rows 39 and 39u fix the order of lines 3 and 4: after its own `SHUT_WR`
+and a peer RST, Linux's first send gives `ECONNRESET` and consumes it,
+and reads then give 0; macOS's sends give `EPIPE` and the first read
+`ECONNRESET` (ran: `tcpprobe4.c`, 3 runs on each kernel). With line 4
+first, Linux's read would report a reset its kernel had already given to
+the send.
+
+**What wakes a parked op.** It is then evaluated by its harvest list.
 
 | op | woken by | when |
 |---|---|---|
-| receive | data, FIN or RST landing; own `.both`; `failStream` | at landing / at the call |
-| send | a credit that makes room; a window grow; an RST landing; own `shutdown(.send / .both)`; `failStream` | at landing / at the call |
+| receive | data, FIN or RST landing; a local reset; own `.both`; `failStream` | at landing / at the call |
+| send | a credit that makes room; a window grow; an RST landing; a local reset; own `shutdown(.send / .both)`; `failStream` | at landing / at the call |
 | either | cancel or deadline: `Canceled` / `Timeout`, and the op is removed | at the call |
 | either | own close: `FileDescriptorNotASocket` (the generation) | next harvest |
 | receive | own `shutdown(.send)`: **not** woken (row 19) | — |
@@ -1853,43 +1942,51 @@ Each op ends once, through the existing `isLive` and `endOp`.
 **`shutdown(fd, .send)`:**
 1. The fd is not an endpoint in `est`: refused.
 2. A reset was received, or the endpoint failed: `SocketUnconnected`.
-   This does not consume the pending error (rows 37 and 38, both
-   kernels).
+   This does not consume the pending error (rows 37, 38 and 39w, both
+   kernels; 39w also shows it comes before line 3).
 3. Its FIN already went out: ok, nothing more.
 4. Otherwise: a FIN goes out behind the admitted bytes, and needs no
    room; a parked send is woken (`BrokenPipe`, row 24). If no FIN has
    landed on it, its port is reserved (TIME_WAIT).
 
-**`shutdown(fd, .both)`:** as `.send`, then the receive side is shut.
+**`shutdown(fd, .both)`:** as `.send`, and when that part fails, `.both`
+stops there with its error (row 37). Then the receive side is shut:
 - A parked receive is woken, and gives 0 (row 16, both kernels).
-- Unread bytes: `.linux` keeps them for reading (row 17). `.macos`
-  discards them (`both_discard`). With no profile and unread bytes, it
-  panics (row 17).
+- Unread bytes: `.linux` keeps them for reading (rows 17 and 41: the
+  window stays full, so a parked sender stays parked until they are
+  read). `.macos` discards them (`both_discard`), adds them to
+  `reclaimed`, and owes a credit: the window release of 17.7 (row 41: the
+  parked sender wakes). With no profile and unread bytes, it panics (row
+  17).
 - A byte that lands later: see the data landing rules.
 
 **`close(fd)`** of an `est` endpoint (other phases: 17.6):
-1. The endpoint failed, or a reset was received: the descriptor is
+1. Unread bytes are discarded and counted (`unread_at_close`), always
+   (review 3, finding 6). Remember whether there were any.
+2. The endpoint failed, or a reset was received: the descriptor is
    released; nothing goes on the wire.
-2. There are unread bytes, or `SO_LINGER` {1, 0} is set: an RST goes out
-   and `rst_sent` is set. Unread bytes are discarded
-   (`unread_at_close`), and the endpoint's held outbound data and FIN are
+3. There were unread bytes, or `SO_LINGER` {1, 0} is set: an RST goes out
+   and `rst_sent` is set. The endpoint's held outbound data and FIN are
    discarded (`abort`). Its data already on the wire still lands before
    the RST, in order.
-3. Otherwise: a FIN goes out, unless one already did. Its port is
+4. Otherwise: a FIN goes out, unless one already did. Its port is
    reserved if it is the active closer.
 
 In every case the endpoint is dead. Unresolved ops end
-`FileDescriptorNotASocket` at the next harvest.
+`FileDescriptorNotASocket` at the next harvest. An owed credit still
+departs (17.7).
 
 **A data chunk lands at endpoint X:**
 1. X failed: dropped (`failed_receiver`); no answer.
-2. A reset was received on X: dropped (`after_reset`); no answer.
+2. A reset was received on X (landed or local): dropped (`after_reset`);
+   no answer.
 3. X is dead (closed): dropped (`closed_receiver`). If X has not sent an
    RST, one goes back.
 4. X did `.both`: dropped (`shut_receiver`). If X has not sent an RST,
-   one goes back (rows 17 and 18, both kernels). Under `.linux`, if X has
-   no pending error, it gets `ConnectionResetByPeer` (row 18: the next
-   read fails). With no profile, it panics (row 18).
+   one goes back (rows 17, 18 and 40, both kernels). Under `.linux`, X
+   gets a local reset (above), and its held outbound data and FIN are
+   discarded (`abort`), as at an RST landing. With no profile, it panics
+   (row 18).
 5. Otherwise (`S-queued` or `est`): the bytes join the unread bytes, and
    a parked receive is woken. (`S-prov` cannot be reached here: the
    client's data follows its ACK in order.)
@@ -1910,7 +2007,7 @@ In every case the endpoint is dead. Unresolved ops end
    it (review 3, finding 2).
 4. X is `C-syn`: 17.6.
 5. Otherwise (`S-queued` or `est`):
-   - set `reset_received`, and the pending error by profile (above);
+   - set `reset_received` and `fin_before_reset` (profile-neutral);
    - unread bytes stay, and are read first (rows 20 and 22);
    - X's held outbound data and FIN are discarded (`abort`);
    - X's sending direction is terminal;
@@ -1940,8 +2037,11 @@ The protocol is part of each rule's record in the fault digest.
 **Delay and jitter** are drawn once per entry, at its send, with the key
 `(seed, conn_id, direction, sequence, purpose)`, where the purpose is
 "delay" or "jitter" (17.10). Within a direction, landing times only go
-forward: the clamp is always on, and each entry lands at least 1 ns after
-the one before it.
+forward: the clamp of 17.7 is always on, and an entry lands no earlier
+than the one before it; equal times land in sequence order. (Revision 3
+said "at least 1 ns after", copied from UDP's clamp, where equal times
+have no sequence to order them. TCP entries have one, so equal times are
+safe, and slice 1's timings stay as they are.)
 
 **Held, defined:**
 1. **When.** An entry is held if a matching **partition or silence** is
@@ -1985,12 +2085,18 @@ the virtual time of the call. It puts nothing on the wire.
 | when | what happens |
 |---|---|
 | X in `C-syn` | the parked connect fails, at the call, with `ConnectionResetByPeer` or **`Timeout`** (`ConnectError` has no `ConnectionTimedOut`; read: `src/os/net.zig:648-650`); X becomes `C-failed` and failed; a later SYN-ACK is dropped (17.6) |
-| X in `est` | X is failed. A parked or woken receive or send ends with `ConnectionResetByPeer` or `ConnectionTimedOut` at the call. If none is parked, the next receive or send gets it once (17.8 step 3). |
+| X in `est` | X is failed. A parked receive and a parked send are woken at the call (a woken one is already due). At harvest each runs its evaluation (17.8), whose first line reports the failure: the first op harvested gets `ConnectionResetByPeer` or `ConnectionTimedOut` and sets it reported; the other then gets its line 2, 0 for a receive and `BrokenPipe` for a send. Which is first is the harvest order, a function of the seed. If none is unresolved, the next receive or send gets it once. After it is reported, receives give 0 and sends `BrokenPipe` (review 3, finding 11). |
 | X's outbound data | **held** data and FIN are discarded (`failed_sender`); data **already on the wire** still lands at the peer. Owed and held credits from X are discarded. |
 | X's inbound data | unread bytes are discarded (`failed_receiver`). Entries that land later are dropped, and nothing answers (17.8). |
 | the peer B | B is not touched. Its parked ops stay parked until something happens to B itself: data, a FIN or an RST that lands, a cancel, a deadline, a close, or `failStream` on B. B's sends are admitted while it has room. When its window fills, the send parks, because a failed X sends no credit. |
 | later close of X | the descriptor is released, and nothing goes on the wire (17.8 close, step 1) |
 | X in any other phase | refused |
+
+Why the harvest order decides: a kernel keeps one pending socket error,
+so of a blocked read and a blocked send only one gets the cause, and which
+one is a scheduling race. The sim makes that race the harvest order, so
+it is deterministic per seed and both orders occur across seeds. Giving
+both ops the error would report it twice, which no kernel does.
 
 hotseat's case, "the host dies in the middle of the RTSP exchange", is
 `failStream(client_fd, .timed_out)`. A test that also wants the host side
@@ -2045,11 +2151,11 @@ quiet partitions it, or closes the host's socket.
   - each socket's options (`TCP_NODELAY`, `SO_REUSEADDR`, `SO_LINGER`);
   - each listener's capacity, queue and provisional endpoints;
   - each endpoint's phase, flags (FIN in and out, `.both`, reset
-    received and reported, RST sent, failed and its kind), pending
-    error, and unread bytes;
-  - each direction's admitted, credited, read and discarded counts, its
-    sequence and `data_send_index`, its credit pacing (last departure,
-    owed);
+    received and reported, `fin_before_reset`, RST sent, failed, its
+    kind and whether it was reported), and unread bytes;
+  - each direction's admitted, credited, read, reclaimed and discarded
+    counts, its sequence, `data_send_index` and last landing time, its
+    credit pacing (last departure, owed and when);
   - every TCP entry on the wire or held;
   - the TCP port table, counter and reservations;
   - the next `conn_id`, the parked op ids and the generations.
@@ -2076,7 +2182,9 @@ quiet partitions it, or closes the host's socket.
 The probes ran 3 times on macOS 25.6.0 arm64 and 3 times on Linux 6.8.0
 aarch64 (colima):
 - `tcpprobe.c`: rows 1 to 15 (sitting 23);
-- `tcpprobe3.c`: rows 16 to 38 (sitting 25).
+- `tcpprobe3.c`: rows 16 to 38 (sitting 25);
+- `tcpprobe4.c`: rows 39 to 41, and the kernel's account of each blocked
+  call (sitting 29).
 
 The raw outputs are beside reports 23 and 25. Each kernel's three outputs
 are identical, except row 10 on macOS and the random port of row 14 on
@@ -2088,6 +2196,29 @@ call and whether the event had started when it returned. A call that was
 not inside the call at the event, or that returned before it, is
 reported `REJECTED`; no run printed that. Rows 16 to 35 are byte-identical
 to sitting 24's outputs on both kernels, so the repair changed no answer.
+
+**What the blocked-call rows prove, narrowed (review 3, finding 10).**
+The flags alone do not prove the call was blocked across the event: the
+worker can return, pause, and read the event flag late, and `entered` is
+stored before the call starts. `tcpprobe4.c` (sitting 29; rows 16 to 38
+byte-identical to `tcpprobe3.c`'s outputs on both kernels, 3 runs each)
+adds the kernel's own account, read just before the event: on Linux the
+worker's `/proc/self/task/<tid>/syscall` named its own call (206
+`sendto`, 207 `recvfrom`); on macOS `thread_info` gave run state 3,
+waiting in the kernel. That held for rows 16, 19, 23, 24, 25 and 41 in
+every run. So at the event each call had entered the kernel and had not
+returned. **What remains uncertain:**
+- on macOS the run state does not name the call. The worker makes no
+  other call after `entered`, but a wait for another reason (a page
+  fault, say) is not excluded by this evidence alone;
+- between the sample and the event (the next statement) the call could
+  still return for another cause. The only others are the 2 s guard,
+  about 1.8 s away at that point, and traffic, and the probe sends none
+  in that window. This is an argument from the probe's code, not a
+  measurement.
+
+Rows 39 to 41 are `tcpprobe4.c`'s new rows. The raw outputs are
+`zio-sim29/probe4/` beside report 29.
 
 | row | case | macOS | Linux | sim |
 |---|---|---|---|---|
@@ -2129,6 +2260,12 @@ to sitting 24's outputs on both kernels, so the repair changed no answer.
 | 36 | peer resets; send first, twice; reads | `EPIPE`, `EPIPE`; `ECONNRESET`, 0 | `ECONNRESET`, `EPIPE`; 0, 0 | profile |
 | 37 | peer resets; `SHUT_WR`, `SHUT_RDWR` before reading; read | `ENOTCONN`, `ENOTCONN`; `ECONNRESET` | the same | `SocketUnconnected`; the reset still pending |
 | 38 | peer resets; read, then `SHUT_RDWR` | `ECONNRESET`; `ENOTCONN` | the same | the same |
+| 39 | own `SHUT_WR`, then peer resets (linger 0, no FIN first); send first, twice; reads | `EPIPE`, `EPIPE`; `ECONNRESET`, 0 | `ECONNRESET`, `EPIPE`; 0, 0 | profile (send line 3 before line 4) |
+| 39r | the same; read first, twice; then sends | `ECONNRESET`, 0; `EPIPE`, `EPIPE` | the same | the same |
+| 39u | own `SHUT_WR` after 1 byte the peer never reads; peer closes; as 39 | as 39 | as 39 | as 39 |
+| 39w | own `SHUT_WR`, peer resets; `SHUT_WR`, `SHUT_RDWR`; reads | `ENOTCONN`, `ENOTCONN`; `ECONNRESET`, 0 | the same | the same (shutdown line 2 before line 3) |
+| 40 | `SHUT_RDWR`, nothing unread; peer sends 70000 in one call; reads; peer sends, reads | 0, 0, 0; peer `EPIPE`, `ECONNRESET` | `ECONNRESET`, 0, 0; peer `EPIPE`, 0 | profile; one local reset, never re-armed |
+| 41 | send blocked on a full window, receiver (all unread) does `SHUT_RDWR`; then sends, read; receiver reads | wakes `EPIPE`; `EPIPE`, `EPIPE`; `ECONNRESET`; receiver 0, 0 | stays blocked (the 2 s guard ends it); sends `EAGAIN`; read 0; receiver reads the bytes | profile; under `.macos` the window release (17.7), with the limit of 17.14 |
 
 **Not measured:** a listener closed while a SYN or SYN-ACK is in flight.
 Loopback is too fast to catch it; the sim's rule is 17.6's.
@@ -2144,6 +2281,14 @@ Loopback is too fast to catch it; the sim's rule is 17.6's.
   listener closes.
 - There is no Nagle and no delayed ACK.
 - Credit is paced at one departure per L.
+- There is no send buffer apart from the window: a send admits straight
+  into the window and returns the count. So in row 41 under `.macos` the
+  parked send is woken by the window release, admits and returns a
+  count, and the next send gives `BrokenPipe` once its bytes have drawn
+  the RST. macOS's blocked send itself returned `EPIPE`, because its
+  bytes waited behind a full send buffer. A program that loops until all
+  is written (zio's `writeAll`) sees `BrokenPipe` in both. Not measured
+  through zio's non-blocking path on a kernel.
 - Chunk sizes follow a declared pattern, not an MSS.
 - `shutdown(.receive)` and `SO_ERROR` are refused.
 - A passive closer's port is free at its close (a kernel holds it until
