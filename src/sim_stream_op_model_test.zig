@@ -15,8 +15,10 @@
 //   window per direction and a random chunk mode. A step is one of
 //   `StepKind`: an ev send or receive on a random endpoint, a poll, a
 //   shutdown (.send or .both), a close (plain, or with SO_LINGER {1, 0}), a
-//   window or chunk mode change, a cancel of a parked op, or a new
-//   connection. A receive or a send lives in a slot until its callback.
+//   window or chunk mode change, a cancel of a parked op, a new
+//   connection, or `owed_close`: two reads in one instant (the second's
+//   credit owed) and then both closes, so the wire empties while a credit
+//   is owed. A receive or a send lives in a slot until its callback.
 // - The parent runs seeds 1 to 16 in one child per profile, twice, and
 //   compares each seed's digest line between the two children (same seed,
 //   two processes). Then, per seed, a child with no profile: it must panic
@@ -47,7 +49,11 @@
 //   (`sim.testStreamDir`, conservation included) and the flags and unread
 //   bytes of both endpoints (`sim.testConnEnd`) equal the model's; a
 //   connection is retired exactly when the model says it can be; the
-//   entries in flight (`sim.streamEntriesInFlight`) equal the model's.
+//   entries in flight (`sim.streamEntriesInFlight`) equal the model's; every
+//   field of `sim.streamStats()` equals the model's own count (by
+//   reflection, so a new field is compared from its first run); and on each
+//   open endpoint the layer's `bytesReadable` is its unread bytes and
+//   `getpeername` its peer, or `SocketUnconnected` after a reset.
 // - after every poll: the clock did not pass the model's next landing or
 //   owed credit, nor the poll's cap.
 // - at the end: each op still parked is given what it waits for (a byte
@@ -56,7 +62,10 @@
 //   retires.
 // - counts: how many of each step ran and were skipped (by reason), and of
 //   each outcome; the child fails if a required count is 0 over its seeds
-//   (`floors`), so a run where a kind never happened does not count.
+//   (`floors`), so a run where a kind never happened does not count. A
+//   floor counts its case where the case is decided, not a neighbour of it:
+//   line 3a by the saved send serial, a stale credit at departure apart from
+//   one at landing, a wake by op and by why (a shutdown by its kind).
 //
 // The no-profile shadow. Up to the first point where the kernels differ, a
 // run with no profile does what a profiled run does, except one flag: under
@@ -79,14 +88,16 @@
 // What it does not reach: faults, holding and `failStream` (slice 3); the
 // listener and handshake rules (slice 1's tests); a cancel inside a harvest
 // batch (the bytes tests have it); a window change while a send is woken
-// (refused; a refusal test has it).
+// (refused; a refusal test has it); the TCP entry limit (the bytes tests
+// fill the wire on purpose; the generator keeps far below it).
 //
 // A failure prints `stream model: FAIL seed S step K: ...` and panics; the
 // child prints `stream model: seed S step K` before each step, and the parent
 // prints the last one. `ZIO_STREAM_MODEL_SEED=S` replays one seed,
 // `ZIO_STREAM_MODEL_STEPS=N` sets the length, `ZIO_STREAM_MODEL_PROFILE` is
-// `linux`, `macos` or `none`; any of them skips the floors and the parent's
-// later children.
+// `linux`, `macos` or `none`. Set for the parent, any of them makes a replay
+// (`replay`): the parent passes them on to one child per profile asked for,
+// and runs no floors, second process or no-profile runs.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -108,8 +119,8 @@ const max_conns = 16;
 const max_slots = 2 * 2 * max_live;
 const buf_cap = 6000;
 
-const StepKind = enum { send, recv, poll, settle, shut_send, shut_both, close, abort, window, chunking, cancel, connect };
-const step_weights = [_]u32{ 24, 22, 18, 6, 1, 1, 2, 1, 5, 2, 4, 6 };
+const StepKind = enum { send, recv, poll, settle, shut_send, shut_both, close, abort, window, chunking, cancel, connect, owed_close };
+const step_weights = [_]u32{ 24, 22, 18, 6, 1, 1, 2, 1, 5, 2, 4, 6, 3 };
 
 /// What a model op ends with.
 const Want = union(enum) { n: usize, err: anyerror };
@@ -138,7 +149,11 @@ const Slot = struct {
     siov: [1]os_net.iovec_const = undefined,
 };
 
-const Wake = enum { none, data, fin, rst, local_reset, credit, grow, shutdown, close };
+/// Why a parked op was woken. A shutdown's wake is split by its kind: a
+/// receive is woken by its own `.both` only (row 19: not by `.send`), a send
+/// by either (rows 24 and 16's `.both`).
+const Wake = enum { none, data, fin, rst, local_reset, credit, grow, shut_send, shut_both, close };
+const n_wake = @typeInfo(Wake).@"enum".field_names.len;
 
 const n_discard = @typeInfo(sim.Discard).@"enum".field_names.len;
 
@@ -157,6 +172,9 @@ const MEnd = struct {
     linger0: bool = false,
     /// The serial of the send parked when the reset arrived.
     reset_parked_send: ?u32 = null,
+    /// The local port, from `getsockname` at the connect: the peer's
+    /// `getpeername` answer.
+    port: u16 = 0,
     unread: std.ArrayList(u8) = .empty,
     recv: ?u8 = null,
     send: ?u8 = null,
@@ -213,13 +231,18 @@ const Counts = struct {
     skip_no_parked: u64 = 0,
     skip_conn_limit: u64 = 0,
     skip_fixed_window: u64 = 0,
+    skip_no_owed_shape: u64 = 0,
     send_admitted: u64 = 0,
     send_partial: u64 = 0,
     send_zero: u64 = 0,
     send_parked: u64 = 0,
     send_epipe: u64 = 0,
     send_reset: u64 = 0,
-    send_reset_parked: u64 = 0,
+    /// Line 3a ran: the harvest of the send whose serial the endpoint saved
+    /// when the reset arrived (`reset_parked_send`), with no FIN first and
+    /// after one.
+    line3a_no_fin: u64 = 0,
+    line3a_after_fin: u64 = 0,
     recv_data: u64 = 0,
     recv_eof: u64 = 0,
     recv_reset: u64 = 0,
@@ -227,7 +250,8 @@ const Counts = struct {
     closed_op: u64 = 0,
     cancel_recv: u64 = 0,
     cancel_send: u64 = 0,
-    woken: [@typeInfo(Wake).@"enum".field_names.len]u64 = @splat(0),
+    /// Wakes by op (`OpKind`: receive, send) and by why.
+    woken: [2][n_wake]u64 = @splat(@splat(0)),
     shut_unconnected: u64 = 0,
     close_fin: u64 = 0,
     close_rst: u64 = 0,
@@ -235,7 +259,18 @@ const Counts = struct {
     rst_answers: u64 = 0,
     local_resets: u64 = 0,
     releases: u64 = 0,
-    stale_credits: u64 = 0,
+    /// Credits for a terminal direction: suppressed at their departure, and
+    /// dropped at their landing (design 17.7; `stale_credit` counts both).
+    stale_departed: u64 = 0,
+    stale_landed: u64 = 0,
+    /// `owed_close` steps that ran: both ends closed in the instant a read
+    /// left a credit owed, so the wire can empty while it is still owed.
+    owed_close: u64 = 0,
+    /// `getpeername` and `bytesReadable` (FIONREAD) on every open endpoint
+    /// after every step; `peer_unconnected` is a reset endpoint's answer.
+    peer_checks: u64 = 0,
+    peer_unconnected: u64 = 0,
+    readable_checks: u64 = 0,
     owed_departed: u64 = 0,
     credits_landed: u64 = 0,
     shrink_below_use: u64 = 0,
@@ -251,8 +286,13 @@ const Counts = struct {
         inline for (info.field_names, info.field_types) |name, T| {
             switch (@typeInfo(T)) {
                 .int => @field(a, name) += @field(b, name),
-                .array => for (&@field(a, name), @field(b, name)) |*x, y| {
-                    x.* += y;
+                .array => |arr| switch (@typeInfo(arr.child)) {
+                    .int => for (&@field(a, name), @field(b, name)) |*x, y| {
+                        x.* += y;
+                    },
+                    else => for (&@field(a, name), @field(b, name)) |*row, brow| {
+                        for (row, brow) |*x, y| x.* += y;
+                    },
                 },
                 else => {},
             }
@@ -439,7 +479,7 @@ fn departCredit(ci: u8, data: u1) void {
     const d = &k.dirs[data];
     if (dirTerminal(k, data)) {
         d.owed_at = null;
-        M.c.stale_credits += 1;
+        M.c.stale_departed += 1;
         M.st.stale_credit += 1;
         return;
     }
@@ -618,7 +658,7 @@ fn land(w: MEntry) void {
         },
         .credit => {
             if (dirTerminal(k, at)) {
-                M.c.stale_credits += 1;
+                M.c.stale_landed += 1;
                 M.st.stale_credit += 1;
                 return;
             }
@@ -688,10 +728,12 @@ fn sendEval(ci: u8, side: u1, s: *Slot, bytes: []const u8) ?Want {
         if (e.reset_reported) return .{ .err = error.BrokenPipe };
         if (parked) {
             if (!e.fin_before_reset) {
+                M.c.line3a_no_fin += 1;
                 report(e);
                 return .{ .err = error.ConnectionResetByPeer };
             }
             const p = profilePointNoShadow("row 41, a send parked when a reset arrives after a FIN", false);
+            M.c.line3a_after_fin += 1;
             report(e);
             return .{ .err = if (p == .linux) error.BrokenPipe else error.ConnectionResetByPeer };
         }
@@ -797,8 +839,11 @@ fn connect() bool {
     M.c.conns += 1;
     const k = &M.conns[ci];
     k.* = .{ .used = true, .id = @intCast(M.n_conns) };
-    k.ends[0] = .{ .fd = cfd, .open = true };
-    k.ends[1] = .{ .fd = sfd, .open = true };
+    var ca: os_net.sockaddr.in = undefined;
+    var calen: os_net.socklen_t = @sizeOf(os_net.sockaddr.in);
+    os_net.getsockname(cfd, @ptrCast(&ca), &calen) catch |e| fail("getsockname: {t}", .{e});
+    k.ends[0] = .{ .fd = cfd, .open = true, .port = std.mem.bigToNative(u16, ca.port) };
+    k.ends[1] = .{ .fd = sfd, .open = true, .port = M.port };
     // Windows: tiny, small, medium or the default; the chunk mode by them.
     for (0..2) |side| {
         const w: u32 = switch (rand(4)) {
@@ -875,7 +920,7 @@ fn complete(i: u8) void {
         .cancelled => s.want = .{ .err = error.Canceled },
         .decided => {},
         .woken => {
-            M.c.woken[@backingInt(s.wake)] += 1;
+            M.c.woken[@backingInt(s.kind)][@backingInt(s.wake)] += 1;
             if (!e.open or e.fd != s.fd) {
                 s.want = .{ .err = error.FileDescriptorNotASocket };
                 M.c.closed_op += 1;
@@ -942,7 +987,6 @@ fn countResult(s: *const Slot) void {
                 M.c.send_epipe += 1;
             } else if (err == error.ConnectionResetByPeer) {
                 M.c.send_reset += 1;
-                if (s.state == .woken and s.wake != .none) M.c.send_reset_parked += 1;
             },
         },
     }
@@ -1023,7 +1067,7 @@ fn stepRecv() bool {
     return true;
 }
 
-const SkipWhy = enum { no_endpoint, unresolved, no_parked, fixed_window };
+const SkipWhy = enum { no_endpoint, unresolved, no_parked, fixed_window, no_owed_shape };
 
 fn skip(why: SkipWhy) bool {
     switch (why) {
@@ -1031,6 +1075,7 @@ fn skip(why: SkipWhy) bool {
         .unresolved => M.c.skip_unresolved += 1,
         .no_parked => M.c.skip_no_parked += 1,
         .fixed_window => M.c.skip_fixed_window += 1,
+        .no_owed_shape => M.c.skip_no_owed_shape += 1,
     }
     return false;
 }
@@ -1048,14 +1093,15 @@ fn shutdown(how: os_net.ShutdownHow) bool {
         const shut_rd = how == .both and !e.shut_rd;
         const discards = shut_rd and e.unread.items.len > 0;
         const p: Profile = if (discards) profilePoint("row 17, shutdown(.both) with unread bytes", true) else M.profile;
+        const why: Wake = if (how == .both) .shut_both else .shut_send;
         if (!e.fin_out) {
             e.fin_out = true;
             sendEntry(ci, side, .fin, 0, &.{}, 0);
-            wakeSend(ci, side, .shutdown);
+            wakeSend(ci, side, why);
         }
         if (shut_rd) {
             e.shut_rd = true;
-            wakeRecv(ci, side, .shutdown);
+            wakeRecv(ci, side, why);
             if (discards and p == .macos) {
                 const n = discardUnread(ci, side, .both_discard);
                 k.dirs[other(side)].reclaimed += n;
@@ -1141,6 +1187,46 @@ fn stepChunking() bool {
     const mode = randomChunking(ci) orelse return skip(.fixed_window);
     sim.setStreamChunking(M.conns[ci].ends[side].fd, mode);
     M.conns[ci].chunking = mode;
+    return true;
+}
+
+/// Both ends closed in the instant a read leaves a credit owed (t-4130,
+/// mutant S2-20). A read whose credit leaves now, a second read in the same
+/// instant, whose credit is owed for one L later, then both closes. The
+/// first credit and the closes' FIN or RST land at that later instant too,
+/// so the connection's wire empties while its credit is still owed: the
+/// connection may retire only after the credit departs (stale, as its
+/// sender is dead), never at those landings.
+fn stepOwedClose() bool {
+    var cand: [2 * max_conns]struct { u8, u1 } = undefined;
+    var n: usize = 0;
+    for (&M.conns, 0..) |*k, ci| {
+        if (!k.used or !k.ends[0].open or !k.ends[1].open) continue;
+        for (0..2) |side| {
+            const x: u1 = @intCast(side);
+            const e = &k.ends[x];
+            const d = k.dirs[other(x)];
+            if (e.unread.items.len < 2 or e.recv != null or dirTerminal(k, other(x))) continue;
+            if (d.owed_at != null) continue;
+            if (d.last_credit_at) |lt| {
+                if (now() < lt + L) continue;
+            }
+            cand[n] = .{ @intCast(ci), x };
+            n += 1;
+        }
+    }
+    if (n == 0) return skip(.no_owed_shape);
+    const ci, const x = cand[rand(n)];
+    const k = &M.conns[ci];
+    for (0..2) |_| {
+        submit(.recv, ci, x, 1);
+        pollOnce(0);
+    }
+    const t = now();
+    if (k.dirs[other(x)].owed_at != t + L or k.dirs[other(x)].last_credit_at != t) fail("owed_close on connection {d}: the second read's credit is not owed for {d} ns", .{ k.id, t + L });
+    closeEnd(k, &k.ends[x]);
+    closeEnd(k, &k.ends[other(x)]);
+    M.c.owed_close += 1;
     return true;
 }
 
@@ -1237,6 +1323,7 @@ fn runStep(kind: StepKind) bool {
         .chunking => stepChunking(),
         .cancel => stepCancel(),
         .connect => connect(),
+        .owed_close => stepOwedClose(),
     };
 }
 
@@ -1283,6 +1370,7 @@ fn checkState() void {
             {
                 fail("connection {d} side {d}: sim {any}, model phase {t} fin_in {} fin_out {} rst_sent {} reset_received {} fin_before_reset {} shut_rd {} reset_reported {} unread {d}", .{ k.id, s, got, phase, e.fin_in, e.fin_out, e.rst_sent, e.reset_received, e.fin_before_reset, e.shut_rd, e.reset_reported, e.unread.items.len });
             }
+            if (e.open) checkEndCalls(k, s);
             const d = k.dirs[s];
             const g = sim.testStreamDir(k.id, s == 0) orelse unreachable;
             var fl: u64 = 0;
@@ -1302,6 +1390,27 @@ fn checkState() void {
     const sim_n = sim.streamEntriesInFlight();
     if (sim_n != in_flight) fail("TCP entries in flight: sim {d}, model {d}", .{ sim_n, in_flight });
     checkStats();
+}
+
+/// The layer's `bytesReadable` (FIONREAD) and `getpeername` on an open
+/// endpoint: its unread bytes, and its peer until a reset was received,
+/// then `SocketUnconnected` (design 17.4, row 9).
+fn checkEndCalls(k: *const MConn, s: u1) void {
+    const e = &k.ends[s];
+    const n = os_net.bytesReadable(e.fd) catch |err| fail("bytesReadable on connection {d} side {d}: {t}", .{ k.id, s, err });
+    if (n != e.unread.items.len) fail("bytesReadable on connection {d} side {d}: sim {d}, model {d}", .{ k.id, s, n, e.unread.items.len });
+    M.c.readable_checks += 1;
+    var sa: os_net.sockaddr.in = undefined;
+    var len: os_net.socklen_t = @sizeOf(os_net.sockaddr.in);
+    if (os_net.getpeername(e.fd, @ptrCast(&sa), &len)) |_| {
+        if (e.reset_received) fail("getpeername on connection {d} side {d}: a peer, after a reset (want SocketUnconnected)", .{ k.id, s });
+        const ip: [4]u8 = @bitCast(sa.addr);
+        if (!std.mem.eql(u8, &ip, &.{ 127, 0, 0, 1 }) or std.mem.bigToNative(u16, sa.port) != k.ends[other(s)].port) fail("getpeername on connection {d} side {d}: {any}:{d}, want 127.0.0.1:{d}", .{ k.id, s, ip, std.mem.bigToNative(u16, sa.port), k.ends[other(s)].port });
+    } else |err| {
+        if (!e.reset_received or err != error.SocketUnconnected) fail("getpeername on connection {d} side {d}: {t} (reset received: {})", .{ k.id, s, err, e.reset_received });
+        M.c.peer_unconnected += 1;
+    }
+    M.c.peer_checks += 1;
 }
 
 /// Every field of `sim.streamStats()` against the model's count, by
@@ -1488,13 +1597,13 @@ fn printCounts(c: Counts, profile: Profile, seeds: usize, steps: usize) void {
     inline for (@typeInfo(StepKind).@"enum".field_names, 0..) |name, i| {
         std.debug.print("  step {s}: ran {d}, skipped {d}\n", .{ name, c.ran[i], c.skipped[i] });
     }
-    std.debug.print("  skips: no endpoint {d}, op unresolved {d}, no parked op {d}, connection limit {d}, .fixed with a large window {d}\n", .{ c.skip_no_endpoint, c.skip_unresolved, c.skip_no_parked, c.skip_conn_limit, c.skip_fixed_window });
+    std.debug.print("  skips: no endpoint {d}, op unresolved {d}, no parked op {d}, connection limit {d}, .fixed with a large window {d}, no owed_close shape {d}\n", .{ c.skip_no_endpoint, c.skip_unresolved, c.skip_no_parked, c.skip_conn_limit, c.skip_fixed_window, c.skip_no_owed_shape });
     const info = @typeInfo(Counts).@"struct";
     inline for (info.field_names, info.field_types) |name, T| {
         if (comptime T == u64 and !std.mem.startsWith(u8, name, "skip_")) std.debug.print("  {s}: {d}\n", .{ name, @field(c, name) });
     }
     inline for (@typeInfo(Wake).@"enum".field_names, 0..) |name, i| {
-        if (i != 0) std.debug.print("  woken by {s}: {d}\n", .{ name, c.woken[i] });
+        if (i != 0) std.debug.print("  woken by {s}: receive {d}, send {d}\n", .{ name, c.woken[0][i], c.woken[1][i] });
     }
     std.debug.print("  sends by chunk mode: hashed {d}, fixed {d}, off {d}\n", .{ c.chunks[0], c.chunks[1], c.chunks[2] });
 }
@@ -1503,10 +1612,12 @@ fn printCounts(c: Counts, profile: Profile, seeds: usize, steps: usize) void {
 /// is 0 did not test what it claims.
 fn floors(c: Counts, profile: Profile) void {
     const req = .{
-        "send_admitted",    "send_partial",     "send_zero",    "send_parked", "send_epipe",  "send_reset",    "send_reset_parked",
-        "recv_data",        "recv_eof",         "recv_reset",   "recv_parked", "closed_op",   "cancel_recv",   "cancel_send",
-        "shut_unconnected", "close_fin",        "close_rst",    "close_quiet", "rst_answers", "stale_credits", "owed_departed",
-        "credits_landed",   "shrink_below_use", "shared_reset", "batches",     "end_proofs",
+        "send_admitted",    "send_partial",     "send_zero",     "send_parked",      "send_epipe",       "send_reset",
+        "recv_data",        "recv_eof",         "recv_reset",    "recv_parked",      "closed_op",        "cancel_recv",
+        "cancel_send",      "shut_unconnected", "close_fin",     "close_rst",        "close_quiet",      "rst_answers",
+        "stale_departed",   "stale_landed",     "owed_departed", "credits_landed",   "shrink_below_use", "shared_reset",
+        "batches",          "end_proofs",       "line3a_no_fin", "line3a_after_fin", "owed_close",       "peer_checks",
+        "peer_unconnected", "readable_checks",
     };
     inline for (req) |name| {
         if (@field(c, name) == 0) fail("count {s} is 0 over the seeds of profile {t}: the run did not test it", .{ name, profile });
@@ -1514,11 +1625,19 @@ fn floors(c: Counts, profile: Profile) void {
     inline for (@typeInfo(StepKind).@"enum".field_names, 0..) |name, i| {
         if (c.ran[i] == 0) fail("step {s} never ran under profile {t}", .{ name, profile });
     }
-    inline for (@typeInfo(Wake).@"enum".field_names, 0..) |name, i| {
-        // A local reset wakes nothing: after its own .both an endpoint's
-        // receive gives 0 at once and its send BrokenPipe, so neither parks.
-        const needed = i != 0 and !std.mem.eql(u8, name, "local_reset");
-        if (needed and c.woken[i] == 0) fail("no op was woken by {s} under profile {t}", .{ name, profile });
+    // Each wake an op can have, by op (design 17.8, what wakes a parked
+    // op). Not needed: a local reset wakes nothing (after its own .both an
+    // endpoint's receive gives 0 at once and its send BrokenPipe, so neither
+    // parks); a receive is never woken by data's room (credit, grow) or by
+    // `.send` (row 19), and a send never by data or a FIN (row 5).
+    const need = [2][]const Wake{
+        &.{ .data, .fin, .rst, .shut_both, .close },
+        &.{ .rst, .credit, .grow, .shut_send, .shut_both, .close },
+    };
+    for (need, 0..) |list, op| {
+        for (list) |w| {
+            if (c.woken[op][@backingInt(w)] == 0) fail("no {s} was woken by {t} under profile {t}", .{ if (op == 0) "receive" else "send", w, profile });
+        }
     }
     for (c.chunks, 0..) |v, i| {
         if (v == 0) fail("no send in chunk mode {d} under profile {t}", .{ i, profile });
@@ -1575,9 +1694,32 @@ fn runChild(gpa: std.mem.Allocator, profile: []const u8, seed: ?u64) !Child {
     return .{ .term = res.term, .stderr = res.stderr };
 }
 
+/// A replay, a diagnostic: one child per profile asked for (`linux` and
+/// `macos` when none is), with the seed and the length asked for, its own
+/// output printed whole. A profiled child must pass; a child with no
+/// profile is only printed, as its panic is the point. No floors (a child
+/// given a seed or a length skips them), no second process, no no-profile
+/// runs.
+fn replay(gpa: std.mem.Allocator, o_profile: ?[*:0]const u8, o_seed: ?u64) !void {
+    const both = [_][]const u8{ "linux", "macos" };
+    const one = [_][]const u8{if (o_profile) |v| std.mem.span(v) else ""};
+    const list: []const []const u8 = if (o_profile != null) &one else &both;
+    for (list) |p| {
+        if (std.meta.stringToEnum(Profile, p) == null) @panic("stream model: ZIO_STREAM_MODEL_PROFILE is linux, macos or none");
+        const r = try runChild(gpa, p, o_seed);
+        defer gpa.free(r.stderr);
+        printChild(r.stderr);
+        std.debug.print("stream model replay: profile {s}, seed {?d}: term {any}; the last step it started: {s}\n", .{ p, o_seed, r.term, lastProgress(r.stderr) });
+        if (std.mem.eql(u8, p, "none")) continue;
+        if (!r.term.success()) return error.StreamModelFailed;
+        try sim.checkDoneMarkers(child_name, r.stderr);
+    }
+}
+
 /// The lines of `stderr` that start with `prefix`, joined.
 fn linesWith(gpa: std.mem.Allocator, stderr: []const u8, prefix: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
     var it = std.mem.splitScalar(u8, stderr, '\n');
     while (it.next()) |line| {
         if (std.mem.indexOf(u8, line, prefix)) |at| {
@@ -1610,6 +1752,11 @@ test "sim: stream op model: connections under random sends, receives, shutdowns,
     if (comptime !sim.compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
     if (sim.isDeathChild()) return;
     const gpa = std.testing.allocator;
+    // A replay: the parent passes the overrides to its children itself (a
+    // child's environment is built here, not inherited).
+    const o_profile = std.c.getenv("ZIO_STREAM_MODEL_PROFILE");
+    const o_seed = envU64("ZIO_STREAM_MODEL_SEED");
+    if (o_profile != null or o_seed != null or std.c.getenv("ZIO_STREAM_MODEL_STEPS") != null) return replay(gpa, o_profile, o_seed);
     var np: [2][]u8 = undefined;
     var np_n: usize = 0;
     defer for (np[0..np_n]) |x| gpa.free(x);
@@ -1640,7 +1787,6 @@ test "sim: stream op model: connections under random sends, receives, shutdowns,
         }
         std.debug.print("stream model: profile {s}: two processes give the same {d} digest lines\n", .{ p, std.mem.count(u8, digests[0], "\n") });
     }
-    if (std.c.getenv("ZIO_STREAM_MODEL_SEED") != null or std.c.getenv("ZIO_STREAM_MODEL_STEPS") != null) return;
     // The no-profile shadow: both profiles predict the same point per seed.
     if (!std.mem.eql(u8, np[0], np[1])) {
         std.debug.print("the no-profile shadows differ:\n.linux:\n{s}\n.macos:\n{s}\n", .{ np[0], np[1] });

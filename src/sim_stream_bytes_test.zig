@@ -414,7 +414,9 @@ const prow = struct {
 
     fn connected() !struct { zio_net.Server, zio_net.Stream, zio_net.Stream } {
         const l = try t1.listen(lo, 0, .{});
+        errdefer l.close();
         const c = try t1.connect(lo, t1.portOf(l), .none);
+        errdefer c.close();
         const s = try l.accept(.{});
         return .{ l, c, s };
     }
@@ -442,6 +444,11 @@ const prow = struct {
 
     pub var big: [32 << 20]u8 = undefined;
 
+    /// An op in a spawned task. Its task borrows the `Blocked` on the
+    /// caller's stack, so every spawn is followed by `defer h.cancel()`
+    /// (a no-op after `join`): a row that returns early by an error still
+    /// joins the task before the `Blocked` and its socket go away (outside
+    /// review of slice 2's follow-up, P2).
     const Blocked = struct {
         x: zio_net.Stream,
         is_send: bool,
@@ -516,6 +523,7 @@ const prow = struct {
         defer s.close();
         var b: Blocked = .{ .x = s, .is_send = false };
         var h = try rt_mod.spawn(Blocked.run, .{&b});
+        defer h.cancel();
         try rt_mod.sleep(.fromMilliseconds(200));
         t.ok(s.shutdown(.both));
         h.join();
@@ -563,6 +571,7 @@ const prow = struct {
         defer s.close();
         var b: Blocked = .{ .x = s, .is_send = false };
         var h = try rt_mod.spawn(Blocked.run, .{&b});
+        defer h.cancel();
         try rt_mod.sleep(.fromMilliseconds(200));
         t.ok(s.shutdown(.send));
         try rt_mod.sleep(.fromMilliseconds(300));
@@ -616,6 +625,7 @@ const prow = struct {
     fn blockedSend(t: *Tok, c: zio_net.Stream, timeout: @import("time.zig").Timeout, wait_ms: u64, comptime event: fn () anyerror!void) !void {
         var b: Blocked = .{ .x = c, .is_send = true, .timeout = timeout };
         var h = try rt_mod.spawn(Blocked.run, .{&b});
+        defer h.cancel();
         try rt_mod.sleep(.fromMilliseconds(wait_ms));
         t.put(if (b.done) "NOT-BLOCKED" else "blocked");
         try event();
@@ -625,8 +635,8 @@ const prow = struct {
     var ev_c: zio_net.Stream = undefined;
     var ev_s: zio_net.Stream = undefined;
     fn peerResets() !void {
+        defer ev_s.close();
         try linger0(ev_s);
-        ev_s.close();
     }
     fn ownShutWr() !void {
         try ev_c.shutdown(.send);
@@ -866,12 +876,16 @@ const prow = struct {
         const l, const c, const s = try connected();
         defer l.close();
         defer c.close();
+        var s_open = true;
+        defer if (s_open) s.close();
         var b: Blocked = .{ .x = c, .is_send = false };
         var h = try rt_mod.spawn(Blocked.run, .{&b});
+        defer h.cancel();
         try rt_mod.sleep(.fromMilliseconds(200));
         t.put(if (b.done) "NOT-BLOCKED" else "blocked");
         try linger0(s);
         s.close();
+        s_open = false;
         h.join();
         t.n(b.result);
         rd(t, c);
@@ -886,15 +900,20 @@ const prow = struct {
         const l, const c, const s = try connected();
         defer l.close();
         defer c.close();
+        var s_open = true;
+        defer if (s_open) s.close();
         var bs: Blocked = .{ .x = c, .is_send = true, .timeout = .fromSeconds(5) };
         var br: Blocked = .{ .x = c, .is_send = false, .timeout = .fromSeconds(5) };
         var hs = try rt_mod.spawn(Blocked.run, .{&bs});
+        defer hs.cancel();
         var hr = try rt_mod.spawn(Blocked.run, .{&br});
+        defer hr.cancel();
         try rt_mod.sleep(.fromMilliseconds(200));
         t.put(if (bs.done) "NOT-BLOCKED" else "blocked");
         t.put(if (br.done) "NOT-BLOCKED" else "blocked");
         try linger0(s);
         s.close();
+        s_open = false;
         hs.join();
         hr.join();
         const send_first = if (bs.result) |_| false else |e| e == error.ConnectionResetByPeer;
@@ -918,6 +937,7 @@ const prow = struct {
         defer s.close();
         var b: Blocked = .{ .x = c, .is_send = false };
         var h = try rt_mod.spawn(Blocked.run, .{&b});
+        defer h.cancel();
         try rt_mod.sleep(.fromMilliseconds(200));
         t.put(if (b.done) "NOT-BLOCKED" else "blocked");
         t.ok(s.shutdown(.send));
