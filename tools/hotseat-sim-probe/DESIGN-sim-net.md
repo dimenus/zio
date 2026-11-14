@@ -976,12 +976,18 @@ the mutants in its commits.
   holes; flows sharing a landing instant are still kept out of it).
 - Open and filed: t-4096 (zero-length receive on an empty sim pipe), t-4098
   (the op model's holes above).
-- **Next: the stream track (section 17).** Revision 1 was 6e854fc,
-  revision 2 2d987f7 (with slice 0), revision 3 sitting 25 (the second
-  outside review, `gpt-simnet10.md`, and the profile ruling). None pushed
-  past 6e854fc until the grader says; the upstream merge (fabfbf1 on
-  `dimenus/hotseat/upstream-sync`) is taken by merge when the grader says.
-  Next: the grader's and an outside review of revision 3, then slice 1.
+- **Next: the stream track (section 17).**
+  - Revisions: 1 was 6e854fc; 2 was 2d987f7, with slice 0; 3 was 4e6459f.
+    Revision 3 answers the second outside review (`gpt-simnet10.md`) and
+    the profile ruling.
+  - The grader accepted 17.17's three points and the three open
+    questions of report 25 as recommended.
+  - The upstream sync (fabfbf1) is merged by 1070586. Only design text
+    sits on top of fabfbf1's code.
+  - **Slice 1 starts from this head, with a fresh seat, after the third
+    outside read of revision 3.**
+  - Also open for the sim seat: t-4096 (refuse a zero-room receive,
+    decided yes) and t-4106 (the spawn windows).
 - **For hotseat, not zio:** ENet's receive returns 0 for an empty datagram,
   the same as would-block, so ENet's receive loop stops there for that
   service call. Later datagrams wait for the next call.
