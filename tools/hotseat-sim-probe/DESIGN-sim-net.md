@@ -437,33 +437,34 @@ The scripts the gates below use are beside them, in `zio-sim6-tools/` there
   fds; every ev op on a datagram socket goes through the same layer calls, and
   parks on the socket where a backend would wait; a real fd in a sim op
   refuses.
+- **Options and limits (ec6ec37):** three option classes
+  (`dgramSetOption`'s doc comment); `SO_RCVBUF` re-provisions the queue; the
+  sim's allocator can fail in a test (`testSetNetAllocator`).
 
 ### Next (phase 1, in this order)
 
-1. **Limits and options (section 6, 8).** `setsockopt`/`getsockopt` on a sim
-   fd refuse today. Build the three option classes; `SO_RCVBUF`
-   re-provisions the queue (`error.SystemResources` on failure, the old limit
-   kept); test the packet limit isolated from the byte budget, growth after
-   open, and one socket's overflow not touching another's. zio's error for an
-   unsupported option is the existing `OptionNotSupported`, not the
-   `OptionUnsupported` the design names. Per-flow order is already done.
-2. **Trace and `wireDigest` (section 7).** `dgram` trace events, digest
+1. **Trace and `wireDigest` (section 7).** `dgram` trace events, digest
    entries only when a run used a datagram socket (so old digests keep), the
    one-byte sensitivity case, two fresh processes with the same transcript.
-3. **The native-exit refusals (section 3),** with the script that lists every
+2. **The native-exit refusals (section 3),** with the script that lists every
    fd-taking function in `src/os/` and a verdict per caller. Known gap: the
    layer's `close` on a sim **pipe** fd still reaches the kernel (EBADF is
    `unreachable` there).
-4. **The C-bridge tests in both builds, and the seven acceptance groups.**
+3. **The C-bridge tests in both builds, and the seven acceptance groups.**
 
-### An open design point (needs a decision before group 7)
+### Open design points (each needs a decision)
 
-A send from a source address the socket cannot use: the sim answers
-`AddressUnavailable` (section 3.1). Measured: macOS answers EADDRNOTAVAIL too;
-**Linux 6.8 answers ENETUNREACH** for an address the host does not have, and
-**sends from any local address**, even one the socket is not bound to. Group 7
-(the same bridge, the same return values, in both builds) cannot hold on Linux
-as the design stands. See report 6.
+- **Two departures in ec6ec37:** re-provisioning out of memory refuses (the
+  design says `SystemResources`, which `SetsockoptError` lacks), and reading
+  an unsupported option refuses (`GetsockoptError` has only `Unexpected`).
+  Widening either error set would change a build without sim. Report 7.
+- **A bad source address (before group 7):** for a send from a source
+  address the socket cannot use, the sim answers `AddressUnavailable`
+  (section 3.1). Measured: macOS answers EADDRNOTAVAIL too; **Linux 6.8
+  answers ENETUNREACH** for an address the host does not have, and **sends
+  from any local address**, even one the socket is not bound to. Group 7 (the
+  same bridge, the same return values, in both builds) cannot hold on Linux as
+  the design stands. Report 6.
 
 ### How to run things
 
