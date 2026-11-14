@@ -1042,17 +1042,46 @@ the mutants in its commits.
       it depends on a gap smaller than one segment in the window; the sim
       has no such gap, and row 41g is a fidelity limit (17.14).
     - **The stream op model** (17.15 item 2, without faults): below.
+  - **Slice 2 was accepted by the grader at 982fe5b** (its recompute agreed
+    with report 30). hotseat moves its pin there, so every pushed commit
+    may be pinned: keep each one green.
+  - **Sitting 31, in short** (report 31 has the gates and the mutant
+    lists, `zio-sim31/` beside it).
+    - The grader's two survivors (f1d1b89). `chunks_landed += 2`: the op
+      model now keeps its own `StreamStats` and compares every field of
+      `sim.streamStats()` after every step, by reflection, so a new field
+      is compared from its first run. `creditPlan`'s `.stale` changes only
+      `.both`'s wire reservation (`departCredit` decides stale again by
+      itself), so its one observable effect is a false limit panic; a
+      bytes test makes that state (a wire one short of the limit).
+    - The outside review of the op model (`gpt-simnet14.md`; 44580d4):
+      stale credits counted at departure and at landing apart; wakes by
+      op and by why, a shutdown by its kind; line 3a counted by the saved
+      send serial; each new floor shown to fail by a mutant of its count;
+      the parity rows' spawns join on every path; the parent passes replay
+      overrides on; `linesWith`'s leak. t-4130: a new step `owed_close`
+      and `getpeername`/`bytesReadable` checks kill S2-20 to S2-22; the
+      entry limit and the woken-send window change stay with their own
+      tests (closed).
+    - t-4096 (75bb57e): a receive of 0 bytes on a sim pipe is refused, as
+      on a stream socket. One pipe test changed: its 0-room half is a
+      death test now (the commit says why).
   - **Next, in this order:**
-    1. The grader's acceptance of slice 2.
-    2. Slice 3 (17.16): `.tcp` rules with holding, `failStream`, the
+    1. Slice 3 (17.16): `.tcp` rules with holding, `failStream`, the
        connect with no answer; the op model then gains faults (17.15 item
-       2's required cases that need them).
+       2's required cases that need them). Its surface rows are the four
+       `.pending = 3` rows (`synack_failed_client`, `tcp_rules`,
+       `fail_stream`, `connect_no_answer`); the fifth pending row is slice
+       4's. Not started in sitting 31. Note for the next seat: sitting
+       31's brief called slice 3 "options and addresses"; 17.16 says the
+       above, and the options and addresses were slice 1's. Ask the
+       grader which is meant before building.
   - **Open, filed:** t-4126 (macOS row 41g's answer varied in 1 run of 3),
     t-4127 (what stays open after the ruling: whether zio's readiness
     backends' `SO_ERROR` read is a defect, the parked cells no row
-    measures, the gap as a fidelity limit). Queued for the sim seat, not
-    started: t-4096 (refuse a zero-room receive, decided yes), t-4106,
-    t-4115, t-4117.
+    measures, the gap as a fidelity limit), t-4132 (the stream tests'
+    other spawn sites, error paths only). Queued for the sim seat, not
+    started: t-4106, t-4115, t-4117. Closed in sitting 31: t-4096, t-4130.
   - **What I would change, with what I know now:**
     - The parity table prints every row's answer now; a row that passes
       silently was how a measured difference could hide.
@@ -1128,11 +1157,14 @@ the mutants in its commits.
   The parent runs seeds 1 to 16 in a child per profile, twice (the digest
   lines must be equal), then one child per seed with no profile, which
   must panic where the profiled runs' shadow predicted. Its header
-  comment says what it generates and checks. To see a child's counts:
-  the test binary with `ZIO_SIM_DEATH_CHILD=1`,
-  `ZIO_STREAM_MODEL_PROFILE=linux|macos|none` and `TEST_FILTER` set to
-  the child's name; `ZIO_STREAM_MODEL_SEED=S` replays one seed and
-  `ZIO_STREAM_MODEL_STEPS=N` sets the length (either skips the floors).
+  comment says what it generates and checks. A replay: set
+  `ZIO_STREAM_MODEL_SEED=S`, `ZIO_STREAM_MODEL_STEPS=N` or
+  `ZIO_STREAM_MODEL_PROFILE=linux|macos|none` for `zig build test`; the
+  parent passes them to one child per profile and prints its output (no
+  floors, no second process, no no-profile runs). To see a child's
+  counts: the test binary with `ZIO_SIM_DEATH_CHILD=1`,
+  `ZIO_STREAM_MODEL_PROFILE=...` and `TEST_FILTER` set to the child's
+  name.
 - **The surface table needs the filter `sim: stream`:** its refusal rows
   run other tests in child processes, and a build filtered to the table
   alone does not contain them. To run the table by itself, build with
@@ -1324,6 +1356,11 @@ the mutants in its commits.
 - **The structural test accepts `sim.isSimFd(fd)`, or `sim.isDgramFd(fd)`
   with the refusal,** as a sim branch, not `sim.isStreamFd(fd)` alone. A
   new layer function with a stream branch also needs a datagram branch.
+- **A floor must count its case where the case is decided,** not an
+  outcome that a neighbour case also gives. Three floors of the stream op
+  model did (sitting 31: stale credits, shutdown wakes, line 3a). To show
+  a floor is live, zero its counting line and watch the child fail with
+  its name.
 - **A count written before it is counted is a guess.** 7c72c39's message
   gives `src/sim.zig` +57/-6 and the test file +178/-42; `git diff
   --numstat` gives +55/-8 and +169/-51. Run the command, then write the
