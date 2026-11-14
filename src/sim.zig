@@ -554,6 +554,14 @@ fn digestNet(h: *std.hash.Wyhash) void {
         std.mem.writeInt(u16, e[21..23], @intCast(s.stats.dropped_rcvbuf & 0xffff), .little);
         e[23] = @truncate(s.stats.sent);
         h.update(&e);
+        // Which op waits here, and for what: a datagram to this socket
+        // completes it, so two runs with the ops swapped differ.
+        var pk: [5]u8 = @splat(0);
+        if (s.parked) |p| {
+            std.mem.writeInt(u32, pk[0..4], p.id, .little);
+            pk[4] = @backingInt(p.wait);
+        }
+        h.update(&pk);
     }
 }
 
@@ -1189,7 +1197,7 @@ const Dgram = struct {
     stats: DatagramStats = .{},
     /// An ev op waiting for a datagram (a receive, or a poll for reading):
     /// a landing or a close makes it due now.
-    parked: ?Parked = null,
+    parked: ?DgramParked = null,
 };
 
 const WireDatagram = struct {
@@ -1533,10 +1541,20 @@ pub fn dgramOpDone(c: *anyopaque, id: u32) void {
     pushDueAt(c, .dgram, id, clock_ns);
 }
 
-pub fn dgramPark(fd: i32, c: *anyopaque, id: u32) void {
+/// What waits on a datagram socket: a receive takes the datagram, a poll
+/// only learns it is there. Both are in the state digest.
+pub const DgramWait = enum(u8) { recv = 1, poll = 2 };
+
+const DgramParked = struct {
+    c: *anyopaque,
+    id: u32,
+    wait: DgramWait,
+};
+
+pub fn dgramPark(fd: i32, c: *anyopaque, id: u32, wait: DgramWait) void {
     const d = dgramSlot("an ev receive or poll", fd);
     if (d.parked != null) panic("sim: two ev ops parked on sim datagram socket {d}", .{fd});
-    d.parked = .{ .c = c, .id = id };
+    d.parked = .{ .c = c, .id = id, .wait = wait };
 }
 
 pub fn dgramIsOpen(fd: i32) bool {
@@ -5850,6 +5868,69 @@ const dg_inflight = struct {
         return .{ .state = state, .wire = wire_d, .trace = trace };
     }
 };
+
+/// Round 2 of the outside review, F4: two receivers, an op parked on each.
+/// The variants swap which op parks on which socket, or make the first op a
+/// poll instead of a receive. The live-id list and each socket's "parked"
+/// bit are the same in all of them.
+const dg_parked_digest = struct {
+    const Variant = enum { base, swapped, first_is_poll };
+    var variant: Variant = .base;
+    var fds: [2]i32 = undefined;
+    var state: u64 = 0;
+
+    fn first() void {
+        const fd = if (variant == .swapped) fds[1] else fds[0];
+        if (variant == .first_is_poll) {
+            dg.evPoll(fd, .recv) catch {};
+        } else {
+            var buf: [4]u8 = undefined;
+            _ = dg.evRecvFrom(fd, &buf) catch {};
+        }
+    }
+
+    fn second() void {
+        const fd = if (variant == .swapped) fds[0] else fds[1];
+        var buf: [4]u8 = undefined;
+        _ = dg.evRecvFrom(fd, &buf) catch {};
+    }
+
+    fn body() !void {
+        for (&fds, 0..) |*fd, i| {
+            fd.* = try dg.open();
+            try dg.bindTo(fd.*, dg.addr(127, 0, 0, 1, @intCast(7000 + i)));
+        }
+        var a = try dg.runtime.spawn(first, .{});
+        var b = try dg.runtime.spawn(second, .{});
+        try dg.rt_mod.sleep(.fromMilliseconds(1));
+        state = stateDigest();
+        for (fds) |fd| dg.os_net.close(fd);
+        a.join();
+        b.join();
+    }
+
+    fn run(v: Variant) !u64 {
+        variant = v;
+        try dg.run(2, body);
+        return state;
+    }
+};
+
+test "sim: dgram trace: the state digest sees which op is parked on which socket, and its kind" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    const T = dg_parked_digest;
+    const base = try T.run(.base);
+    try std.testing.expectEqual(base, try T.run(.base));
+    var blind: usize = 0;
+    for ([_]T.Variant{ .swapped, .first_is_poll }) |v| {
+        const d = try T.run(v);
+        if (d == base) {
+            std.debug.print("variant {t}: state digest {x:0>16}, the same as the base run's\n", .{ v, d });
+            blind += 1;
+        }
+    }
+    if (blind != 0) return error.StateDigestBlind;
+}
 
 test "sim: dgram trace: the state digest sees where a datagram still on the wire goes and where it came from" {
     if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;

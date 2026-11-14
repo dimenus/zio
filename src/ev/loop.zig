@@ -1830,6 +1830,12 @@ pub const Loop = struct {
         }
     }
 
+    /// Sim: what a parked datagram op waits for: only a receive or a poll
+    /// for reading ever parks (`tryDgramOp`).
+    fn simDgramWait(c: *const Completion) sim.DgramWait {
+        return if (c.op == .net_poll) .poll else .recv;
+    }
+
     /// Sim: a sim pipe models only a send with the default flags and a
     /// receive's `dontwait`. Every other flag that differs from its default
     /// refuses, by name; the list comes from the type, so a flag added later
@@ -1864,7 +1870,7 @@ pub const Loop = struct {
         if (tryDgramOp(c)) {
             sim.dgramOpDone(c, id);
         } else {
-            sim.dgramPark(simOpHandle(c).?, c, id);
+            sim.dgramPark(simOpHandle(c).?, c, id, simDgramWait(c));
         }
     }
 
@@ -1958,7 +1964,7 @@ pub const Loop = struct {
                 if (buf[i].closed or !sim.dgramIsOpen(h)) {
                     c.setError(error.FileDescriptorNotASocket);
                 } else if (!tryDgramOp(c)) {
-                    sim.dgramPark(h, c, buf[i].id);
+                    sim.dgramPark(h, c, buf[i].id, simDgramWait(c));
                     continue;
                 }
             }
