@@ -170,7 +170,7 @@ const handshake = struct {
 };
 
 test "sim: stream: connect completes when the SYN-ACK lands (2L) and accept when the ACK lands (3L), with ports, peer address and NODELAY" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     try run(1, null, handshake.body);
 }
 
@@ -191,7 +191,7 @@ const both_close = struct {
 };
 
 test "sim: stream: both ends closed at one instant are both active closers, and both FINs land at dead endpoints" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     try run(1, null, both_close.body);
 }
 
@@ -215,7 +215,7 @@ const refused = struct {
 };
 
 test "sim: stream: a connect to a port with no listener is ConnectionRefused at 2L, and the connection retires with its server endpoint absent" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     try run(1, null, refused.body);
 }
 
@@ -237,7 +237,7 @@ const cancel_before_syn = struct {
 };
 
 test "sim: stream: a connect cancelled before its SYN lands: the SYN is dropped at landing, no server state, and the connection retires" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     try run(1, null, cancel_before_syn.body);
 }
 
@@ -272,7 +272,7 @@ const cancel_after_syn = struct {
 };
 
 test "sim: stream: a connect cancelled after its SYN lands: the SYN-ACK is answered with an RST that kills the provisional endpoint and frees its listener's place" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     try run(1, null, cancel_after_syn.body);
 }
 
@@ -297,7 +297,7 @@ const accepted_after_close = struct {
 };
 
 test "sim: stream: a client that closes before accept leaves a queued connection that accept returns with its FIN landed" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     try run(1, null, accepted_after_close.body);
 }
 
@@ -372,7 +372,7 @@ const listener_close = struct {
 };
 
 test "sim: stream: closing a listener resets its queued and provisional connections, leaves an accepted one alone, and an RST to a dead client is dropped" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     try run(1, null, listener_close.body);
 }
 
@@ -398,7 +398,7 @@ const close_wakes_accept = struct {
 };
 
 test "sim: stream: closing a listener ends an accept parked on it FileDescriptorNotASocket" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     try run(1, null, close_wakes_accept.body);
 }
 
@@ -440,7 +440,7 @@ const equal_time = struct {
 };
 
 test "sim: stream: two connects at one instant are queued in submission order, in both creation orders" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     for ([_]bool{ false, true }) |sw| {
         equal_time.swap = sw;
         try run(1, null, equal_time.body);
@@ -548,7 +548,7 @@ const woken_cancel = struct {
 };
 
 test "sim: stream: an accept or a connect woken and cancelled inside the harvest batch: the accept claimed nothing, the connect still established" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     woken_cancel.seen = .{ 0, 0 };
     for (1..17) |s| try run(s, null, woken_cancel.body);
     // Both batch orders happened.
@@ -632,7 +632,7 @@ const batch_reopen = struct {
 };
 
 test "sim: stream: a woken accept whose listener a callback earlier in the batch closes and reopens ends FileDescriptorNotASocket" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     batch_reopen.seen = .{ 0, 0 };
     for (1..17) |s| try run(s, null, batch_reopen.body);
     try expect(batch_reopen.seen[0] > 0 and batch_reopen.seen[1] > 0);
@@ -704,12 +704,12 @@ const port_reuse = struct {
 };
 
 test "sim: stream: a fd number reused while the old connection's SYN-ACK is on the wire: it lands at the old connection, not the new socket" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     try run(1, null, fd_reuse.body);
 }
 
 test "sim: stream: a listener port bound again while the old connection's entries are on the wire: they land at the old connection, not the new listener" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     try run(1, null, port_reuse.body);
 }
 
@@ -733,7 +733,7 @@ const other_loopback = struct {
 };
 
 test "sim: stream: under .linux a connect to 127.0.0.2 reaches a 0.0.0.0 listener from 127.0.0.1 (rows 15 and 30)" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     try run(1, .linux, other_loopback.body);
 }
 
@@ -764,7 +764,7 @@ const options = struct {
 };
 
 test "sim: stream: TCP_NODELAY 1 is stored and read back, 0 and SO_REUSEPORT are OptionNotSupported, SO_REUSEADDR is accepted" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     try run(1, null, options.body);
 }
 
@@ -807,7 +807,7 @@ const std_io = struct {
 };
 
 test "sim: stream: std.Io's listen with reuse_address, connect and accept on zio's vtable, end to end" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     try run(1, null, std_io.body);
 }
 
@@ -823,7 +823,7 @@ const digests = struct {
 };
 
 test "sim: stream: one seed gives one trace, wire digest and state digest; another profile changes only the state digest" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     try run(3, null, digests.body);
     const a = digests.out;
     try run(3, null, digests.body);
@@ -837,7 +837,7 @@ test "sim: stream: one seed gives one trace, wire digest and state digest; anoth
 // ---- Refusals ----
 
 fn refusal(comptime name: []const u8, comptime want: []const u8, comptime profile: ?sim.StreamProfile, comptime body: fn () anyerror!void) !void {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     if (!sim.isDeathChild()) return sim.expectChildPanics(name, want);
     sim.noCoreDump();
     try run(1, profile, body);
@@ -1184,7 +1184,7 @@ const parity = struct {
 const host_kernel: Kernel = if (builtin.os.tag.isDarwin()) .macos else .linux;
 
 test "sim: stream parity: rows 2, 12, 14, 31 and 32 through zio.net, on this host's kernel without sim, in a sim run with its profile with sim" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     if (comptime sim.compiled_in) return parity.inSim(host_kernel);
     const rt = try rt_mod.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
@@ -1194,7 +1194,7 @@ test "sim: stream parity: rows 2, 12, 14, 31 and 32 through zio.net, on this hos
 }
 
 test "sim: stream parity: the other kernel's column in a sim run (row 12 under .macos is refused, a death test)" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     try parity.inSim(if (host_kernel == .macos) .linux else .macos);
 }
 
@@ -1440,7 +1440,13 @@ fn findRow(comptime rows: []const Row, comptime name: []const u8) usize {
 
 // Every `net_*` ev op tag and every `net*` vtable field has exactly one row,
 // and every row names one that exists: a new tag or field fails the build.
+// Not on Windows: a socket there is a handle, not an `i32`, and the rows'
+// checks are POSIX code (every one of these tests skips there).
 comptime {
+    if (builtin.os.tag != .windows) checkRows();
+}
+
+fn checkRows() void {
     @setEvalBranchQuota(100_000);
     for (@typeInfo(ev.Op).@"enum".field_names) |name| {
         if (std.mem.startsWith(u8, name, "net_") and findRow(&op_rows, name) != 1) @compileError("surface table: ev op " ++ name ++ " needs exactly one row");
@@ -1462,7 +1468,7 @@ comptime {
 }
 
 test "sim: stream surface table: every built row's check passes; pending rows are exactly the later slices' rows, printed, never passed" {
-    if (skip) return error.SkipZigTest;
+    if (comptime skip) return error.SkipZigTest;
     const all = op_rows ++ vtable_rows ++ rule_rows;
     var passed: usize = 0;
     var pending: usize = 0;
