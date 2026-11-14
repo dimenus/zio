@@ -24,6 +24,8 @@ const Timestamp = time.Timestamp;
 const Coroutine = @import("coro/coroutines.zig").Coroutine;
 const Context = @import("coro/coroutines.zig").Context;
 const StackPool = @import("coro/stack_pool.zig").StackPool;
+const StackCache = @import("coro/stack_pool.zig").StackCache;
+const StackInfo = @import("coro/stack.zig").StackInfo;
 const StackPoolConfig = @import("coro/stack_pool.zig").Config;
 const setupStackGrowth = @import("coro/stack.zig").setupStackGrowth;
 const cleanupStackGrowth = @import("coro/stack.zig").cleanupStackGrowth;
@@ -626,6 +628,11 @@ pub const Executor = struct {
     // pool rate-limits itself, so every executor may carry this timer.
     stack_pool_shrink_timer: ev.Timer = ev.Timer.init(.{ .duration = .fromSeconds(60) }),
 
+    // This executor's private cache of free coroutine stacks, in front of the
+    // runtime's stack pool. Touched only by this executor's thread; see
+    // Runtime.acquireStack.
+    stack_cache: StackCache = .{},
+
     // The task currently executing on this executor, or null when we are running
     // scheduler code (the run loop, a context switch, a completion callback) rather
     // than a task body. A null value routes any I/O performed here through the
@@ -829,6 +836,7 @@ pub const Executor = struct {
         setCurrentExecutor(null);
         Coroutine.clearCurrent();
 
+        self.stack_cache.flush(&self.runtime.stack_pool);
         self.loop.deinit();
 
         cleanupStackGrowth();
@@ -841,6 +849,9 @@ pub const Executor = struct {
     fn stackPoolShrinkCallback(loop: *ev.Loop, c: *ev.Completion) void {
         const timer = c.cast(ev.Timer);
         const self: *Executor = @alignCast(@fieldParentPtr("stack_pool_shrink_timer", timer));
+        // Cached stacks count as in use; return them first so the shrink
+        // pass sees this executor's idle capacity as free.
+        self.stack_cache.flush(&self.runtime.stack_pool);
         self.runtime.stack_pool.shrink(loop.now());
     }
 
@@ -1220,6 +1231,11 @@ pub const Executor = struct {
             }
         }
 
+        // The last park came back with nothing runnable, so the executor is
+        // still idle. Whichever pass first finds work, or returns to the main
+        // task, needs to call leaveIdle.
+        var still_idle: bool = false;
+
         while (true) {
             // Process ready coroutines
             while (self.getNextTask()) |next_task| {
@@ -1247,10 +1263,15 @@ pub const Executor = struct {
             // Polling with tasks still queued means this pass fell behind.
             if (migrates) self.updateBacklog(!self.run_queue.isEmpty());
             if (has_work) {
+                if (still_idle) {
+                    self.leaveIdle();
+                    still_idle = false;
+                }
                 try self.loop.poll(.zero);
                 self.drainDispatched();
             } else {
-                try self.parkAndSearch(check_ready);
+                still_idle = try self.parkAndSearch(check_ready);
+                if (!still_idle) self.leaveIdle();
             }
 
             // Retune the tick budget from this batch. Skipped when we may have
@@ -1281,6 +1302,7 @@ pub const Executor = struct {
 
             // Check again after I/O
             if (check_ready and self.main_task.state.load(.acquire).tag == .ready) {
+                if (still_idle) self.leaveIdle();
                 return;
             }
         }
@@ -1297,7 +1319,7 @@ pub const Executor = struct {
     /// executor park indefinitely, with stealing folded into the pre-park
     /// check, which is also what makes the park's wake protocol sound (see
     /// park).
-    fn parkAndSearch(self: *Executor, check_ready: bool) !void {
+    fn parkAndSearch(self: *Executor, check_ready: bool) !bool {
         if (!migrates) {
             self.bump("parks_full", 1);
             {
@@ -1306,7 +1328,7 @@ pub const Executor = struct {
                 try self.loop.poll(.max);
             }
             self.drainDispatched();
-            return;
+            return false;
         }
 
         // With nobody to steal from (or to), the probe would only delay the
@@ -1315,13 +1337,11 @@ pub const Executor = struct {
             self.bump("parks_doze", 1);
             try self.loop.poll(.zero);
             self.drainDispatched();
-            if (self.checkLocalWork(check_ready)) return self.leaveIdle();
+            if (self.checkLocalWork(check_ready)) return false;
         }
         self.bump("parks_full", 1);
         try self.park(check_ready);
-        if (!self.run_queue.isEmpty() or (check_ready and self.main_task.state.load(.acquire).tag == .ready)) {
-            self.leaveIdle();
-        }
+        return self.run_queue.isEmpty() and (!check_ready or self.main_task.state.load(.acquire).tag != .ready);
     }
 
     /// Leaving the idle path with work in hand, from the probe or a full
@@ -2542,6 +2562,26 @@ pub const Runtime = struct {
         }
     }
 
+    /// Take a stack for a new coroutine: from the calling executor's cache
+    /// when the caller is one of this runtime's executors, otherwise straight
+    /// from the pool (user threads, callback threads, another runtime's
+    /// executor). The cache belongs to the calling thread, not to the executor
+    /// the task is placed on.
+    pub fn acquireStack(self: *Runtime) error{OutOfMemory}!StackInfo {
+        if (getCurrentExecutorOrNull()) |executor| {
+            if (executor.runtime == self) return executor.stack_cache.acquire(&self.stack_pool);
+        }
+        return self.stack_pool.acquire();
+    }
+
+    /// Return a coroutine's stack; the counterpart of `acquireStack`.
+    pub fn releaseStack(self: *Runtime, stack_info: StackInfo) void {
+        if (getCurrentExecutorOrNull()) |executor| {
+            if (executor.runtime == self) return executor.stack_cache.release(&self.stack_pool, stack_info);
+        }
+        self.stack_pool.release(stack_info);
+    }
+
     /// Shut the runtime down and free it. Every task must have finished, and
     /// every thread outside the runtime that wakes its tasks (by setting an
     /// `Event`, sending on a channel, and so on) must have stopped doing so:
@@ -2573,10 +2613,6 @@ pub const Runtime = struct {
         // Stop worker executors and join threads (deinits their loops)
         self.shutdownWorkers();
 
-        // All tasks should be complete before deinit. A task holds its stack
-        // until it finishes, so the pool's count of stacks in use covers them.
-        std.debug.assert(self.stack_pool.in_use == 0);
-
         // Clean up ThreadPool (its workers were already done in stop()).
         self.thread_pool.deinit();
 
@@ -2587,6 +2623,11 @@ pub const Runtime = struct {
         }
 
         self.executors.deinit(allocator);
+
+        // All tasks should be complete before deinit. A task holds its stack
+        // until it finishes, so the pool's count of stacks in use covers them
+        // (every executor's cache was flushed back by its deinit above).
+        std.debug.assert(self.stack_pool.in_use == 0);
 
         // Clean up stack pool
         self.stack_pool.deinit();
@@ -3900,6 +3941,34 @@ test "runtime: wake-before-park awaken bit stress (single executor)" {
 
 test "runtime: wake-before-park awaken bit stress (two executors)" {
     try wakeBeforeParkStress(2);
+}
+
+test "runtime: stacks cached by executors stay bounded and return on deinit" {
+    const runtime = try Runtime.init(std.testing.allocator, .{
+        .executors = .exact(2),
+    });
+    // deinit asserts that every cached stack came back to the pool.
+    defer runtime.deinit();
+
+    const S = struct {
+        fn work() void {}
+    };
+
+    // Tasks spawned here finish on whichever executor runs them, so stacks
+    // flow from this thread's cache to the others' and back through the pool.
+    var group: Group = .init;
+    defer group.cancel();
+    for (0..500) |_| try group.spawn(S.work, .{});
+    try group.wait();
+
+    // Every task has finished; what is still checked out of the pool is
+    // what the executors keep in their caches, plus at most one stack per
+    // executor whose finish cleanup (where the stack is released) has not
+    // run yet: wait() returns when the last task is done, and the cleanup
+    // runs at that executor's next landing site.
+    const executors = runtime.executors.items.len;
+    const bound = executors * (runtime.options.stack_pool.local_cache + 1);
+    try std.testing.expect(runtime.stack_pool.in_use <= bound);
 }
 
 fn wakeBeforeParkStress(executor_count: u6) !void {

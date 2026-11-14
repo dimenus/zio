@@ -281,9 +281,9 @@ pub const LoopState = struct {
     //   - On timer fire: cancel linked operation (same thread, direct)
     // The cross-thread cancel mechanism remains for general cancellation (task migration,
     // external cancellation), but timeouts become zero-overhead pointer unlinking.
-    /// Protects all timer heaps and the cached `now` values. A single lock is
-    /// enough: it's local to the loop and effectively uncontended, only ever
-    /// held for O(log n) heap ops with callbacks run outside it.
+    /// Protects all timer heaps. A single lock is enough: it's local to the
+    /// loop and effectively uncontended, only ever held for O(log n) heap ops
+    /// with callbacks run outside it.
     timer_mutex: os.Mutex = .init(),
 
     async_handles: Queue(Completion) = .{},
@@ -1445,7 +1445,6 @@ pub const Loop = struct {
                 };
 
                 const op_data = completion.cast(op.toType());
-                op_data.linked_work.allocator = self.allocator;
                 op_data.linked_work.linked_context = .{
                     .loop = self,
                     .linked = completion,
@@ -1476,6 +1475,10 @@ pub const Loop = struct {
     // from the same start, so buffers are sent in the order they were read.
 
     fn netSendFileStart(self: *Loop, op: *NetSendFile) void {
+        if (op.bufs[0].len == 0 and op.bufs[1].len == 0) {
+            op.c.setError(error.Unimplemented);
+            return self.state.markCompleted(&op.c);
+        }
         op.fallback = .{};
         op.fallback.read_remaining = op.remaining;
         // Lay out the working buffers from the (up to two) caller buffers. When
@@ -1596,9 +1599,9 @@ pub const Loop = struct {
     }
 
     fn netSendFileFinish(self: *Loop, op: *NetSendFile, err: ?anyerror) void {
-        // A cancel only wins when nothing was sent (see NetSendFile).
+        // An error only wins when nothing was sent (see NetSendFile).
         if (err) |e| {
-            if (e != error.Canceled or op.fallback.total == 0) {
+            if (op.fallback.total == 0) {
                 op.c.setError(e);
                 return self.state.markCompleted(&op.c);
             }

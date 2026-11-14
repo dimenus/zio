@@ -21,13 +21,13 @@ jobs:
           - { os: macos-15-intel, target: native, backends: 'kqueue poll' }
           - { os: windows-latest, target: native, backends: 'iocp poll' }
           - { os: ubuntu-24.04, target: x86_64-windows, wine: true, backends: 'iocp poll' }
-          - { os: ubuntu-latest, target: arm-linux, qemu: true, backends: 'linux epoll poll' }
-          - { os: ubuntu-latest, target: thumb-linux, qemu: true, backends: 'linux epoll poll' }
-          - { os: ubuntu-latest, target: x86-linux, qemu: true, backends: 'linux epoll poll' }
-          - { os: ubuntu-latest, target: riscv32-linux, qemu: true, backends: 'linux epoll poll' }
-          - { os: ubuntu-latest, target: riscv64-linux, qemu: true, backends: 'linux epoll poll' }
-          - { os: ubuntu-latest, target: loongarch64-linux, qemu: true, backends: 'linux epoll poll' }
-          - { os: ubuntu-latest, target: powerpc64le-linux, qemu: true, backends: 'linux epoll poll' }
+          - { os: ubuntu-24.04, target: arm-linux, qemu: true, backends: 'linux epoll poll' }
+          - { os: ubuntu-24.04, target: thumb-linux, qemu: true, backends: 'linux epoll poll' }
+          - { os: ubuntu-24.04, target: x86-linux, qemu: true, backends: 'linux epoll poll' }
+          - { os: ubuntu-24.04, target: riscv32-linux, qemu: true, backends: 'linux epoll poll' }
+          - { os: ubuntu-24.04, target: riscv64-linux, qemu: true, backends: 'linux epoll poll' }
+          - { os: ubuntu-24.04, target: loongarch64-linux, qemu: true, backends: 'linux epoll poll' }
+          - { os: ubuntu-24.04, target: powerpc64le-linux, qemu: true, backends: 'linux epoll poll' }
           - { os: ubuntu-latest, target: x86_64-freebsd, vm: freebsd, backends: 'kqueue poll' }
           - { os: ubuntu-latest, target: x86_64-netbsd, vm: netbsd, backends: 'kqueue poll' }
           - { os: ubuntu-latest, target: x86_64-openbsd, vm: openbsd, backends: 'kqueue poll' }
@@ -51,10 +51,15 @@ jobs:
 
     - name: Install Wine
       if: matrix.config.wine
-      timeout-minutes: 5
+      # libwine alone is over 100 MB, and the runner's Ubuntu mirror is
+      # sometimes slow enough that it takes several minutes.
+      timeout-minutes: 15
       run: |
         sudo apt-get update -q -y
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -q -y wine64
+        # The recommends are a desktop media stack (gstreamer, codecs, VA
+        # drivers) the tests don't use. `wine` is the launcher, which wine64
+        # only recommends.
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -q -y --no-install-recommends wine wine64
 
     - name: Build and test for each backend
       shell: bash

@@ -240,36 +240,49 @@ pub const NetSendMmsgData = struct {
     retry: SendRetry = .{},
 };
 
+// Path ops keep their null-terminated copy (`*_buf`) in the completion, which
+// stays in place until its CQE, so the path is still valid when a later
+// `io_uring_enter` hands the SQE to the kernel.
+
 pub const FileOpenData = struct {
     path: [:0]const u8 = "",
+    path_buf: fs.PathZ = .{},
     how: linux_sys.open_how = undefined,
 };
 
 pub const FileCreateData = struct {
     path: [:0]const u8 = "",
+    path_buf: fs.PathZ = .{},
     how: linux_sys.open_how = undefined,
 };
 
 pub const DirCreateDirData = struct {
     path: [:0]const u8 = "",
+    path_buf: fs.PathZ = .{},
 };
 
 pub const DirRenameData = struct {
     old_path: [:0]const u8 = "",
+    old_path_buf: fs.PathZ = .{},
     new_path: [:0]const u8 = "",
+    new_path_buf: fs.PathZ = .{},
 };
 
 pub const DirRenamePreserveData = struct {
     old_path: [:0]const u8 = "",
+    old_path_buf: fs.PathZ = .{},
     new_path: [:0]const u8 = "",
+    new_path_buf: fs.PathZ = .{},
 };
 
 pub const DirDeleteFileData = struct {
     path: [:0]const u8 = "",
+    path_buf: fs.PathZ = .{},
 };
 
 pub const DirDeleteDirData = struct {
     path: [:0]const u8 = "",
+    path_buf: fs.PathZ = .{},
 };
 
 pub const FileSizeData = struct {
@@ -279,10 +292,12 @@ pub const FileSizeData = struct {
 pub const FileStatData = struct {
     statx: linux.Statx = std.mem.zeroes(linux.Statx),
     path: [:0]const u8 = "",
+    path_buf: fs.PathZ = .{},
 };
 
 pub const DirOpenData = struct {
     path: [:0]const u8 = "",
+    path_buf: fs.PathZ = .{},
 };
 
 pub const ProcessWaitData = struct {
@@ -421,7 +436,6 @@ const Self = @This();
 
 const log = @import("../../../common.zig").log;
 
-allocator: std.mem.Allocator,
 ring: linux.IoUring,
 waker_eventfd: i32,
 waker_needs_rearm: bool,
@@ -451,7 +465,7 @@ shared_state: *SharedState,
 inflight: usize = 0,
 accept_hints: AcceptHints = .{},
 
-pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
+pub fn init(self: *Self, _: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
     var flags: u32 = 0;
     flags |= linux.IORING_SETUP_SINGLE_ISSUER;
     flags |= linux.IORING_SETUP_DEFER_TASKRUN;
@@ -482,7 +496,6 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_s
     _ = shared_state.refcount.fetchAdd(1, .seq_cst);
 
     self.* = .{
-        .allocator = allocator,
         .ring = ring,
         .waker_eventfd = waker_eventfd,
         .waker_needs_rearm = true,
@@ -861,7 +874,7 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
         .file_open => {
             const data = c.cast(FileOpen);
             if (is_new) {
-                data.internal.path = self.allocator.dupeSentinel(u8, data.path, 0) catch {
+                data.internal.path = data.internal.path_buf.init(data.path) catch {
                     c.setError(error.SystemResources);
                     state.markCompletedFromBackend(c);
                     return;
@@ -877,6 +890,7 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
                 .NOFOLLOW = !data.flags.follow_symlinks,
                 .NOCTTY = !data.flags.allow_ctty,
                 .PATH = data.flags.path_only,
+                .DIRECT = data.flags.direct,
             };
             const sqe = self.getSqeOrDefer(c) orelse return;
             if (data.flags.resolve_beneath) {
@@ -894,7 +908,7 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
         .file_create => {
             const data = c.cast(FileCreate);
             if (is_new) {
-                data.internal.path = self.allocator.dupeSentinel(u8, data.path, 0) catch {
+                data.internal.path = data.internal.path_buf.init(data.path) catch {
                     c.setError(error.SystemResources);
                     state.markCompletedFromBackend(c);
                     return;
@@ -906,6 +920,7 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
                 .CREAT = true,
                 .TRUNC = data.flags.truncate,
                 .EXCL = data.flags.exclusive,
+                .DIRECT = data.flags.direct,
             };
             const sqe = self.getSqeOrDefer(c) orelse return;
             if (data.flags.resolve_beneath) {
@@ -983,7 +998,7 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
         .dir_create_dir => {
             const data = c.cast(DirCreateDir);
             if (is_new) {
-                data.internal.path = self.allocator.dupeSentinel(u8, data.path, 0) catch {
+                data.internal.path = data.internal.path_buf.init(data.path) catch {
                     c.setError(error.SystemResources);
                     state.markCompletedFromBackend(c);
                     return;
@@ -996,13 +1011,13 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
         .dir_rename => {
             const data = c.cast(DirRename);
             if (is_new) {
-                data.internal.old_path = self.allocator.dupeSentinel(u8, data.old_path, 0) catch {
+                data.internal.old_path = data.internal.old_path_buf.init(data.old_path) catch {
                     c.setError(error.SystemResources);
                     state.markCompletedFromBackend(c);
                     return;
                 };
-                data.internal.new_path = self.allocator.dupeSentinel(u8, data.new_path, 0) catch {
-                    self.allocator.free(data.internal.old_path);
+                data.internal.new_path = data.internal.new_path_buf.init(data.new_path) catch {
+                    data.internal.old_path_buf.deinit();
                     c.setError(error.SystemResources);
                     state.markCompletedFromBackend(c);
                     return;
@@ -1015,13 +1030,13 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
         .dir_rename_preserve => {
             const data = c.cast(DirRenamePreserve);
             if (is_new) {
-                data.internal.old_path = self.allocator.dupeSentinel(u8, data.old_path, 0) catch {
+                data.internal.old_path = data.internal.old_path_buf.init(data.old_path) catch {
                     c.setError(error.SystemResources);
                     state.markCompletedFromBackend(c);
                     return;
                 };
-                data.internal.new_path = self.allocator.dupeSentinel(u8, data.new_path, 0) catch {
-                    self.allocator.free(data.internal.old_path);
+                data.internal.new_path = data.internal.new_path_buf.init(data.new_path) catch {
+                    data.internal.old_path_buf.deinit();
                     c.setError(error.SystemResources);
                     state.markCompletedFromBackend(c);
                     return;
@@ -1034,7 +1049,7 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
         .dir_delete_file => {
             const data = c.cast(DirDeleteFile);
             if (is_new) {
-                data.internal.path = self.allocator.dupeSentinel(u8, data.path, 0) catch {
+                data.internal.path = data.internal.path_buf.init(data.path) catch {
                     c.setError(error.SystemResources);
                     state.markCompletedFromBackend(c);
                     return;
@@ -1047,7 +1062,7 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
         .dir_delete_dir => {
             const data = c.cast(DirDeleteDir);
             if (is_new) {
-                data.internal.path = self.allocator.dupeSentinel(u8, data.path, 0) catch {
+                data.internal.path = data.internal.path_buf.init(data.path) catch {
                     c.setError(error.SystemResources);
                     state.markCompletedFromBackend(c);
                     return;
@@ -1084,7 +1099,7 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
             if (data.path) |user_path| {
                 // Path provided - stat relative to handle
                 if (is_new) {
-                    data.internal.path = self.allocator.dupeSentinel(u8, user_path, 0) catch {
+                    data.internal.path = data.internal.path_buf.init(user_path) catch {
                         c.setError(error.SystemResources);
                         state.markCompletedFromBackend(c);
                         return;
@@ -1105,7 +1120,7 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
         .dir_open => {
             const data = c.cast(DirOpen);
             if (is_new) {
-                data.internal.path = self.allocator.dupeSentinel(u8, data.path, 0) catch {
+                data.internal.path = data.internal.path_buf.init(data.path) catch {
                     c.setError(error.SystemResources);
                     state.markCompletedFromBackend(c);
                     return;
@@ -1307,7 +1322,11 @@ fn netSendFileAdvance(self: *Self, state: *LoopState, c: *Completion, res: i32) 
                 // Cannot happen (the pipe holds in_pipe > 0 bytes); bail out
                 // rather than re-splice forever.
                 self.netSendFileCleanup(c);
-                c.setError(error.Unexpected);
+                if (data.internal.sent > 0) {
+                    c.setResult(.net_send_file, data.internal.sent);
+                } else {
+                    c.setError(error.Unexpected);
+                }
                 state.markCompletedFromBackend(c);
                 return;
             }
@@ -1847,7 +1866,7 @@ noinline fn storeResultSlow(self: *Self, c: *Completion, res: i32) void {
 
         .file_open => {
             const data = c.cast(FileOpen);
-            self.allocator.free(data.internal.path);
+            data.internal.path_buf.deinit();
             if (res < 0) {
                 c.setError(fs.errnoToFileOpenError(@fromBackingInt(@intCast(-res)), data.flags));
             } else {
@@ -1857,7 +1876,7 @@ noinline fn storeResultSlow(self: *Self, c: *Completion, res: i32) void {
 
         .file_create => {
             const data = c.cast(FileCreate);
-            self.allocator.free(data.internal.path);
+            data.internal.path_buf.deinit();
             if (res < 0) {
                 c.setError(fs.errnoToFileOpenError(@fromBackingInt(@intCast(-res)), data.flags));
             } else {
@@ -1919,7 +1938,7 @@ noinline fn storeResultSlow(self: *Self, c: *Completion, res: i32) void {
 
         .dir_create_dir => {
             const data = c.cast(DirCreateDir);
-            self.allocator.free(data.internal.path);
+            data.internal.path_buf.deinit();
             if (res < 0) {
                 c.setError(fs.errnoToDirCreateDirError(@fromBackingInt(@intCast(-res))));
             } else {
@@ -1929,8 +1948,8 @@ noinline fn storeResultSlow(self: *Self, c: *Completion, res: i32) void {
 
         .dir_rename => {
             const data = c.cast(DirRename);
-            self.allocator.free(data.internal.old_path);
-            self.allocator.free(data.internal.new_path);
+            data.internal.old_path_buf.deinit();
+            data.internal.new_path_buf.deinit();
             if (res < 0) {
                 c.setError(fs.errnoToDirRenameError(@fromBackingInt(@intCast(-res))));
             } else {
@@ -1940,8 +1959,8 @@ noinline fn storeResultSlow(self: *Self, c: *Completion, res: i32) void {
 
         .dir_rename_preserve => {
             const data = c.cast(DirRenamePreserve);
-            self.allocator.free(data.internal.old_path);
-            self.allocator.free(data.internal.new_path);
+            data.internal.old_path_buf.deinit();
+            data.internal.new_path_buf.deinit();
             if (res < 0) {
                 const errno: linux.E = @fromBackingInt(@intCast(-res));
                 if (errno == .EXIST) {
@@ -1956,7 +1975,7 @@ noinline fn storeResultSlow(self: *Self, c: *Completion, res: i32) void {
 
         .dir_delete_file => {
             const data = c.cast(DirDeleteFile);
-            self.allocator.free(data.internal.path);
+            data.internal.path_buf.deinit();
             if (res < 0) {
                 c.setError(fs.errnoToDirDeleteFileError(@fromBackingInt(@intCast(-res))));
             } else {
@@ -1966,7 +1985,7 @@ noinline fn storeResultSlow(self: *Self, c: *Completion, res: i32) void {
 
         .dir_delete_dir => {
             const data = c.cast(DirDeleteDir);
-            self.allocator.free(data.internal.path);
+            data.internal.path_buf.deinit();
             if (res < 0) {
                 c.setError(fs.errnoToDirDeleteDirError(@fromBackingInt(@intCast(-res))));
             } else {
@@ -1987,7 +2006,7 @@ noinline fn storeResultSlow(self: *Self, c: *Completion, res: i32) void {
             const data = c.cast(FileStat);
             // Free path if it was allocated (only when user provided a path)
             if (data.path != null) {
-                self.allocator.free(data.internal.path);
+                data.internal.path_buf.deinit();
             }
             if (res < 0) {
                 c.setError(fs.errnoToFileStatError(@fromBackingInt(@intCast(-res))));
@@ -1998,7 +2017,7 @@ noinline fn storeResultSlow(self: *Self, c: *Completion, res: i32) void {
 
         .dir_open => {
             const data = c.cast(DirOpen);
-            self.allocator.free(data.internal.path);
+            data.internal.path_buf.deinit();
             if (res < 0) {
                 c.setError(fs.errnoToDirOpenError(@fromBackingInt(@intCast(-res)), data.flags));
             } else {
@@ -2060,9 +2079,9 @@ noinline fn storeResultSlow(self: *Self, c: *Completion, res: i32) void {
             // netSendFileAdvance.
             const data = c.cast(NetSendFile);
             self.netSendFileCleanup(c);
-            const errno: linux.E = if (res < 0) @fromBackingInt(@intCast(-res)) else .SUCCESS;
-            // A cancel only wins when nothing was sent (see NetSendFile).
-            if (res < 0 and !(errno == .CANCELED and data.internal.sent > 0)) {
+            // An error only wins when nothing was sent (see NetSendFile).
+            if (res < 0 and data.internal.sent == 0) {
+                const errno: linux.E = @fromBackingInt(@intCast(-res));
                 c.setError(switch (data.internal.stage) {
                     .to_pipe => fs.errnoToFileReadError(errno),
                     .to_socket => net.errnoToSendError(errno),
