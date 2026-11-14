@@ -4101,6 +4101,119 @@ test "sim: dgram: the receive queue matches a list of byte strings under random 
     }
 }
 
+/// What one direction of a sim pipe should hold: the bytes sent and not yet
+/// received, in order, under `pipe_buf_cap`.
+const PipeModel = struct {
+    bytes: std.ArrayList(u8) = .empty,
+
+    /// A send copies what fits, gathered in slice order. A full buffer parks
+    /// a send of one byte or more; a send of nothing returns 0 at once.
+    fn send(m: *PipeModel, gpa: std.mem.Allocator, src: []const []const u8) !?usize {
+        const total = totalLen(src);
+        if (total == 0) return 0;
+        const space = pipe_buf_cap - m.bytes.items.len;
+        if (space == 0) return null;
+        const n = @min(total, space);
+        var left = n;
+        for (src) |sl| {
+            const k = @min(sl.len, left);
+            try m.bytes.appendSlice(gpa, sl[0..k]);
+            left -= k;
+        }
+        return n;
+    }
+
+    /// A receive takes the oldest bytes, scattered in slice order.
+    fn recv(m: *PipeModel, gpa: std.mem.Allocator, cap: usize) ![]const u8 {
+        const n = @min(cap, m.bytes.items.len);
+        const out = try gpa.dupe(u8, m.bytes.items[0..n]);
+        try m.bytes.replaceRange(gpa, 0, n, &.{});
+        return out;
+    }
+};
+
+// One pipe, both directions, driven through the sim's own byte handling
+// (`copySend`, `drainBuf`): sends of one to three slices (a quarter of them
+// empty) big enough to fill the 4096-byte buffer often, a send to a full
+// buffer that parks and is cancelled, and receives into zero to three slices
+// (a quarter of them empty). Each end's buffer is compared with
+// `PipeModel` after every step. A failure prints the seed and the step.
+test "sim: pipe: the pipe buffer matches a list of bytes under random sends, receives, empty slices and a full buffer" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var parks: usize = 0;
+    var empty_sends: usize = 0;
+    for ([_]u64{ 1, 2, 3, 4, 5 }) |model_seed| {
+        begin(model_seed);
+        defer end();
+        var prng: std.Random.DefaultPrng = .init(model_seed);
+        const r = prng.random();
+        const fds = pipePair();
+        var models: [2]PipeModel = .{ .{}, .{} };
+        var dummy: u8 = 0;
+        var step: usize = 0;
+        errdefer std.debug.print("pipe model test: seed {d}, step {d}\n", .{ model_seed, step });
+        while (step < 1000) : (step += 1) {
+            // `from` sends into the buffer of the other end, `models[1 - from]`.
+            const from = r.uintLessThan(usize, 2);
+            if (r.boolean()) {
+                var parts: [3][]u8 = undefined;
+                const n = r.intRangeAtMost(usize, 1, 3);
+                for (parts[0..n]) |*part| {
+                    const len: usize = if (r.uintLessThan(u8, 4) == 0) 0 else r.intRangeAtMost(usize, 1, 1500);
+                    part.* = try gpa.alloc(u8, len);
+                    r.bytes(part.*);
+                }
+                var src: [3][]const u8 = undefined;
+                for (parts[0..n], 0..) |part, k| src[k] = part;
+                if (totalLen(src[0..n]) == 0) empty_sends += 1;
+                const want = try models[1 - from].send(gpa, src[0..n]);
+                switch (copySend(fds[from], src[0..n], &dummy, 0, false)) {
+                    .due => |got| try std.testing.expectEqual(want, got),
+                    .parked => {
+                        try std.testing.expectEqual(@as(?usize, null), want);
+                        parks += 1;
+                        _ = cancelIo(&dummy);
+                    },
+                    else => |o| {
+                        std.debug.print("send: {t}\n", .{o});
+                        return error.UnexpectedSend;
+                    },
+                }
+            } else {
+                var bufs: [3][2000]u8 = undefined;
+                var dst: [3][]u8 = undefined;
+                const n = r.uintAtMost(usize, 3);
+                var cap: usize = 0;
+                for (dst[0..n], 0..) |*d, k| {
+                    const len: usize = if (r.uintLessThan(u8, 4) == 0) 0 else r.intRangeAtMost(usize, 1, 2000);
+                    d.* = bufs[k][0..len];
+                    cap += len;
+                }
+                const want = try models[from].recv(gpa, cap);
+                const got = drainBuf(fds[from], dst[0..n]);
+                try std.testing.expectEqual(want.len, got);
+                var at: usize = 0;
+                for (dst[0..n]) |d| {
+                    const k = @min(d.len, got - at);
+                    try std.testing.expectEqualSlices(u8, want[at..][0..k], d[0..k]);
+                    at += k;
+                }
+            }
+            for (fds, 0..) |fd, k| {
+                const e = ends[endIndex(fd).?];
+                try std.testing.expectEqualSlices(u8, models[k].bytes.items, e.buf[0..e.buf_len]);
+            }
+        }
+    }
+    // The run did reach the cases it is for.
+    std.debug.print("pipe model test: 5000 steps, {d} sends parked on a full buffer, {d} sends of nothing\n", .{ parks, empty_sends });
+    try std.testing.expect(parks > 20);
+    try std.testing.expect(empty_sends > 20);
+}
+
 // The outside review's sequence for finding 2 (review of 158ebba).
 test "sim: dgram ev: a receive parked on a socket that is closed and whose number is reused at once ends FileDescriptorNotASocket and leaves the new socket's datagram" {
     if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
