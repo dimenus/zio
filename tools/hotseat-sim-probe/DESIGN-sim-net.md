@@ -999,50 +999,62 @@ the mutants in its commits.
     cannot vanish; the TCP landing time and `next_conn_id` are checked,
     named panics. Mutants: `mut/28-f.json` beside report 28, all killed.
     Report 28 has the gates.
-  - **Next: slice 2** (17.16: bytes, chunks, window, credit and
-    conservation; FIN and RST with data; the profiles' send and receive
-    rules; `.both`; linger 0; `getpeername`; `bytesReadable`; the window
-    and chunking settings). **Review 3's findings that blocked it
-    are fixed in section 17 (sitting 29, with rows 39 to 41 measured; the
-    commit message has the reasoning).** What each one was:
-    - **3, the send and receive lists:** split each into a call list
-      and a harvest list, as a95fe60 did for accept. The "unresolved"
-      guard is the call's only; at harvest the op is itself the
-      unresolved one, so the literal send list refuses every woken send
-      (rows 23 and 25).
-    - **4: own `SHUT_WR`, then a peer RST, before any peer FIN.** Under
-      `.linux`, send line 4 (`BrokenPipe`) comes before line 5 (consume
-      the pending reset), and a later read then reports a reset. **No
-      run measures this composed sequence.** Add it to the probe (3 runs
-      on each kernel) before writing the precedence.
-    - **5:** `.both`, then late data in two chunks, under `.linux`: the
-      second chunk can set the local reset again after the first was
-      read. Gate it on "never reported", not on an empty pending slot,
-      and say how a local reset joins the received and reported facts.
-    - **6:** close after a reset with unread bytes takes close line 1
-      and never discards them. Discard and count them on every close,
-      before retirement.
-    - **7:** `.macos`, `.both` with a full window of unread bytes and a
-      parked send: the discard frees room but no credit leaves and the
-      FIN does not wake the sender. Define a window release or a
-      terminal notice, keep reclaimed room apart from bytes read, and
-      keep row 17's trace.
-    - **9:** with no profile, a FIN then an RST, then close with no read
-      or send: the RST landing already chose a profile's answer. Slice 1
-      keeps it profile-neutral (`fin_before_reset`); say so in 17.8 and
-      move the choice to the call, or name the landing as a panic point.
-    - **10:** the probe's blocked-call proof has a hole at the return
-      boundary (the worker can return, pause, and read the event flag
-      late). Narrow 17.13's claim and state the uncertainty that
-      remains, unless syscall-boundary evidence is cheap to get (not
-      looked for in sitting 27).
-    - **11:** `failStream` with a send and a receive both unresolved:
-      say which ops get the failure, when it counts as reported, and
-      what later calls return, and keep the harvest lists consistent.
-
-    Slice 2's own gate (17.16): the op model for streams without faults,
-    under each profile and with no profile; parity rows 3, 5, 7 to 9, 16
-    to 29, 33 to 38; mutants; the gates of this section.
+  - **Review 3's findings that blocked slice 2 are fixed in section 17**
+    (c8b5570, sitting 29): the send and receive lists split into call and
+    harvest lists (3); the reset before the own FIN in the send list (4,
+    measured: row 39); the local reset set once, never re-armed (5, row
+    40); close always counts unread bytes (6); the window release under
+    `.macos` (7, row 41); the RST landing profile-neutral (9); the
+    blocked-call rows backed by the kernel's account of each call (10,
+    `tcpprobe4.c`); `failStream` wakes both ops and the harvest order
+    picks the one that gets the error (11). Rows 39 to 41 and the probe
+    are in `zio-sim29/probe4/` beside report 29.
+  - **Slice 2 is built, except its op model (sitting 29: 6232b5f, and
+    4d98218 for the mutants' tests).** Bytes, chunks (hashed by default), the window and
+    paced credit, FIN, RST with data, shutdown `.send` and `.both`, close
+    with unread bytes or SO_LINGER {1, 0}, the profiles' send and receive
+    rules, the local reset, the window release, `getpeername`,
+    `bytesReadable`, and the window and chunking settings, through the ev
+    ops, the socket layer, zio.net and std.Io. Protocol: the comment above
+    `pub const StreamProfile` in `src/sim.zig`. Tests:
+    `src/sim_stream_bytes_test.zig` (`sim: stream bytes`, its refusals,
+    and `sim: stream parity: slice 2's rows`); the surface table is at
+    `built_slice = 2`, with only slices 3 and 4 pending. Mutants:
+    `mut/29-s2.json` beside report 29.
+  - **Stopped at a design question, t-4119 (open, the owner's).** The
+    profiles follow the probes' blocking C calls. Through zio on real
+    sockets, a send that is parked when an RST or the peer's `.both`
+    arrives gives another answer: on macOS (kqueue) rows 23, 25 and 41
+    end `ECONNRESET` and the reads then give 0, because zio's kqueue
+    backend ends the op with `SO_ERROR`, which also clears it; on Linux
+    (epoll and io_uring) row 41 ends `EPIPE` about 215 ms after the
+    receiver's SHUT_RDWR, where the probe's blocked send stayed blocked
+    (not understood). The sim keeps the design's rule. The parity table
+    asserts both answers for those four cells (`macos_zio`,
+    `linux_zio`) and prints them each run.
+  - **Next, in this order:**
+    1. The owner's ruling on t-4119. If the profiles are to follow zio
+       on the kernel, change 17.8's `.macos` parked-send rule (and decide
+       what Linux row 41 is), then make the four cells one column.
+    2. **The stream op model** (17.15 item 2), slice 2's missing gate:
+       random sends, receives, shutdowns, closes, window and chunk
+       changes and cancels on several connections, against a reference
+       that holds each direction's byte list and every conservation term
+       and implements 17.8's lists itself; per profile and with no
+       profile (the panic points); seeds 1 to 16; counts per op kind,
+       with a run where a kind never ran not counted. Shape:
+       `src/sim_op_model_test.zig`.
+    3. Slice 3 (17.16): `.tcp` rules with holding, `failStream`, the
+       connect with no answer.
+  - **What I would change, with what I know now:**
+    - Measure every profile row through zio's public API on each
+      backend, not only in C. The C probe answers "what does the
+      kernel do"; the sim's users ask "what does zio give me". They
+      differ where a backend reads `SO_ERROR` (t-4119).
+    - The surface table's checks run whole scenarios, so the table run
+      takes about 9 s; a row that names its scenario test instead of
+      running it again would be cheaper. Not done: running it is what
+      proves the row.
   - Open for the sim seat, queued, not started: t-4096 (refuse a
     zero-room receive, decided yes), t-4106 (the spawn windows), t-4115
     (the bind cells slice 1 refuses as not measured), t-4117 (the
@@ -1104,6 +1116,11 @@ the mutants in its commits.
   one. Before `sim.end`, a stream test closes every stream socket and
   sleeps while `sim.streamEntriesInFlight()` is not 0 (`drain` in
   `src/sim_stream_test.zig`); `end` panics on what is left.
+- **Slice 2's tests:** the filter `sim: stream bytes` (its refusals are
+  under `sim: stream refuses`). The parity rows of slice 2 are `sim: stream
+  parity: slice 2's rows`, in both builds; on Linux run them in an
+  io_uring and an epoll binary, as slice 1's. Each row prints a line for
+  an open difference (t-4119), naming which column that run checks.
 - **The surface table needs the filter `sim: stream`:** its refusal rows
   run other tests in child processes, and a build filtered to the table
   alone does not contain them. To run the table by itself, build with
@@ -1279,6 +1296,22 @@ the mutants in its commits.
 - **The mutant runner edits files in place.** Point a copy of it (its
   `ROOT`) at a scratch copy of the tree (rsync without `.zig-cache` and
   `.git`); the worktree is then free for other builds while it runs.
+- **A C probe is not zio.** The probes call blocking sockets in threads;
+  zio parks a non-blocking op on a backend, and its kqueue backend ends a
+  parked op with `SO_ERROR`, which also clears it. So rows where an op is
+  parked can differ between the probe and zio on the same kernel
+  (t-4119). Check a profile row through zio's public API on real sockets
+  before calling it parity.
+- **A read after the endpoint's own `shutdown(.both)` gives 0 at once;**
+  it does not park. A test that wants a chunk to land first sleeps.
+- **A connection retires as soon as both ends are dead and nothing is on
+  the wire,** and `testStreamDir` then gives null. Check discards after a
+  close with `streamStats().discarded`, the run's totals by cause.
+- **Darwin's `std.c.T` has no `FIONREAD`;** the layer uses the BSD value
+  `_IOR('f', 127, int)`, 0x4004667f.
+- **The structural test accepts `sim.isSimFd(fd)`, or `sim.isDgramFd(fd)`
+  with the refusal,** as a sim branch, not `sim.isStreamFd(fd)` alone. A
+  new layer function with a stream branch also needs a datagram branch.
 - **Tool rules for agents here:** a recursive `rm` of a path built from a
   variable is refused by a hook; make a new directory instead. Restoring a
   file with `git checkout <file>` is refused too, and would drop uncommitted
@@ -1287,8 +1320,9 @@ the mutants in its commits.
 
 ## 17. The stream track: simulated TCP on loopback (design check, revision 3)
 
-Status: **slice 1 of 17.16 is built** (d613fd1, 35972fb; section 15 has
-the state). Slices 2 to 4 are design only. Revision 1 was
+Status: **slices 1 and 2 of 17.16 are built**, except slice 2's op model
+(slice 1: d613fd1, 35972fb; slice 2: 6232b5f; section 15 has the state
+and the open question t-4119). Slices 3 and 4 are design only. Revision 1 was
 6e854fc, revision 2 was 2d987f7, and revision 3 is sitting 25. It answers
 the second outside review, `gpt-simnet10.md`, and the grader's rulings on
 report 24. The third outside review, `gpt-simnet11.md`, is answered in
