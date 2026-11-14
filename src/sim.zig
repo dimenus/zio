@@ -1564,27 +1564,34 @@ pub fn dgramSend(fd: i32, src: anytype, to: Ip4, from: ?[4]u8) error{ AddressUna
     }
     if (rule_history_len != 0) {
         const src_addr: Ip4 = .{ .ip = src_ip, .port = d.local.port };
+        // Every allocation this send could need comes before any fault
+        // decision: a decision moves counts, matches, draws and a burst
+        // state, and a send that then failed for memory would leave them
+        // moved, so its retry would get another fate (round 5 of the
+        // outside review, finding 1). A duplicate's copy is made whether or
+        // not the rule duplicates, and freed if it does not.
+        const second = net_alloc.dupe(u8, bytes) catch {
+            net_alloc.free(bytes);
+            return error.SystemResources;
+        };
+        wire.ensureUnusedCapacity(net_alloc, 2) catch {
+            net_alloc.free(bytes);
+            net_alloc.free(second);
+            return error.SystemResources;
+        };
         switch (faultAtSend(wire_seq, src_addr, to)) {
             .dropped => |outcome| {
                 // The sender succeeded; the datagram is recorded at its
                 // send time, bytes and all, and never reaches the wire.
                 recordLanding(.{ .seq = wire_seq, .from = src_addr, .to = to, .bytes = bytes, .due_at = clock_ns }, outcome);
                 net_alloc.free(bytes);
+                net_alloc.free(second);
             },
             .sent => |s| {
-                // Both copies' memory first, so a failure leaves nothing on
-                // the wire.
-                const second: ?[]u8 = if (s.copies == 2) net_alloc.dupe(u8, bytes) catch {
-                    net_alloc.free(bytes);
-                    return error.SystemResources;
-                } else null;
-                wire.ensureUnusedCapacity(net_alloc, s.copies) catch {
-                    net_alloc.free(bytes);
-                    if (second) |b| net_alloc.free(b);
-                    return error.SystemResources;
-                };
                 wireInsert(.{ .seq = wire_seq, .from = src_addr, .to = to, .bytes = bytes, .due_at = s.due[0] });
-                if (second) |b| wireInsert(.{ .seq = wire_seq, .from = src_addr, .to = to, .bytes = b, .due_at = s.due[1], .copy = true });
+                if (s.copies == 2) {
+                    wireInsert(.{ .seq = wire_seq, .from = src_addr, .to = to, .bytes = second, .due_at = s.due[1], .copy = true });
+                } else net_alloc.free(second);
             },
         }
         wire_seq += 1;
@@ -9222,4 +9229,57 @@ test "sim: pipe refuses: an ev receive of IOV_MAX + 1 buffers" {
             }.b);
         }
     }.body);
+}
+
+// ---- Round 5 of the outside review (gpt-simnet7.md, of 3340b0f) ----
+
+/// Finding 1: a send that fails for memory must leave no fault decision
+/// behind. The rule duplicates everything, delays it, and has a burst that
+/// alternates (bad, good, ...) with no draw, so a decision that leaked into
+/// the burst state shows in the next send's fate.
+const r5_alloc = struct {
+    var failing: std.testing.FailingAllocator = undefined;
+
+    fn failingSend(a: i32, k: u32, fail_index: usize) !void {
+        failing = std.testing.FailingAllocator.init(std.heap.smp_allocator, .{ .fail_index = fail_index });
+        testSetNetAllocator(failing.allocator());
+        defer testSetNetAllocator(std.heap.smp_allocator);
+        try std.testing.expectError(error.SystemResources, nf.send(a, 1, 7001, k));
+    }
+
+    fn body() !void {
+        const a = try nf.sock(1, 7000);
+        const b = try nf.sock(1, 7001);
+        const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
+        // The review's sequence: everything duplicated and delayed. A fresh
+        // run's wire has no capacity, so a send allocates its payload copy
+        // (0), the duplicate's copy (1), and the wire's growth (2).
+        setImpairment(ab, .{ .dup_ppm = 1_000_000, .delay_ns = std.time.ns_per_ms });
+        for ([_]usize{ 0, 1, 2 }) |fi| {
+            try failingSend(a, 0, fi);
+            try std.testing.expectEqual(NetFaultStats{}, netFaultStats());
+            try std.testing.expectEqual(@as(u64, 0), netFaultDraws());
+            try std.testing.expectEqual(@as(u64, 0), datagramStats(a).sent);
+        }
+        try std.testing.expectEqual(RuleStats{}, clearImpairment(ab));
+        // The burst: the first send that succeeds goes good to bad, lost.
+        setImpairment(ab, .{ .dup_ppm = 1_000_000, .delay_ns = std.time.ns_per_ms, .burst = .{ .enter_ppm = 1_000_000, .leave_ppm = 1_000_000 } });
+        try nf.send(a, 1, 7001, 0);
+        try std.testing.expectEqual(@as(u64, 1), netFaultStats().lost_burst);
+        // The next send leaves the bad state; its duplicate's copy fails.
+        // Its retry must still be that send: bad to good, two copies.
+        try failingSend(a, 1, 1);
+        try std.testing.expectEqual(NetFaultStats{ .lost_burst = 1 }, netFaultStats());
+        try nf.send(a, 1, 7001, 1);
+        try dg.rt_mod.sleep(.fromMilliseconds(2));
+        try std.testing.expectEqual(@as(usize, 2), try nf.count(b));
+        try std.testing.expectEqual(NetFaultStats{ .lost_burst = 1, .duplicated = 1, .delayed = 2 }, netFaultStats());
+        try std.testing.expectEqual(@as(u64, 2), datagramStats(a).sent);
+        try std.testing.expectEqual(RuleStats{ .matched = 2, .dropped = 1, .duplicated = 1, .delayed = 2 }, clearImpairment(ab));
+    }
+};
+
+test "sim: net faults: a send whose payload copy, duplicate copy or wire growth fails commits no fault decision, and its retry gets the fate a first try would" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, r5_alloc.body);
 }
