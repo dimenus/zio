@@ -1,8 +1,8 @@
 # Design brief: a sim network for zio (t-4086, t-4087), revision 3
 
-Status: **phase 1 (section 12) is built. An outside review of 158ebba found
-nine defects; all nine are closed (section 15). Phase 1 is not accepted
-until the owner reviews that work. The rest is for review.**
+Status: **phase 1 (section 12) is built. Round 1 of the outside review
+(158ebba) is closed; round 2 (1126ebe) has F1 to F6 closed and three model
+tests open (section 15). The rest is for review.**
 
 Revision 2 (dd55885) was reviewed by another vendor's model. This revision
 takes the decisions made after that review. Section 13 lists what changed
@@ -687,6 +687,43 @@ select adapter, which 9ecfbc6 removed.
   generation was added; see "Next".
 - **Open, not done:** t-4096, a zero-length receive on an empty sim pipe
   parks; check what the kernels do first.
+
+### Round 2 of the outside review (gpt-simnet4.md, of 1126ebe)
+
+Same method: a test from the review's sequence, run on the code before the
+fix, then the fix and mutants. Each commit has the failing output.
+
+- **F1 (P1), fixed in 794ce5d:** an op already copied into the harvest's
+  batch could be canceled by a sibling's group callback (members that do
+  not defer their finish) and then completed again. The harvest now skips
+  an entry unless its exact (pointer, submit id) is live, and `endOp`
+  panics on a second end. The defect is older than this work: it crashes
+  the same way for pipe sends at 3417a77 (the zio starh2 pins). zio's own
+  task-level waits keep members deferred, so they do not reach it.
+- **F2, fixed in 7c0c22e:** a woken pipe receive whose bytes another receive
+  took parks again instead of reporting end of file.
+- **F3, fixed in 35fda32:** pipe ev ops refuse every flag that differs from
+  its default, except a receive's `dontwait`, by name from the type.
+- **F4, fixed in 5500807:** the state digest hashes each datagram socket's
+  parked op id and what it waits for (`DgramWait`).
+- **F5, decided by the owner, 9407c06:** the `recvmsg` refusal stays;
+  section 8 says what it costs.
+- **F6, fixed in 47ac04c:** a sim fd in an `SCM_RIGHTS` message on a real
+  socket refuses; a parameter named `control` is an fd carrier in the
+  structural test, whose header now lists its known limits.
+- **Open, not started (the owner's list for sitting 15, in this order):**
+  - an op-level model test for datagram sockets and pipes together: a few
+    sockets and one pipe; random send, receive (ev, parked or not), poll,
+    cancel, race groups of two or three ops, close, open (number reuse),
+    SO_RCVBUF change and clock advance; a plain model of byte-string queues
+    and pending ops; after every step each op completed at most once and
+    with the model's result, nothing live or due at the end, no bytes lost
+    or doubled; seed and step on failure. It must find F1 and F2 on the old
+    code (`git revert` of 794ce5d and 7c0c22e in a scratch copy) and round
+    1's finding 2 (1b2d7ce reverted) within its normal run;
+  - the datagram queue model test: scatter buffers, the packet limit, a
+    drained tail;
+  - the pipe model test: an oracle that does not call `totalLen`.
 
 ### Next
 
