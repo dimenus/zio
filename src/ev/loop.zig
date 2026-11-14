@@ -1879,14 +1879,14 @@ pub const Loop = struct {
         }
     }
 
-    /// Sim: an ev op on a sim stream socket (design section 17; slice 1).
-    /// Bind, listen and close go through the socket layer as on a datagram
-    /// socket, and are due now. Connect and accept are the sim's own
-    /// (`sim.streamConnect`, `sim.streamAccept`): a connect always parks
-    /// until its SYN-ACK or RST lands; an accept takes a queued connection
-    /// now, or parks until an ACK lands. Every other op on a stream socket
-    /// refuses by name: the byte paths, shutdown and poll come with slice 2,
-    /// and the datagram calls never apply.
+    /// Sim: an ev op on a sim stream socket (design section 17; slices 1
+    /// and 2). Bind, listen, shutdown and close go through the socket layer
+    /// as on a datagram socket, and are due now. Connect, accept, receive
+    /// and send are the sim's own (`sim.streamConnect`, `streamAccept`,
+    /// `streamRecv`, `streamSend`): each has its result now or parks on the
+    /// socket until a landing, a setting or a call wakes it, and its harvest
+    /// evaluates it again (`harvestSimStream`). Poll and the datagram calls
+    /// refuse by name.
     fn submitSimStream(c: *Completion, h: i32) void {
         const id = sim.streamOpStart(c, h);
         switch (c.op) {
@@ -1908,12 +1908,49 @@ pub const Loop = struct {
                 simAccepted(op, a);
             },
             .net_poll => sim.panic("sim: NetPoll on sim stream socket {d} is refused: no supported stream path polls (design 17.4)", .{h}),
-            .net_recv => sim.refuseStream("NetRecv", h),
-            .net_send => sim.refuseStream("NetSend", h),
-            .net_shutdown => sim.refuseStream("NetShutdown", h),
+            .net_recv => {
+                const op = c.cast(NetRecv);
+                refuseSimStreamFlags("receive", op.flags, h);
+                if (!simStreamResult(c, sim.streamRecv(h, op.buffers.iovecs, c, id))) return;
+            },
+            .net_send => {
+                const op = c.cast(NetSend);
+                refuseSimStreamFlags("send", op.flags, h);
+                if (!simStreamResult(c, sim.streamSend(h, op.buffer.iovecs, c, id))) return;
+            },
+            .net_shutdown => common.handleNetShutdown(c),
             else => sim.panic("sim: {s} on sim stream socket {d} is not simulated", .{ @tagName(c.op), h }),
         }
         sim.streamOpDone(c, id);
+    }
+
+    /// Sim: sets a receive's or a send's result; false when it parked.
+    fn simStreamResult(c: *Completion, r: sim.StreamResult) bool {
+        switch (r) {
+            .n => |n| switch (c.op) {
+                .net_recv => c.setResult(.net_recv, n),
+                .net_send => c.setResult(.net_send, n),
+                else => unreachable,
+            },
+            .err => |err| c.setError(err),
+            .park => return false,
+        }
+        return true;
+    }
+
+    /// Sim: a stream socket models a receive and a send with the default
+    /// flags only (design 17.4). Every other flag refuses by name, from the
+    /// type, as on a pipe: `dontwait` would need a would-block answer the
+    /// stream ops never give, and the rest have no meaning the sim gives
+    /// them.
+    fn refuseSimStreamFlags(comptime what: []const u8, flags: anytype, fd: i32) void {
+        const T = @TypeOf(flags);
+        const defaults: T = .{};
+        inline for (comptime std.meta.fieldNames(T)) |name| {
+            if (@field(flags, name) != @field(defaults, name)) {
+                sim.panic("sim: " ++ what ++ " flag " ++ name ++ " on sim stream socket {d} is not simulated", .{fd});
+            }
+        }
     }
 
     fn simAccepted(op: *NetAccept, a: sim.Accepted) void {
@@ -1935,7 +1972,9 @@ pub const Loop = struct {
                 const op = c.cast(NetAccept);
                 simAccepted(op, sim.streamHarvestAccept(h, op.flags.nonblocking));
             },
-            else => sim.panic("sim: a woken {s} on a stream socket: only a connect or an accept waits", .{@tagName(c.op)}),
+            .net_recv => _ = simStreamResult(c, sim.streamHarvestRecv(h, c.cast(NetRecv).buffers.iovecs)),
+            .net_send => _ = simStreamResult(c, sim.streamHarvestSend(h, c.cast(NetSend).buffer.iovecs)),
+            else => sim.panic("sim: a woken {s} on a stream socket: only a connect, an accept, a receive or a send waits", .{@tagName(c.op)}),
         }
     }
 

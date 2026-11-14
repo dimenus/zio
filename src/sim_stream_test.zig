@@ -39,16 +39,16 @@ const io_common = @import("common.zig");
 const os_net = @import("os/net.zig");
 const Timeout = @import("time.zig").Timeout;
 
-const L = sim.wire_latency_ns;
-const lo: [4]u8 = .{ 127, 0, 0, 1 };
+pub const L = sim.wire_latency_ns;
+pub const lo: [4]u8 = .{ 127, 0, 0, 1 };
 const any: [4]u8 = .{ 0, 0, 0, 0 };
-const skip = !sim.compiled_in or builtin.os.tag == .windows;
+pub const skip = !sim.compiled_in or builtin.os.tag == .windows;
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const expectError = std.testing.expectError;
 
 /// Runs `body` as the one task of a fresh sim run.
-fn run(seed: u64, profile: ?sim.StreamProfile, comptime body: fn () anyerror!void) !void {
+pub fn run(seed: u64, profile: ?sim.StreamProfile, comptime body: fn () anyerror!void) !void {
     sim.begin(seed);
     defer sim.end();
     if (profile) |p| sim.setStreamProfile(p);
@@ -67,11 +67,11 @@ fn run(seed: u64, profile: ?sim.StreamProfile, comptime body: fn () anyerror!voi
     };
 }
 
-var runtime: *rt_mod.Runtime = undefined;
+pub var runtime: *rt_mod.Runtime = undefined;
 
 /// Sleeps in virtual time while TCP entries are in flight: the protocol's
 /// rule before `sim.end`.
-fn drain() !void {
+pub fn drain() !void {
     var n: u32 = 0;
     while (sim.streamEntriesInFlight() != 0) : (n += 1) {
         if (n > 1000) return error.StreamWireNeverDrained;
@@ -79,42 +79,42 @@ fn drain() !void {
     }
 }
 
-fn listen(ip: [4]u8, port: u16, opts: zio_net.IpAddress.ListenOptions) !zio_net.Server {
+pub fn listen(ip: [4]u8, port: u16, opts: zio_net.IpAddress.ListenOptions) !zio_net.Server {
     return zio_net.IpAddress.initIp4(ip, port).listen(opts);
 }
 
-fn connect(ip: [4]u8, port: u16, timeout: Timeout) !zio_net.Stream {
+pub fn connect(ip: [4]u8, port: u16, timeout: Timeout) !zio_net.Stream {
     return zio_net.IpAddress.initIp4(ip, port).connect(.{ .timeout = timeout });
 }
 
-fn portOf(s: zio_net.Server) u16 {
+pub fn portOf(s: zio_net.Server) u16 {
     return s.socket.address.ip.getPort();
 }
 
-fn localOf(fd: i32) !sim.Ip4 {
+pub fn localOf(fd: i32) !sim.Ip4 {
     var sa: os_net.sockaddr.in = undefined;
     var len: os_net.socklen_t = @sizeOf(os_net.sockaddr.in);
     try os_net.getsockname(fd, @ptrCast(&sa), &len);
     return .{ .ip = @bitCast(sa.addr), .port = std.mem.bigToNative(u16, sa.port) };
 }
 
-fn sockaddr(ip: [4]u8, port: u16) os_net.sockaddr.in {
+pub fn sockaddr(ip: [4]u8, port: u16) os_net.sockaddr.in {
     return .{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(ip) };
 }
 
-fn evOpen() !i32 {
+pub fn evOpen() !i32 {
     var op = ev.NetOpen.init(.ipv4, .stream, .ip, .{ .nonblocking = true });
     try io_common.waitForIo(&op.c);
     return op.getResult();
 }
 
-fn evClose(fd: i32) void {
+pub fn evClose(fd: i32) void {
     var op = ev.NetClose.init(fd);
     io_common.waitForIoUncancelable(&op.c);
     op.getResult() catch {};
 }
 
-fn noop(_: *ev.Loop, _: *ev.Completion) void {}
+pub fn noop(_: *ev.Loop, _: *ev.Completion) void {}
 
 // ---- The handshake and close, with no fault ----
 
@@ -836,15 +836,31 @@ test "sim: stream: one seed gives one trace, wire digest and state digest; anoth
 
 // ---- Refusals ----
 
-fn refusal(comptime name: []const u8, comptime want: []const u8, comptime profile: ?sim.StreamProfile, comptime body: fn () anyerror!void) !void {
+pub fn refusal(comptime name: []const u8, comptime want: []const u8, comptime profile: ?sim.StreamProfile, comptime body: fn () anyerror!void) !void {
     if (comptime skip) return error.SkipZigTest;
     if (!sim.isDeathChild()) return sim.expectChildPanics(name, want);
     sim.noCoreDump();
     try run(1, profile, body);
 }
 
+pub fn closeAll1(a: anytype) !void {
+    a.close();
+    try drain();
+}
+pub fn closeAll2(a: anytype, b: anytype) !void {
+    a.close();
+    b.close();
+    try drain();
+}
+pub fn closeAll3(a: anytype, b: anytype, c: anytype) !void {
+    a.close();
+    b.close();
+    c.close();
+    try drain();
+}
+
 /// A connected pair: the client is fd 100033, the accepted socket 100034.
-fn pair() !struct { zio_net.Server, zio_net.Stream, zio_net.Stream } {
+pub fn pair() !struct { zio_net.Server, zio_net.Stream, zio_net.Stream } {
     const server = try listen(lo, 0, .{});
     const c = try connect(lo, portOf(server), .none);
     const s = try server.accept(.{});
@@ -854,16 +870,20 @@ fn pair() !struct { zio_net.Server, zio_net.Stream, zio_net.Stream } {
 const refuse_bodies = struct {
     fn send() !void {
         _, const c, _ = try pair();
-        _ = try c.write("x", .none);
+        var storage: [1]os_net.iovec_const = undefined;
+        var op = ev.NetSend.init(c.socket.handle, .fromSlices(&.{"x"}, &storage), .{ .dontwait = true });
+        try io_common.waitForIo(&op.c);
     }
     fn recv() !void {
         _, const c, _ = try pair();
         var b: [4]u8 = undefined;
-        _ = try c.read(&b, .none);
+        var storage: [1]os_net.iovec = undefined;
+        var op = ev.NetRecv.init(c.socket.handle, .fromSlices(&.{&b}, &storage), .{ .peek = true });
+        try io_common.waitForIo(&op.c);
     }
     fn shutdown() !void {
         _, const c, _ = try pair();
-        try c.shutdown(.send);
+        try c.shutdown(.receive);
     }
     fn poll() !void {
         _, const c, _ = try pair();
@@ -888,7 +908,7 @@ const refuse_bodies = struct {
     }
     fn linger() !void {
         const fd = try os_net.socket(.ipv4, .stream, .ip, .{ .nonblocking = true });
-        const lg: [2]c_int = .{ 1, 0 };
+        const lg: [2]c_int = .{ 1, 5 };
         try os_net.setsockopt(fd, os_net.SOL.SOCKET, os_net.SO.LINGER, std.mem.asBytes(&lg));
     }
     fn rcvbuf() !void {
@@ -983,14 +1003,14 @@ const refuse_bodies = struct {
     }
 };
 
-test "sim: stream refuses: NetSend on a stream socket (slice 2)" {
-    try refusal("sim: stream refuses: NetSend on a stream socket", "sim: NetSend on sim stream socket 100033 is not simulated yet", null, refuse_bodies.send);
+test "sim: stream refuses: a send flag other than the defaults (dontwait)" {
+    try refusal("sim: stream refuses: a send flag other than the defaults", "sim: send flag dontwait on sim stream socket 100033 is not simulated", null, refuse_bodies.send);
 }
-test "sim: stream refuses: NetRecv on a stream socket (slice 2)" {
-    try refusal("sim: stream refuses: NetRecv on a stream socket", "sim: NetRecv on sim stream socket 100033 is not simulated yet", null, refuse_bodies.recv);
+test "sim: stream refuses: a receive flag other than the defaults (peek)" {
+    try refusal("sim: stream refuses: a receive flag other than the defaults", "sim: receive flag peek on sim stream socket 100033 is not simulated", null, refuse_bodies.recv);
 }
-test "sim: stream refuses: NetShutdown on a stream socket (slice 2)" {
-    try refusal("sim: stream refuses: NetShutdown on a stream socket", "sim: NetShutdown on sim stream socket 100033 is not simulated yet", null, refuse_bodies.shutdown);
+test "sim: stream refuses: shutdown(.receive)" {
+    try refusal("sim: stream refuses: shutdown(.receive)", "sim: shutdown(.receive) on sim stream socket 100033 is refused", null, refuse_bodies.shutdown);
 }
 test "sim: stream refuses: NetPoll on a stream socket" {
     try refusal("sim: stream refuses: NetPoll on a stream socket", "sim: NetPoll on sim stream socket 100033 is refused", null, refuse_bodies.poll);
@@ -999,13 +1019,13 @@ test "sim: stream refuses: NetSendTo on a stream socket" {
     try refusal("sim: stream refuses: NetSendTo on a stream socket", "sim: net_sendto on sim stream socket 100033 is not simulated", null, refuse_bodies.sendto);
 }
 test "sim: stream refuses: the socket layer's recv on a stream socket" {
-    try refusal("sim: stream refuses: the socket layer's recv on a stream socket", "sim: the socket layer's receive on sim stream socket 100033 is not simulated yet", null, refuse_bodies.layerRecv);
+    try refusal("sim: stream refuses: the socket layer's recv on a stream socket", "sim: the socket layer's receive on sim stream socket 100033 is not simulated (design 17.4", null, refuse_bodies.layerRecv);
 }
 test "sim: stream refuses: the socket layer's connect on a stream socket" {
     try refusal("sim: stream refuses: the socket layer's connect on a stream socket", "sim: the socket layer's connect on sim stream socket 100032", null, refuse_bodies.layerConnect);
 }
-test "sim: stream refuses: SO_LINGER before slice 2" {
-    try refusal("sim: stream refuses: SO_LINGER before slice 2", "sim: setsockopt SO_LINGER on sim stream socket 100032", null, refuse_bodies.linger);
+test "sim: stream refuses: SO_LINGER with a linger time" {
+    try refusal("sim: stream refuses: SO_LINGER with a linger time", "sim: setsockopt SO_LINGER {1, 5} on sim stream socket 100032", null, refuse_bodies.linger);
 }
 test "sim: stream refuses: SO_RCVBUF on a stream socket is misuse" {
     try refusal("sim: stream refuses: SO_RCVBUF on a stream socket is misuse", "sim: setsockopt a SOL_SOCKET option", null, refuse_bodies.rcvbuf);
@@ -1202,7 +1222,7 @@ test "sim: stream parity: the other kernel's column in a sim run (row 12 under .
 
 /// The last slice of design 17.16 that is built. A row of a later slice is
 /// pending: it has no check, so it cannot pass.
-const built_slice = 1;
+const built_slice = 2;
 
 const Status = union(enum) {
     /// Built: `check` exercises it (a scenario, or a refusal's child).
@@ -1219,6 +1239,13 @@ fn built(comptime check: fn () anyerror!void) Status {
     return .{ .built = .{ .slice = 1, .check = check } };
 }
 
+fn built2(comptime check: fn () anyerror!void) Status {
+    return .{ .built = .{ .slice = 2, .check = check } };
+}
+
+/// Slice 2's checks live beside its tests.
+const c2 = @import("sim_stream_bytes_test.zig").chk2;
+
 fn scenario(comptime profile: ?sim.StreamProfile, comptime body: fn () anyerror!void) fn () anyerror!void {
     return struct {
         fn f() anyerror!void {
@@ -1227,7 +1254,7 @@ fn scenario(comptime profile: ?sim.StreamProfile, comptime body: fn () anyerror!
     }.f;
 }
 
-fn refusedIn(comptime test_name: []const u8, comptime want: []const u8) fn () anyerror!void {
+pub fn refusedIn(comptime test_name: []const u8, comptime want: []const u8) fn () anyerror!void {
     return struct {
         fn f() anyerror!void {
             try sim.expectChildPanics(test_name, want);
@@ -1289,7 +1316,7 @@ const chk = struct {
     const boundNotListening = scenario(null, bound_not_listening.body);
     fn emptyLists() anyerror!void {
         inline for (.{ "recv", "send", "recvfrom", "sendto", "recvmsg", "sendmsg", "recvDatagram", "sendDatagram" }) |name| {
-            try sim.expectChildPanics("sim: stream refuses: an empty list: the layer's " ++ name, "sim: the socket layer's " ++ (if (comptime std.mem.eql(u8, name, "recv")) "receive" else name) ++ " on sim stream socket 100032 is not simulated yet");
+            try sim.expectChildPanics("sim: stream refuses: an empty list: the layer's " ++ name, "sim: the socket layer's " ++ (if (comptime std.mem.eql(u8, name, "recv")) "receive" else name) ++ " on sim stream socket 100032 is not simulated (design 17.4");
         }
         try sim.expectChildPanics("sim: stream refuses: an empty list: std.Io's netRead", "sim: std.Io's netRead with no buffers on sim stream socket 100033");
     }
@@ -1305,9 +1332,10 @@ const chk = struct {
         try parity.inSim(.linux);
         try parity.inSim(.macos);
     }
-    const send = refusedIn("sim: stream refuses: NetSend on a stream socket", "sim: NetSend on sim stream socket 100033 is not simulated yet");
-    const recv = refusedIn("sim: stream refuses: NetRecv on a stream socket", "sim: NetRecv on sim stream socket 100033 is not simulated yet");
-    const shutdown = refusedIn("sim: stream refuses: NetShutdown on a stream socket", "sim: NetShutdown on sim stream socket 100033 is not simulated yet");
+    const send_flags = refusedIn("sim: stream refuses: a send flag other than the defaults", "sim: send flag dontwait on sim stream socket 100033 is not simulated");
+    const recv_flags = refusedIn("sim: stream refuses: a receive flag other than the defaults", "sim: receive flag peek on sim stream socket 100033 is not simulated");
+    const shut_rd_only = refusedIn("sim: stream refuses: shutdown(.receive)", "sim: shutdown(.receive) on sim stream socket 100033 is refused");
+    const linger_time = refusedIn("sim: stream refuses: SO_LINGER with a linger time", "sim: setsockopt SO_LINGER {1, 5} on sim stream socket 100032");
     const poll = refusedIn("sim: stream refuses: NetPoll on a stream socket", "sim: NetPoll on sim stream socket 100033 is refused");
     const sendto = refusedIn("sim: stream refuses: NetSendTo on a stream socket", "sim: net_sendto on sim stream socket 100033 is not simulated");
     const ipv6 = refusedIn("sim: stream refuses: an IPv6 stream socket", "sim: socket(ipv6, stream, ip) during a sim run");
@@ -1363,9 +1391,9 @@ const op_rows = [_]Row{
     .{ .name = "net_connect", .status = built(chk.handshake_) },
     .{ .name = "net_accept", .status = built(chk.handshake_) },
     .{ .name = "net_close", .status = built(chk.handshake_) },
-    .{ .name = "net_recv", .status = .{ .pending = 2 } },
-    .{ .name = "net_send", .status = .{ .pending = 2 } },
-    .{ .name = "net_shutdown", .status = .{ .pending = 2 } },
+    .{ .name = "net_recv", .status = built2(c2.recv_) },
+    .{ .name = "net_send", .status = built2(c2.send_) },
+    .{ .name = "net_shutdown", .status = built2(c2.shutdown_) },
     .{ .name = "net_poll", .status = built(chk.poll) },
     .{ .name = "net_recvfrom", .status = built(chk.recvfrom) },
     .{ .name = "net_sendto", .status = built(chk.sendto) },
@@ -1387,7 +1415,7 @@ const vtable_rows = [_]Row{
     .{ .name = "netSocketCreatePair", .status = .{ .outside = "a kernel socketpair, AF_UNIX in practice: real descriptors, which a sim op refuses (section 3.3)" } },
     .{ .name = "netWriteFile", .status = built(chk.send_file) },
     .{ .name = "netClose", .status = built(chk.std_io_) },
-    .{ .name = "netShutdown", .status = .{ .pending = 2 } },
+    .{ .name = "netShutdown", .status = built2(c2.std_io_) },
     .{ .name = "netInterfaceNameResolve", .status = .{ .outside = "interfaces and DNS are outside sim runs (section 2)" } },
     .{ .name = "netInterfaceName", .status = .{ .outside = "interfaces and DNS are outside sim runs (section 2)" } },
     .{ .name = "netLookup", .status = .{ .outside = "interfaces and DNS are outside sim runs (section 2)" } },
@@ -1536,7 +1564,7 @@ const rule_rows = [_]RuleRow{
     .{ .id = .options, .name = "17.4 options: NODELAY, REUSEADDR, advisory REUSEPORT", .status = built(scenario(null, options.body)) },
     .{ .id = .so_error_refused, .name = "17.4 getsockopt SO_ERROR: refused", .status = built(chk.so_error) },
     .{ .id = .ipv6_unix_refused, .name = "17.4 IPv6 and AF_UNIX: refused", .status = built(chk.ipv6) },
-    .{ .id = .rst_second, .name = "17.8 RST 1: a second RST: dropped and counted", .status = .{ .pending = 2 } },
+    .{ .id = .rst_second, .name = "17.8 RST 1: a second RST: dropped and counted", .status = built2(c2.rst_second_) },
     .{ .id = .rst_dead, .name = "17.8 RST 2: dead endpoint: dropped", .status = built(chk.listener_close_) },
     .{ .id = .rst_s_prov, .name = "17.8 RST 3: live S-prov: dies, capacity freed", .status = built(chk.cancel_after) },
     .{ .id = .rst_est, .name = "17.8 RST 5: S-queued or est: reset_received (the profile's pending error is slice 2)", .status = built(chk.listener_close_) },
@@ -1545,16 +1573,16 @@ const rule_rows = [_]RuleRow{
     .{ .id = .teardown_open, .name = "17.15 teardown: an open socket never connected", .status = built(chk.teardown_open) },
     .{ .id = .teardown_listener, .name = "17.15 teardown: an empty listener", .status = built(chk.teardown_listener) },
     .{ .id = .teardown_unretired, .name = "17.15 teardown: an unretired connection (entries on the wire)", .status = built(chk.teardown_wire) },
-    .{ .id = .bytes_window_credit, .name = "17.7 admission, chunks, window, credit, conservation", .status = .{ .pending = 2 } },
-    .{ .id = .recv_lists, .name = "17.8 NetRecv list (and its harvest list)", .status = .{ .pending = 2 } },
-    .{ .id = .send_lists, .name = "17.8 NetSend list (and its harvest list)", .status = .{ .pending = 2 } },
-    .{ .id = .profiles_reset, .name = "17.8 profiles: what an RST sets, reset reported once", .status = .{ .pending = 2 } },
-    .{ .id = .shutdown, .name = "17.8 shutdown(.send) and shutdown(.both)", .status = .{ .pending = 2 } },
-    .{ .id = .close_reset_or_unread, .name = "17.8 close 1 and 2: after a reset; with unread bytes or SO_LINGER 0", .status = .{ .pending = 2 } },
-    .{ .id = .data_landing, .name = "17.8 data landing 1 to 5", .status = .{ .pending = 2 } },
-    .{ .id = .credit_landing, .name = "17.8 credit landing 1 and 2", .status = .{ .pending = 2 } },
-    .{ .id = .getpeername_bytes_readable, .name = "17.4 getpeername and bytesReadable (FIONREAD)", .status = .{ .pending = 2 } },
-    .{ .id = .window_chunking_settings, .name = "17.7 setStreamWindow and setStreamChunking", .status = .{ .pending = 2 } },
+    .{ .id = .bytes_window_credit, .name = "17.7 admission, chunks, window, credit, conservation", .status = built2(c2.bytes) },
+    .{ .id = .recv_lists, .name = "17.8 NetRecv list (and its harvest list)", .status = built2(c2.recvLists) },
+    .{ .id = .send_lists, .name = "17.8 NetSend list (and its harvest list)", .status = built2(c2.sendLists) },
+    .{ .id = .profiles_reset, .name = "17.8 profiles: the RST landing is neutral, the call reads the profile, reset reported once (slice 2's parity rows in a sim run, both columns; the open difference t-4119 is printed there)", .status = built2(c2.profiles) },
+    .{ .id = .shutdown, .name = "17.8 shutdown(.send) and shutdown(.both)", .status = built2(c2.shutdownRules) },
+    .{ .id = .close_reset_or_unread, .name = "17.8 close 1 and 2: after a reset; with unread bytes or SO_LINGER 0", .status = built2(c2.close_) },
+    .{ .id = .data_landing, .name = "17.8 data landing 1 to 5", .status = built2(c2.dataLanding) },
+    .{ .id = .credit_landing, .name = "17.8 credit landing 1 and 2", .status = built2(c2.credit_) },
+    .{ .id = .getpeername_bytes_readable, .name = "17.4 getpeername and bytesReadable (FIONREAD)", .status = built2(c2.peerAndReadable) },
+    .{ .id = .window_chunking_settings, .name = "17.7 setStreamWindow and setStreamChunking", .status = built2(c2.settings) },
     .{ .id = .tcp_rules, .name = "17.9 .tcp rules: delay, jitter, holding", .status = .{ .pending = 3 } },
     .{ .id = .fail_stream, .name = "17.9 failStream", .status = .{ .pending = 3 } },
     .{ .id = .connect_no_answer, .name = "17.9 the connect with no answer (a held SYN past its deadline)", .status = .{ .pending = 3 } },
@@ -1705,31 +1733,31 @@ const empty_lists = struct {
 };
 
 test "sim: stream refuses: an empty list: the layer's recv" {
-    try refusal("sim: stream refuses: an empty list: the layer's recv", "sim: the socket layer's receive on sim stream socket 100032 is not simulated yet", null, empty_lists.recv);
+    try refusal("sim: stream refuses: an empty list: the layer's recv", "sim: the socket layer's receive on sim stream socket 100032 is not simulated (design 17.4", null, empty_lists.recv);
 }
 test "sim: stream refuses: an empty list: the layer's send" {
-    try refusal("sim: stream refuses: an empty list: the layer's send", "sim: the socket layer's send on sim stream socket 100032 is not simulated yet", null, empty_lists.send);
+    try refusal("sim: stream refuses: an empty list: the layer's send", "sim: the socket layer's send on sim stream socket 100032 is not simulated (design 17.4", null, empty_lists.send);
 }
 test "sim: stream refuses: an empty list: the layer's recvfrom" {
-    try refusal("sim: stream refuses: an empty list: the layer's recvfrom", "sim: the socket layer's recvfrom on sim stream socket 100032 is not simulated yet", null, empty_lists.recvfrom);
+    try refusal("sim: stream refuses: an empty list: the layer's recvfrom", "sim: the socket layer's recvfrom on sim stream socket 100032 is not simulated (design 17.4", null, empty_lists.recvfrom);
 }
 test "sim: stream refuses: an empty list: the layer's sendto" {
-    try refusal("sim: stream refuses: an empty list: the layer's sendto", "sim: the socket layer's sendto on sim stream socket 100032 is not simulated yet", null, empty_lists.sendto);
+    try refusal("sim: stream refuses: an empty list: the layer's sendto", "sim: the socket layer's sendto on sim stream socket 100032 is not simulated (design 17.4", null, empty_lists.sendto);
 }
 test "sim: stream refuses: an empty list: the layer's recvmsg" {
-    try refusal("sim: stream refuses: an empty list: the layer's recvmsg", "sim: the socket layer's recvmsg on sim stream socket 100032 is not simulated yet", null, empty_lists.recvmsg);
+    try refusal("sim: stream refuses: an empty list: the layer's recvmsg", "sim: the socket layer's recvmsg on sim stream socket 100032 is not simulated (design 17.4", null, empty_lists.recvmsg);
 }
 test "sim: stream refuses: an empty list: the layer's sendmsg" {
-    try refusal("sim: stream refuses: an empty list: the layer's sendmsg", "sim: the socket layer's sendmsg on sim stream socket 100032 is not simulated yet", null, empty_lists.sendmsg);
+    try refusal("sim: stream refuses: an empty list: the layer's sendmsg", "sim: the socket layer's sendmsg on sim stream socket 100032 is not simulated (design 17.4", null, empty_lists.sendmsg);
 }
 test "sim: stream refuses: an empty list: the layer's recvDatagram" {
-    try refusal("sim: stream refuses: an empty list: the layer's recvDatagram", "sim: the socket layer's recvDatagram on sim stream socket 100032 is not simulated yet", null, empty_lists.recvDatagram);
+    try refusal("sim: stream refuses: an empty list: the layer's recvDatagram", "sim: the socket layer's recvDatagram on sim stream socket 100032 is not simulated (design 17.4", null, empty_lists.recvDatagram);
 }
 test "sim: stream refuses: an empty list: the layer's sendDatagram" {
-    try refusal("sim: stream refuses: an empty list: the layer's sendDatagram", "sim: the socket layer's sendDatagram on sim stream socket 100032 is not simulated yet", null, empty_lists.sendDatagram);
+    try refusal("sim: stream refuses: an empty list: the layer's sendDatagram", "sim: the socket layer's sendDatagram on sim stream socket 100032 is not simulated (design 17.4", null, empty_lists.sendDatagram);
 }
 test "sim: stream refuses: an empty list: std.Io's netRead" {
-    try refusal("sim: stream refuses: an empty list: std.Io's netRead", "sim: std.Io's netRead with no buffers on sim stream socket 100033 is not simulated yet", null, empty_lists.stdRead);
+    try refusal("sim: stream refuses: an empty list: std.Io's netRead", "sim: std.Io's netRead with no buffers on sim stream socket 100033 is not simulated (design 17.4", null, empty_lists.stdRead);
 }
 
 /// Finding 2: each op row's own refusal (they borrowed NetSendTo's).

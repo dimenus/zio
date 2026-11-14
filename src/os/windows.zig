@@ -1020,6 +1020,7 @@ pub const WSA_FLAG_OVERLAPPED: u32 = 1;
 
 // ioctlsocket commands
 pub const FIONBIO: i32 = -2147195266;
+pub const FIONREAD: i32 = 0x4004667f;
 
 // Address info flags
 pub const AI = packed struct(u32) {
@@ -1122,6 +1123,7 @@ pub extern "ws2_32" fn connect(s: SOCKET, name: *const sockaddr, namelen: i32) c
 pub extern "ws2_32" fn accept(s: SOCKET, addr: ?*sockaddr, addrlen: ?*i32) callconv(.winapi) SOCKET;
 
 pub extern "ws2_32" fn getsockname(s: SOCKET, name: *sockaddr, namelen: *i32) callconv(.winapi) i32;
+pub extern "ws2_32" fn getpeername(s: SOCKET, name: *sockaddr, namelen: *i32) callconv(.winapi) i32;
 
 pub extern "ws2_32" fn getsockopt(s: SOCKET, level: i32, optname: i32, optval: [*]u8, optlen: *i32) callconv(.winapi) i32;
 

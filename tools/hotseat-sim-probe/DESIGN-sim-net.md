@@ -1726,8 +1726,11 @@ not ACKed separately.
   carries the same window, so a sender parked when its peer read and then
   closed is woken, sends, and meets the RST of a closed endpoint. It is
   discarded only by `failStream` on the receiver (17.9), or when the
-  receiver's own direction toward the sender is terminal at departure
-  time; then nothing leaves (`stale_credit`).
+  direction it credits is terminal at departure time (its sender is dead,
+  or has received a reset); then nothing leaves (`stale_credit`).
+  (Sitting 29's first text named the receiver's own direction, which a
+  closed receiver always makes terminal: that contradicted the line
+  above.)
 - When a credit lands, `credited = max(credited, count)`, which is
   idempotent. If room appears, a parked send is woken.
 - Held credits of one direction coalesce to the newest. That is

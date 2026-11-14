@@ -204,7 +204,11 @@ pub const ShutdownError = error{
 
 pub fn shutdown(fd: fd_t, how: ShutdownHow) ShutdownError!void {
     if (comptime sim_layer) {
-        if (sim.isStreamFd(fd)) sim.refuseStream("shutdown", fd);
+        if (sim.isStreamFd(fd)) return sim.streamShutdown(fd, switch (how) {
+            .receive => .receive,
+            .send => .send,
+            .both => .both,
+        });
         // An unconnected UDP socket: ENOTCONN, as Linux answers.
         if (sim.isDgramFd(fd)) return error.SocketUnconnected;
         sim.refuseSimFd(@src(), fd);
@@ -812,6 +816,70 @@ pub fn getsockname(fd: fd_t, addr: *sockaddr, addr_len: *socklen_t) GetSockNameE
             const rc = posix.system.getsockname(fd, addr, addr_len);
             if (rc != 0) {
                 return unexpectedError(posix.errno(rc));
+            }
+        },
+    }
+}
+
+pub const GetPeerNameError = error{ SocketUnconnected, Unexpected };
+
+/// `getpeername`: the connected peer's address. ENOTCONN, and EINVAL (macOS
+/// answers it after a reset, Linux ENOTCONN: design 17.13 row 9), are both
+/// `SocketUnconnected` in every build, so a caller sees one answer. Under
+/// sim, a stream endpoint that is established and has not received a
+/// reset has a peer; every other stream socket is `SocketUnconnected`.
+pub fn getpeername(fd: fd_t, addr: *sockaddr, addr_len: *socklen_t) GetPeerNameError!void {
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return writeSimAddr(sim.streamPeer(fd) orelse return error.SocketUnconnected, addr, addr_len);
+        if (sim.isDgramFd(fd)) sim.panic("sim: getpeername on sim datagram socket {d} is not simulated (no sim datagram socket is connected)", .{fd});
+        sim.refuseSimFd(@src(), fd);
+    }
+    switch (builtin.os.tag) {
+        .windows => {
+            const rc = windows.getpeername(fd, @ptrCast(addr), @ptrCast(addr_len));
+            if (rc != 0) {
+                const err = windows.WSAGetLastError();
+                if (err == .ENOTCONN) return error.SocketUnconnected;
+                return unexpectedError(err);
+            }
+        },
+        else => {
+            const rc = posix.system.getpeername(fd, addr, addr_len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {},
+                .NOTCONN, .INVAL => return error.SocketUnconnected,
+                else => |err| return unexpectedError(err),
+            }
+        },
+    }
+}
+
+pub const BytesReadableError = error{Unexpected};
+
+/// std's `T` has FIONREAD on Linux and the BSDs, not on Darwin, whose value
+/// is the BSDs' `_IOR('f', 127, int)`.
+const fionread: u32 = if (builtin.os.tag != .windows and @hasDecl(posix.system.T, "FIONREAD")) posix.system.T.FIONREAD else 0x4004667f;
+
+/// `FIONREAD`: the bytes a stream socket can read now without waiting.
+/// Under sim, a stream endpoint's landed, unread bytes (design 17.4).
+pub fn bytesReadable(fd: fd_t) BytesReadableError!usize {
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return sim.streamBytesReadable(fd);
+        if (sim.isDgramFd(fd)) sim.panic("sim: bytesReadable (FIONREAD) on sim datagram socket {d} is not simulated", .{fd});
+        sim.refuseSimFd(@src(), fd);
+    }
+    switch (builtin.os.tag) {
+        .windows => {
+            var n: u32 = 0;
+            if (windows.ioctlsocket(fd, windows.FIONREAD, &n) != 0) return unexpectedError(windows.WSAGetLastError());
+            return n;
+        },
+        else => {
+            var n: c_int = 0;
+            const rc = posix.system.ioctl(fd, @bitCast(@as(u32, fionread)), @intFromPtr(&n));
+            switch (posix.errno(rc)) {
+                .SUCCESS => return @intCast(n),
+                else => |err| return unexpectedError(err),
             }
         },
     }
