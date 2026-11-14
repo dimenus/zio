@@ -521,9 +521,21 @@ fn digestNet(h: *std.hash.Wyhash) void {
     h.update(&b);
     std.mem.writeInt(u64, &b, dropped_no_socket, .little);
     h.update(&b);
+    // A datagram still on the wire has not reached the wire digest, so its
+    // flow is hashed here: two runs that differ only in where it goes have
+    // different futures. A socket's queue needs no such entry: what landed
+    // and in what order is in the wire digest, and the queue is that order
+    // less the `meta_len` already received.
     for (wire.items) |w| {
-        std.mem.writeInt(u64, &b, w.due_at, .little);
-        h.update(&b);
+        var e: [32]u8 = undefined;
+        std.mem.writeInt(u64, e[0..8], w.due_at, .little);
+        std.mem.writeInt(u64, e[8..16], w.seq, .little);
+        @memcpy(e[16..20], &w.from.ip);
+        std.mem.writeInt(u16, e[20..22], w.from.port, .little);
+        @memcpy(e[22..26], &w.to.ip);
+        std.mem.writeInt(u16, e[26..28], w.to.port, .little);
+        std.mem.writeInt(u32, e[28..32], @intCast(w.bytes.len), .little);
+        h.update(&e);
         h.update(w.bytes);
     }
     for (dgrams) |s| {
@@ -5144,6 +5156,70 @@ test "sim: dgram trace: ten fresh processes with the heap moved give one transcr
     const t_at = (std.mem.indexOf(u8, first.?, "transcript=") orelse return error.NoTranscript) + "transcript=".len;
     try std.testing.expectEqual(@as(usize, 156), first.?.len - t_at);
     std.debug.print("10 children: {s}\n", .{first.?[0..@min(first.?.len, 90)]});
+}
+
+const dg_inflight = struct {
+    const Variant = enum { base, other_port, other_ip, other_source, queue_swapped };
+    var variant: Variant = .base;
+    var state: u64 = undefined;
+    var wire_d: u64 = undefined;
+    var trace: u64 = undefined;
+
+    /// A wildcard receiver on 7000 and a sender on wildcard:7100. Two
+    /// datagrams land in the receiver's queue first, then one more is sent
+    /// and the digests are read while it is still on the wire. Each variant
+    /// changes one thing and keeps every length, time and payload byte.
+    fn body() !void {
+        const rx = try dg.open();
+        try dg.bindTo(rx, dg.addr(0, 0, 0, 0, 7000));
+        _ = try dg.open(); // a second socket on 7001 would hide a bad port
+        const tx = try dg.open();
+        try dg.bindTo(tx, dg.addr(0, 0, 0, 0, 7100));
+        const first: []const u8 = if (variant == .queue_swapped) "b" else "a";
+        const second: []const u8 = if (variant == .queue_swapped) "a" else "b";
+        _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 7000), null, first);
+        _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 7000), null, second);
+        try dg.settle();
+        const to = switch (variant) {
+            .other_port => dg.addr(127, 0, 0, 1, 7001),
+            .other_ip => dg.addr(127, 0, 0, 2, 7000),
+            else => dg.addr(127, 0, 0, 1, 7000),
+        };
+        const from: ?[4]u8 = if (variant == .other_source) .{ 127, 0, 0, 3 } else null;
+        _ = try dg.sendFrom(tx, to, from, "x");
+        state = stateDigest();
+        wire_d = wireDigest();
+        trace = traceHash();
+        try dg.settle();
+    }
+
+    fn run(v: Variant) !struct { state: u64, wire: u64, trace: u64 } {
+        variant = v;
+        try dg.run(4, body);
+        return .{ .state = state, .wire = wire_d, .trace = trace };
+    }
+};
+
+test "sim: dgram trace: the state digest sees where a datagram still on the wire goes and where it came from" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    const base = try dg_inflight.run(.base);
+    try std.testing.expectEqual(base, try dg_inflight.run(.base));
+    var blind: usize = 0;
+    inline for (.{ .other_port, .other_ip, .other_source, .queue_swapped }) |v| {
+        const o = try dg_inflight.run(v);
+        // Nothing has landed differently yet: the wire digest and the trace
+        // cannot tell the runs apart, so the state digest must.
+        if (v != .queue_swapped) {
+            try std.testing.expectEqual(base.wire, o.wire);
+            try std.testing.expectEqual(base.trace, o.trace);
+        }
+        if (base.state == o.state) {
+            std.debug.print("variant {s}: state digest {x:0>16}, the same as the base run's\n", .{ @tagName(v), o.state });
+            blind += 1;
+        }
+    }
+    if (blind != 0) return error.StateDigestBlind;
+    std.debug.print("base run, one datagram on the wire: state digest {x:0>16}\n", .{base.state});
 }
 
 test {
