@@ -9606,6 +9606,7 @@ test {
     _ = @import("sim_op_model_test.zig");
     _ = @import("sim_stream_test.zig");
     _ = @import("sim_stream_bytes_test.zig");
+    _ = @import("sim_stream_op_model_test.zig");
 }
 
 // ---- Phase 1: the native-exit refusals, one test per class of exit ----

@@ -1009,8 +1009,8 @@ the mutants in its commits.
     `tcpprobe4.c`); `failStream` wakes both ops and the harvest order
     picks the one that gets the error (11). Rows 39 to 41 and the probe
     are in `zio-sim29/probe4/` beside report 29.
-  - **Slice 2 is built, except its op model (sitting 29: 6232b5f, and
-    4d98218 for the mutants' tests).** Bytes, chunks (hashed by default), the window and
+  - **Slice 2 is built, with its op model (sittings 29 and 30), and waits
+    for the grader.** Bytes, chunks (hashed by default), the window and
     paced credit, FIN, RST with data, shutdown `.send` and `.both`, close
     with unread bytes or SO_LINGER {1, 0}, the profiles' send and receive
     rules, the local reset, the window release, `getpeername`,
@@ -1018,47 +1018,46 @@ the mutants in its commits.
     ops, the socket layer, zio.net and std.Io. Protocol: the comment above
     `pub const StreamProfile` in `src/sim.zig`. Tests:
     `src/sim_stream_bytes_test.zig` (`sim: stream bytes`, its refusals,
-    and `sim: stream parity: slice 2's rows`); the surface table is at
-    `built_slice = 2`, with only slices 3 and 4 pending. Mutants:
-    `mut/29-s2.json` beside report 29.
-  - **Stopped at a design question, t-4119 (open, the owner's).** The
-    profiles follow the probes' blocking C calls. Through zio on real
-    sockets, a send that is parked when an RST or the peer's `.both`
-    arrives gives another answer: on macOS (kqueue) rows 23, 25 and 41
-    end `ECONNRESET` and the reads then give 0, because zio's kqueue
-    backend ends the op with `SO_ERROR`, which also clears it; on Linux
-    (epoll and io_uring) row 41 ends `EPIPE` about 215 ms after the
-    receiver's SHUT_RDWR, where the probe's blocked send stayed blocked
-    (not understood). The sim keeps the design's rule. The parity table
-    asserts both answers for those four cells (`macos_zio`,
-    `linux_zio`) and prints them each run.
+    and `sim: stream parity: slice 2's rows`), and the op model
+    `src/sim_stream_op_model_test.zig` (`sim: stream op model`); the
+    surface table is at `built_slice = 2`, with only slices 3 and 4
+    pending. Commits: 6232b5f and 4d98218 (sitting 29); 59ebd24, 879fc38,
+    7c72c39 and the op model's commit (sitting 30). Mutants:
+    `mut/29-s2.json` beside report 29, `mut/30-*.json` beside report 30.
+  - **Sitting 30, in short.**
+    - The grader's two survivors: the unread buffer's compaction has a
+      test; `landCredit`'s `@max` was equivalent (credits land in order,
+      with growing counts) and is now an invariant panic (59ebd24).
+    - The outside review of slice 2 (`gpt-simnet13.md`): its P2 false
+      refusal is fixed (`.both` reserves only what leaves now,
+      `creditPlan`), and its three test gaps have tests (879fc38).
+    - **t-4119 is ruled (7c72c39):** the sim shows what a zio program sees
+      on the kernel; the parity table, through zio, is the oracle; the C
+      probes explain the kernel. A send parked when a reset arrives takes
+      it (17.8, line 3a), because zio's readiness backends end a parked op
+      with `SO_ERROR`. Rows 23, 25 and 41 changed under `.macos`; rows 41g,
+      42, 43 and 44 are new. Linux row 41 was measured (`r41x.c`, 17.13):
+      it depends on a gap smaller than one segment in the window; the sim
+      has no such gap, and row 41g is a fidelity limit (17.14).
+    - **The stream op model** (17.15 item 2, without faults): below.
   - **Next, in this order:**
-    1. The owner's ruling on t-4119. If the profiles are to follow zio
-       on the kernel, change 17.8's `.macos` parked-send rule (and decide
-       what Linux row 41 is), then make the four cells one column.
-    2. **The stream op model** (17.15 item 2), slice 2's missing gate:
-       random sends, receives, shutdowns, closes, window and chunk
-       changes and cancels on several connections, against a reference
-       that holds each direction's byte list and every conservation term
-       and implements 17.8's lists itself; per profile and with no
-       profile (the panic points); seeds 1 to 16; counts per op kind,
-       with a run where a kind never ran not counted. Shape:
-       `src/sim_op_model_test.zig`.
-    3. Slice 3 (17.16): `.tcp` rules with holding, `failStream`, the
-       connect with no answer.
+    1. The grader's acceptance of slice 2.
+    2. Slice 3 (17.16): `.tcp` rules with holding, `failStream`, the
+       connect with no answer; the op model then gains faults (17.15 item
+       2's required cases that need them).
+  - **Open, filed:** t-4126 (macOS row 41g's answer varied in 1 run of 3),
+    t-4127 (what stays open after the ruling: whether zio's readiness
+    backends' `SO_ERROR` read is a defect, the parked cells no row
+    measures, the gap as a fidelity limit). Queued for the sim seat, not
+    started: t-4096 (refuse a zero-room receive, decided yes), t-4106,
+    t-4115, t-4117.
   - **What I would change, with what I know now:**
-    - Measure every profile row through zio's public API on each
-      backend, not only in C. The C probe answers "what does the
-      kernel do"; the sim's users ask "what does zio give me". They
-      differ where a backend reads `SO_ERROR` (t-4119).
+    - The parity table prints every row's answer now; a row that passes
+      silently was how a measured difference could hide.
     - The surface table's checks run whole scenarios, so the table run
       takes about 9 s; a row that names its scenario test instead of
       running it again would be cheaper. Not done: running it is what
       proves the row.
-  - Open for the sim seat, queued, not started: t-4096 (refuse a
-    zero-room receive, decided yes), t-4106 (the spawn windows), t-4115
-    (the bind cells slice 1 refuses as not measured), t-4117 (the
-    datagram and pipe wire times are still unchecked additions).
 - **For hotseat, not zio:** ENet's receive returns 0 for an empty datagram,
   the same as would-block, so ENet's receive loop stops there for that
   service call. Later datagrams wait for the next call.
@@ -1119,8 +1118,19 @@ the mutants in its commits.
 - **Slice 2's tests:** the filter `sim: stream bytes` (its refusals are
   under `sim: stream refuses`). The parity rows of slice 2 are `sim: stream
   parity: slice 2's rows`, in both builds; on Linux run them in an
-  io_uring and an epoll binary, as slice 1's. Each row prints a line for
-  an open difference (t-4119), naming which column that run checks.
+  io_uring and an epoll binary, as slice 1's. Every row prints what it
+  got (`parity row N, <kernel> column, sim|kernel: ...`); a row with no
+  column for this kernel, or not modelled by the sim (41g), prints that
+  it was not run.
+- **The stream op model:** the filter `sim: stream op model` (about 40 s).
+  The parent runs seeds 1 to 16 in a child per profile, twice (the digest
+  lines must be equal), then one child per seed with no profile, which
+  must panic where the profiled runs' shadow predicted. Its header
+  comment says what it generates and checks. To see a child's counts:
+  the test binary with `ZIO_SIM_DEATH_CHILD=1`,
+  `ZIO_STREAM_MODEL_PROFILE=linux|macos|none` and `TEST_FILTER` set to
+  the child's name; `ZIO_STREAM_MODEL_SEED=S` replays one seed and
+  `ZIO_STREAM_MODEL_STEPS=N` sets the length (either skips the floors).
 - **The surface table needs the filter `sim: stream`:** its refusal rows
   run other tests in child processes, and a build filtered to the table
   alone does not contain them. To run the table by itself, build with
@@ -1312,6 +1322,14 @@ the mutants in its commits.
 - **The structural test accepts `sim.isSimFd(fd)`, or `sim.isDgramFd(fd)`
   with the refusal,** as a sim branch, not `sim.isStreamFd(fd)` alone. A
   new layer function with a stream branch also needs a datagram branch.
+- **A count written before it is counted is a guess.** 7c72c39's message
+  gives `src/sim.zig` +57/-6 and the test file +178/-42; `git diff
+  --numstat` gives +55/-8 and +169/-51. Run the command, then write the
+  number.
+- **A parity row that waits a fixed time can sit on a kernel race.** Row
+  41's 200 ms wait was 5 ms under Linux's RTO and about 50 ms before the
+  persist timer filled the window's last gap, so it measured a different
+  state from the C probe (sitting 30). Before trusting a wait, vary it.
 - **Tool rules for agents here:** a recursive `rm` of a path built from a
   variable is refused by a hook; make a new directory instead. Restoring a
   file with `git checkout <file>` is refused too, and would drop uncommitted
@@ -1320,9 +1338,9 @@ the mutants in its commits.
 
 ## 17. The stream track: simulated TCP on loopback (design check, revision 3)
 
-Status: **slices 1 and 2 of 17.16 are built**, except slice 2's op model
-(slice 1: d613fd1, 35972fb; slice 2: 6232b5f; section 15 has the state
-and the open question t-4119). Slices 3 and 4 are design only. Revision 1 was
+Status: **slices 1 and 2 of 17.16 are built**, slice 2 with its op model
+(slice 1: d613fd1, 35972fb; slice 2: 6232b5f and sitting 30; section 15
+has the state). t-4119 is ruled (17.13). Slices 3 and 4 are design only. Revision 1 was
 6e854fc, revision 2 was 2d987f7, and revision 3 is sitting 25. It answers
 the second outside review, `gpt-simnet10.md`, and the grader's rulings on
 report 24. The third outside review, `gpt-simnet11.md`, is answered in
@@ -2457,6 +2475,16 @@ case, which the sim gets right.
      - a cancel at each handshake phase;
      - a UDP flow and a TCP connection on one address pair;
      - each chunk mode, with `.fixed = 1` at the entry limit.
+   - **Built for slice 2 (sitting 30):** `src/sim_stream_op_model_test.zig`,
+     without faults; its header comment has what it generates and checks.
+     Of the required cases it reaches, with a count that must not be 0: a
+     send parked when an RST lands, `.both` with a parked receive, with
+     unread bytes (`.macos`'s release) and with late data (`.linux`'s local
+     reset), a credit that lands after its direction is terminal, and each
+     chunk mode. Left for slice 3 or for other tests: everything with a
+     fault or a hold, `failStream`, the handshake cases (slice 1's tests),
+     `.fixed = 1` at the entry limit (a bytes test), and a UDP flow beside
+     a connection.
 3. **Teardown, apart from TIME_WAIT (finding 14).** At `sim.end`,
    **before** cleanup, the check fails, listing what remains, if any of
    these is left:
