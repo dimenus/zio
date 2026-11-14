@@ -4,8 +4,8 @@ Status: **phase 1 (section 12) is built, and four rounds of outside review
 of it are closed (section 15). Section 15 is the acceptance record of phase
 1. Phase 2 (faults and replay) is built and accepted at 4aeb580 (section
 15); its API and rules are the comment above `pub const Endpoint` in
-`src/sim.zig`.** **The stream track (TCP) is designed in section 17, not
-built.**
+`src/sim.zig`.** **The stream track (TCP) is designed in section 17;
+slices 1 to 3 are built (section 15), slice 4 (the users) is next.**
 
 Revision 2 (dd55885) was reviewed by another vendor's model. This revision
 takes the decisions made after that review. Section 13 lists what changed
@@ -536,6 +536,11 @@ The scripts the gates below use are beside them, in `zio-sim6-tools/` there
   imports); `src/sim_exits_test.zig` fails the build when one is missing. Its
   rules and hand lists are in its header comment; the cost against upstream is
   in ed2ecee's message.
+- **A spin at one virtual instant panics (t-4133, 69eac70):** more than
+  `sim.default_instant_poll_limit` passes of `Loop.poll` while the clock
+  stands still. Design: section 16; the rule: the comment above
+  `default_instant_poll_limit` in `src/sim.zig`; tests: the filter `sim:
+  spin`. 69eac70's message has two wrong lines, corrected in 02ae53f's.
 - **The C bridge tests (7833cee):** `src/enet_bridge_test.c` is an
   ENet-shaped bridge over the layer (unix.c of cgutman/enet at aca87840b57f,
   for the socket functions of section 3.2) with C tests;
@@ -1066,22 +1071,32 @@ the mutants in its commits.
     - t-4096 (75bb57e): a receive of 0 bytes on a sim pipe is refused, as
       on a stream socket. One pipe test changed: its 0-room half is a
       death test now (the commit says why).
+  - **Slice 3 is built (sitting 32).** 07825f6 decided what 17.9 left
+    open (17.9a); the slice is the commit after it. `.tcp` fault rules
+    (delay, jitter, holding by partition and silence, release),
+    `failStream`, and the connect with no answer. Protocol: the faults
+    paragraph of the comment above `StreamProfile`, and `failStream`'s doc
+    comment, in `src/sim.zig`. Tests: `src/sim_stream_fault_test.zig`
+    (filter `sim: stream faults`; refusals `sim: stream faults refuse`;
+    sensitivity `sim: stream faults: sensitivity`; parity `sim: stream
+    parity: slice 3's rows`, in both builds); the op model's seeds 17 to
+    32; the surface table at `built_slice = 3`, with only slice 4's row
+    pending. Mutants and gates: report 32 and the slice's commit.
+  - **Sitting 32, in short.** t-4133 (69eac70), t-4132 (02ae53f), the
+    design fixes (07825f6), slice 3. Upstream (`origin/main` 5357759) had
+    not moved.
   - **Next, in this order:**
-    1. Slice 3 (17.16): `.tcp` rules with holding, `failStream`, the
-       connect with no answer; the op model then gains faults (17.15 item
-       2's required cases that need them). Its surface rows are the four
-       `.pending = 3` rows (`synack_failed_client`, `tcp_rules`,
-       `fail_stream`, `connect_no_answer`); the fifth pending row is slice
-       4's. Not started in sitting 31. Note for the next seat: sitting
-       31's brief called slice 3 "options and addresses"; 17.16 says the
-       above, and the options and addresses were slice 1's. Ask the
-       grader which is meant before building.
+    1. Slice 4 (17.16): the users. starh2's `dst-conn` accept step;
+       hotseat's tests (17.15 item 7), after t-4110 and t-4111; then an
+       outside review. t-4139 asks what hotseat sees through std.Io for
+       `failStream(.timed_out)`.
   - **Open, filed:** t-4126 (macOS row 41g's answer varied in 1 run of 3),
     t-4127 (what stays open after the ruling: whether zio's readiness
     backends' `SO_ERROR` read is a defect, the parked cells no row
-    measures, the gap as a fidelity limit), t-4132 (the stream tests'
-    other spawn sites, error paths only). Queued for the sim seat, not
-    started: t-4106, t-4115, t-4117. Closed in sitting 31: t-4096, t-4130.
+    measures, the gap as a fidelity limit), t-4139 (std.Io maps
+    `ConnectionTimedOut` to `ConnectionResetByPeer`). Queued for the sim
+    seat, not started: t-4106, t-4115, t-4117. Closed in sitting 32:
+    t-4132, t-4133.
   - **What I would change, with what I know now:**
     - The parity table prints every row's answer now; a row that passes
       silently was how a measured difference could hide.
@@ -1153,10 +1168,18 @@ the mutants in its commits.
   got (`parity row N, <kernel> column, sim|kernel: ...`); a row with no
   column for this kernel, or not modelled by the sim (41g), prints that
   it was not run.
-- **The stream op model:** the filter `sim: stream op model` (about 40 s).
-  The parent runs seeds 1 to 16 in a child per profile, twice (the digest
-  lines must be equal), then one child per seed with no profile, which
-  must panic where the profiled runs' shadow predicted. Its header
+- **Slice 3's tests:** the filter `sim: stream faults`. A test that sets
+  a `.tcp` partition or silence clears it before it drains: a held entry
+  is released only by a clear.
+- **A run that spins at one virtual instant** panics past
+  `sim.default_instant_poll_limit` (t-4133). A test whose correct run
+  needs more raises it with `sim.setInstantPollLimit`, and says why.
+- **The stream op model:** the filter `sim: stream op model` (about a
+  minute and a half). The parent runs seeds 1 to 32 in a child per
+  profile, twice (the digest lines must be equal), then one child per
+  seed with no profile, which must panic where the profiled runs' shadow
+  predicted. Seeds 1 to 16 have no fault step: their digest lines are
+  the check that a stream run with no fault did not change. Its header
   comment says what it generates and checks. A replay: set
   `ZIO_STREAM_MODEL_SEED=S`, `ZIO_STREAM_MODEL_STEPS=N` or
   `ZIO_STREAM_MODEL_PROFILE=linux|macos|none` for `zig build test`; the
@@ -1374,6 +1397,22 @@ the mutants in its commits.
   file with `git checkout <file>` is refused too, and would drop uncommitted
   work: let the mutant runner restore it. In zsh, a word that starts with
   `=` (`echo ====`) is a command lookup and fails; quote it.
+- **A heredoc whose marker is not quoted runs its backticks.** `cat <<EOF`
+  around a commit message with `` `code` `` in it runs each one as a
+  command; a fix script failed that way and a commit went in with its
+  draft message (69eac70; corrected in 02ae53f's message, as commits are
+  never amended). Write `<<'EOF'`.
+- **Python scripts run through `uv run --no-project`** (a hook refuses
+  `python3 script.py`; inline `python3 - <<'EOF'` is allowed). The mutant
+  runner is `uv run --no-project python -I run.py <list> <out>`.
+- **A poll stops at the next landing, so a count of polls is not a
+  time.** A release can put hundreds of entries on the wire 1 µs apart;
+  the op model's connect waited 100 polls and failed with nothing wrong
+  in the sim (sitting 32). Bound a wait by virtual time.
+- **A held list is in sequence order, not arrival order.** An entry held
+  at its landing is older than one sent later and held at its send. The
+  op model's first copy appended, and the new landing-time check found
+  it at seed 19.
 
 ## 16. A run that spins while virtual time stands still (t-4133)
 
@@ -2666,6 +2705,17 @@ case, which the sim gets right.
      fault or a hold, `failStream`, the handshake cases (slice 1's tests),
      `.fixed = 1` at the entry limit (a bytes test), and a UDP flow beside
      a connection.
+   - **Built for slice 3 (sitting 32):** the same model, seeds 17 to 32,
+     with fault steps (a partition, a silence, a delay with jitter, a
+     clear, `failStream`); seeds 1 to 16 are slice 2's mix, unchanged.
+     It now also checks every landing time on the wire after every step.
+     Of the required cases it reaches, each with its own count: a reverse
+     partition that stalls a sender, a reset with held data, `failStream`
+     with entries in flight both ways, and a partition and a delay on one
+     entry. The handshake cases with a fault (a SYN held past its
+     deadline, then released; the connect with no answer) are scenario
+     tests (17.9a, point 15), as is a UDP flow beside a connection and a
+     delayed RST after its fd number was reused.
 3. **Teardown, apart from TIME_WAIT (finding 14).** At `sim.end`,
    **before** cleanup, the check fails, listing what remains, if any of
    these is left:
