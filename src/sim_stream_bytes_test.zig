@@ -1481,6 +1481,53 @@ test "sim: stream bytes: under .macos, shutdown(.both) whose window release join
     try run(1, .macos, both_at_limit.body);
 }
 
+/// `creditPlan`'s `.stale`: a window release whose direction is terminal
+/// sends no credit, so `.both` reserves only its FIN. Its only observable
+/// effect is the reservation: `departCredit` decides stale again by itself,
+/// so the wire, the trace, the digests, retirement and `stale_credit` are
+/// the same if `creditPlan` says `.departs` there. One more reserved entry
+/// shows only at the limit: A's sender closed after its 4 bytes landed (so
+/// A's direction is terminal), and B fills the wire to one short of
+/// `max_tcp_entries`. The FIN fits; a FIN and a credit would not.
+const both_stale_at_limit = struct {
+    fn body() !void {
+        const l0 = try t1.listen(lo, 0, .{});
+        const ca = try t1.connect(lo, t1.portOf(l0), .none);
+        const sa = try l0.accept(.{});
+        const cb = try t1.connect(lo, t1.portOf(l0), .none);
+        const sb = try l0.accept(.{});
+        sim.setStreamChunking(ca.socket.handle, .off);
+        try expectEqual(@as(usize, 4), try ca.write("abcd", .none));
+        ca.close();
+        // The bytes and the FIN land; nothing of A is on the wire after.
+        try rt_mod.sleep(.fromMicroseconds(L / us + 10));
+        try expectEqual(@as(usize, 4), sim.testStreamEnd(sa.socket.handle).unread);
+        try expectEqual(@as(usize, 0), sim.streamEntriesInFlight());
+        sim.setStreamChunking(cb.socket.handle, .{ .fixed = 1 });
+        try expectEqual(@as(usize, 65535), try cb.write(prow.big[0..65535], .none));
+        try expectEqual(@as(usize, sim.max_tcp_entries - 1), sim.streamEntriesInFlight());
+        const stale0 = sim.streamStats().stale_credit;
+        // The FIN leaves; the release's credit is stale and does not.
+        try sa.shutdown(.both);
+        try expectEqual(@as(usize, sim.max_tcp_entries), sim.streamEntriesInFlight());
+        try expectEqual(stale0 + 1, sim.streamStats().stale_credit);
+        const d = try dir(true);
+        try expectEqual(@as(u64, 4), d.reclaimed);
+        try expectEqual(@as(u64, 4), d.discarded[@backingInt(sim.Discard.both_discard)]);
+        try expect(!d.owed);
+        try checkConserved();
+        try rt_mod.sleep(.fromMicroseconds(L / us + 10));
+        for ([_]zio_net.Stream{ sa, cb, sb }) |x| x.close();
+        l0.close();
+        try drain();
+    }
+};
+
+test "sim: stream bytes: under .macos, shutdown(.both) whose window release is stale (its sender closed) reserves only the FIN, on a wire one short of max_tcp_entries" {
+    if (comptime skip) return error.SkipZigTest;
+    try run(1, .macos, both_stale_at_limit.body);
+}
+
 /// P2 [PREMISE]: a credit owed when its receiver closes still departs, and a
 /// sender that is alive and parked takes the room it opens, before the RST
 /// that its next bytes draw. The window is 2. The receiver reads twice, 10

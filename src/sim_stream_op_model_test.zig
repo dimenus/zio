@@ -280,6 +280,9 @@ const M = struct {
     var next_serial: u32 = 1;
     var model_clock: u64 = 0;
     var c: Counts = .{};
+    /// The run's `sim.streamStats()` as the model counts it: compared,
+    /// field by field, after every step (`checkStats`).
+    var st: sim.StreamStats = .{};
     var in_poll: bool = false;
     var batch: usize = 0;
     /// The no-profile shadow's first point: the step and the row text.
@@ -437,6 +440,7 @@ fn departCredit(ci: u8, data: u1) void {
     if (dirTerminal(k, data)) {
         d.owed_at = null;
         M.c.stale_credits += 1;
+        M.st.stale_credit += 1;
         return;
     }
     d.owed_at = null;
@@ -505,6 +509,7 @@ fn admit(ci: u8, side: u1, bytes: []const u8) void {
 
 fn discard(ci: u8, data: u1, cause: sim.Discard, n: usize) void {
     M.conns[ci].dirs[data].discarded[@backingInt(cause)] += n;
+    M.st.discarded[@backingInt(cause)] += n;
 }
 
 fn discardUnread(ci: u8, side: u1, cause: sim.Discard) usize {
@@ -552,8 +557,12 @@ fn land(w: MEntry) void {
     switch (w.kind) {
         .data => {
             const n = w.bytes.len;
-            if (x.reset_received) return discard(ci, w.dir, .after_reset, n);
+            if (x.reset_received) {
+                M.st.dropped_after_reset += 1;
+                return discard(ci, w.dir, .after_reset, n);
+            }
             if (!x.open) {
+                M.st.dropped_dead += 1;
                 answerRst(ci, at);
                 return discard(ci, w.dir, .closed_receiver, n);
             }
@@ -566,21 +575,39 @@ fn land(w: MEntry) void {
                     x.fin_before_reset = false;
                     x.reset_parked_send = parkedSendSerial(x);
                     M.c.local_resets += 1;
+                    M.st.local_resets += 1;
                     wakeRecv(ci, at, .local_reset);
                     wakeSend(ci, at, .local_reset);
                 }
                 return;
             }
             x.unread.appendSlice(M.arena.allocator(), w.bytes) catch @panic("oom");
+            M.st.chunks_landed += 1;
             wakeRecv(ci, at, .data);
         },
         .fin => {
-            if (!x.open or x.reset_received) return;
+            // Dead first, then reset (design 17.8, the FIN landing list).
+            if (!x.open) {
+                M.st.dropped_dead += 1;
+                return;
+            }
+            if (x.reset_received) {
+                M.st.dropped_after_reset += 1;
+                return;
+            }
             x.fin_in = true;
             wakeRecv(ci, at, .fin);
         },
         .rst => {
-            if (x.reset_received or !x.open) return;
+            // Reset first, then dead (design 17.8, the RST landing list).
+            if (x.reset_received) {
+                M.st.dropped_after_reset += 1;
+                return;
+            }
+            if (!x.open) {
+                M.st.dropped_dead += 1;
+                return;
+            }
             x.reset_received = true;
             x.fin_before_reset = x.fin_in;
             x.reset_parked_send = parkedSendSerial(x);
@@ -592,12 +619,14 @@ fn land(w: MEntry) void {
         .credit => {
             if (dirTerminal(k, at)) {
                 M.c.stale_credits += 1;
+                M.st.stale_credit += 1;
                 return;
             }
             const d = &k.dirs[at];
             if (w.count <= d.credited) fail("the model's own credit of {d} on connection {d} landed after one of {d}", .{ w.count, k.id, d.credited });
             d.credited = w.count;
             M.c.credits_landed += 1;
+            M.st.credits_landed += 1;
             if (d.room() > 0) wakeSend(ci, at, .credit);
         },
     }
@@ -1240,6 +1269,7 @@ fn checkState() void {
             if (sim.testConnEnd(k.id, false) != null) fail("connection {d} is not retired, and the model has nothing of it left", .{k.id});
             for (&k.ends) |*e| e.unread.deinit(M.arena.allocator());
             k.used = false;
+            M.st.retired += 1;
             continue;
         }
         for (k.dirs) |d| in_flight += @intFromBool(d.owed_at != null);
@@ -1271,6 +1301,19 @@ fn checkState() void {
     }
     const sim_n = sim.streamEntriesInFlight();
     if (sim_n != in_flight) fail("TCP entries in flight: sim {d}, model {d}", .{ sim_n, in_flight });
+    checkStats();
+}
+
+/// Every field of `sim.streamStats()` against the model's count, by
+/// reflection: a field added to `StreamStats` is compared from its first
+/// run, and fails here until the model counts it. The handshake's fields
+/// (`syn_dropped_dead`, `refused`) stay 0: the model only joins a
+/// connection after its accept.
+fn checkStats() void {
+    const got = sim.streamStats();
+    inline for (@typeInfo(sim.StreamStats).@"struct".field_names) |name| {
+        if (!std.meta.eql(@field(got, name), @field(M.st, name))) fail("streamStats().{s}: sim {any}, model {any}", .{ name, @field(got, name), @field(M.st, name) });
+    }
 }
 
 // ---- The end ----
@@ -1383,6 +1426,7 @@ fn runSeed(seed_value: u64, steps: usize, profile: Profile, child: bool) Counts 
     for (&M.slots) |*s| s.used = false;
     M.next_serial = 1;
     M.c = .{};
+    M.st = .{};
     M.np_step = null;
     M.np_text = "";
     M.expect_refusal = null;

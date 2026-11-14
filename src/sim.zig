@@ -2534,7 +2534,8 @@ pub const StreamStats = struct {
     refused: u64 = 0,
     /// Entries that landed at a dead endpoint.
     dropped_dead: u64 = 0,
-    /// RSTs and FINs that landed after an RST had.
+    /// Data chunks, FINs and RSTs that landed at an endpoint that had
+    /// received a reset (landed or local).
     dropped_after_reset: u64 = 0,
     /// Connections retired.
     retired: u64 = 0,
