@@ -36,7 +36,25 @@ const max_ends = 32;
 const max_due = 32;
 const max_live = 128;
 pub const pipe_buf_cap = 4096;
-const fd_base: i32 = 100000;
+/// The first sim fd number in a run (section 3.3 of the sim network design).
+const default_fd_base: i32 = 100000;
+/// `default_fd_base`, except in a test child that moved it
+/// (`testMoveFdBase`). A variable only for that reason.
+var fd_base: i32 = default_fd_base;
+
+/// Moves the sim fd range in this test process, before `begin`. The build
+/// runner of `zig build test` lowers its own hard RLIMIT_NOFILE to 10240 on
+/// Darwin (`std.process.raiseFileDescriptorLimit`, called from
+/// lib/compiler/Maker.zig), and every test binary inherits that. No
+/// descriptor can then reach 100000, so the fd-namespace checks have nothing
+/// to refuse at the real base. A child that moves the base under its hard
+/// limit runs the same `begin`, `pipePair` and `end` code against descriptors
+/// the kernel can really create.
+fn testMoveFdBase(base: i32) void {
+    if (comptime !builtin.is_test) @compileError("testMoveFdBase is for tests");
+    if (begun) panic("sim: testMoveFdBase during a run", .{});
+    fd_base = base;
+}
 
 const Parked = struct {
     c: *anyopaque,
@@ -219,7 +237,7 @@ fn establishFdNamespace() void {
     const rl = std.posix.getrlimit(.NOFILE) catch |err| panic("sim: fd namespace: getrlimit failed: {t}", .{err});
     saved_nofile_soft = null;
     if (rl.cur > fd_base) {
-        std.posix.setrlimit(.NOFILE, .{ .cur = fd_base, .max = rl.max }) catch |err|
+        std.posix.setrlimit(.NOFILE, .{ .cur = @intCast(fd_base), .max = rl.max }) catch |err|
             panic("sim: fd namespace: cannot lower the soft RLIMIT_NOFILE to {d}: {t}", .{ fd_base, err });
         saved_nofile_soft = rl.cur;
     }
@@ -2484,48 +2502,59 @@ test "sim: refuses a DNS lookup during a run" {
 const p1 = struct {
     const random_mod = @import("random.zig");
 
-    /// Whether this process could hold a real descriptor at a sim fd number.
-    /// Under `zig build test` on macOS the hard limit was 10240 (round 4), so
-    /// the kernel cannot reach the sim range at all and these tests have
-    /// nothing to set up: they skip there, and run when the test binary is
-    /// started from a shell whose hard limit is higher.
-    fn simRangeReachable() bool {
-        const rl = std.posix.getrlimit(.NOFILE) catch return false;
-        return rl.max >= fd_base + max_ends;
+    /// The sim fd base these tests move to (`testMoveFdBase`), and the soft
+    /// limit they raise to above it. Both sit under 10240, the hard limit
+    /// every `zig build test` child has on Darwin, so the kernel can really
+    /// put a descriptor in the moved range and the checks have something to
+    /// refuse. Nothing here skips: a hard limit too low to set this up fails
+    /// the test (`error.HardLimitTooLow`).
+    const moved_base: i32 = 1000;
+    const raised_soft: std.posix.rlim_t = 2000;
+
+    fn moveBase() !void {
+        const rl = try std.posix.getrlimit(.NOFILE);
+        if (rl.max < raised_soft) {
+            std.debug.print("hard RLIMIT_NOFILE {d} is below {d}: cannot set up an fd-namespace test\n", .{ rl.max, raised_soft });
+            return error.HardLimitTooLow;
+        }
+        testMoveFdBase(moved_base);
     }
 
-    /// Raises this child's soft fd limit above `fd_base`, the state a
-    /// process is often in (it was 1048576 in the shell this was written in).
+    /// Raises this child's soft fd limit above the moved base, the state a
+    /// process is often in at the real base (the shell this was written in
+    /// had a soft limit of 1048576, above 100000).
     fn raiseSoftLimit() !void {
         const rl = try std.posix.getrlimit(.NOFILE);
-        const want: std.posix.rlim_t = 200000;
-        if (rl.max < want) return error.SkipZigTest;
-        try std.posix.setrlimit(.NOFILE, .{ .cur = want, .max = rl.max });
+        try std.posix.setrlimit(.NOFILE, .{ .cur = raised_soft, .max = rl.max });
     }
 };
 
 test "sim: fd namespace: begin lowers the soft fd limit to the sim base, a real descriptor cannot take a sim number, and end restores the limit" {
     if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
-    if (!isDeathChild() and !p1.simRangeReachable()) return error.SkipZigTest;
     if (!isDeathChild()) return expectChildSucceeds("sim: fd namespace: begin lowers the soft fd limit to the sim base, a real descriptor cannot take a sim number, and end restores the limit");
     noCoreDump();
+    try p1.moveBase();
     try p1.raiseSoftLimit();
+    // The control: before the run the kernel does put a descriptor at a sim
+    // number, so the refusals below are the limit's doing.
+    try std.testing.expectEqual(@as(c_int, p1.moved_base + 7), std.c.dup2(0, p1.moved_base + 7));
+    _ = std.c.close(p1.moved_base + 7);
     begin(1);
-    try std.testing.expect((try std.posix.getrlimit(.NOFILE)).cur <= fd_base);
-    try std.testing.expectEqual(@as(c_int, -1), std.c.dup2(0, fd_base));
-    try std.testing.expectEqual(@as(c_int, -1), std.c.dup2(0, fd_base + 5));
+    try std.testing.expectEqual(@as(std.posix.rlim_t, @intCast(p1.moved_base)), (try std.posix.getrlimit(.NOFILE)).cur);
+    try std.testing.expectEqual(@as(c_int, -1), std.c.dup2(0, p1.moved_base));
+    try std.testing.expectEqual(@as(c_int, -1), std.c.dup2(0, p1.moved_base + 5));
     end();
-    try std.testing.expectEqual(@as(std.posix.rlim_t, 200000), (try std.posix.getrlimit(.NOFILE)).cur);
+    try std.testing.expectEqual(p1.raised_soft, (try std.posix.getrlimit(.NOFILE)).cur);
     childDone("sim: fd namespace: begin lowers the soft fd limit to the sim base, a real descriptor cannot take a sim number, and end restores the limit");
 }
 
 test "sim: fd namespace: begin refuses when a real descriptor holds a sim fd number" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    if (!isDeathChild() and !p1.simRangeReachable()) return error.SkipZigTest;
-    try refusal("sim: fd namespace: begin refuses when a real descriptor holds a sim fd number", "sim: fd namespace: real descriptor 100003 is open in the sim fd range", struct {
+    try refusal("sim: fd namespace: begin refuses when a real descriptor holds a sim fd number", "sim: fd namespace: real descriptor 1003 is open in the sim fd range", struct {
         fn body() !void {
+            try p1.moveBase();
             try p1.raiseSoftLimit();
-            if (std.c.dup2(0, fd_base + 3) != fd_base + 3) return error.DupFailed;
+            if (std.c.dup2(0, p1.moved_base + 3) != p1.moved_base + 3) return error.DupFailed;
             begin(1);
         }
     }.body);
@@ -2533,14 +2562,37 @@ test "sim: fd namespace: begin refuses when a real descriptor holds a sim fd num
 
 test "sim: fd namespace: a sim fd made after the soft limit was raised again is refused" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    if (!isDeathChild() and !p1.simRangeReachable()) return error.SkipZigTest;
-    try refusal("sim: fd namespace: a sim fd made after the soft limit was raised again is refused", "sim: fd namespace: the soft RLIMIT_NOFILE is 200000, above the sim fd base 100000", struct {
+    try refusal("sim: fd namespace: a sim fd made after the soft limit was raised again is refused", "sim: fd namespace: the soft RLIMIT_NOFILE is 2000, above the sim fd base 1000", struct {
         fn body() !void {
+            try p1.moveBase();
             begin(1);
             try p1.raiseSoftLimit();
             _ = pipePair();
         }
     }.body);
+}
+
+// At the real base and a hard limit below it, which is every `zig build
+// test` child on Darwin, there is nothing to lower: `begin` must leave the
+// soft limit as it was, and `end` must too. Also pins the real base.
+test "sim: fd namespace: at the real base with the hard limit below it, begin and end leave the soft limit alone" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildSucceeds("sim: fd namespace: at the real base with the hard limit below it, begin and end leave the soft limit alone");
+    noCoreDump();
+    try std.testing.expectEqual(@as(i32, 100000), fd_base);
+    const rl = try std.posix.getrlimit(.NOFILE);
+    if (rl.max >= fd_base) {
+        // From a shell with a high hard limit: lower it in this child, which
+        // is the state this test is about.
+        try std.posix.setrlimit(.NOFILE, .{ .cur = @min(rl.cur, 4096), .max = 4096 });
+    }
+    const before = (try std.posix.getrlimit(.NOFILE)).cur;
+    begin(1);
+    try std.testing.expectEqual(before, (try std.posix.getrlimit(.NOFILE)).cur);
+    _ = pipePair();
+    end();
+    try std.testing.expectEqual(before, (try std.posix.getrlimit(.NOFILE)).cur);
+    childDone("sim: fd namespace: at the real base with the hard limit below it, begin and end leave the soft limit alone");
 }
 
 test "sim: refuses zio.randomSecure during a run" {
