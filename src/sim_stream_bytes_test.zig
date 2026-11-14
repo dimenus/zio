@@ -1625,3 +1625,92 @@ pub const chk2 = struct {
         try sim.expectChildPanics("sim: stream refuses: chunk mode .fixed = 0", "sim: chunk mode .fixed = 0");
     }
 };
+
+const rearm = struct {
+    fn body() !void {
+        const srv, const c, const s = try pair();
+        try s.shutdown(.both);
+        try rt_mod.sleep(.fromMicroseconds(L / us));
+        sim.setStreamChunking(c.socket.handle, .{ .fixed = 1 });
+        const t0 = sim.clockNs();
+        try expectEqual(@as(usize, 2), try c.write("ab", .none));
+        // Chunk 0 lands at t0 + L: the local reset, read once. (A read
+        // after .both does not park: it gives 0 at once, so wait first.)
+        try rt_mod.sleep(.fromMicroseconds(L / us));
+        try expectEqual(t0 + L, sim.clockNs());
+        try expectEqual(@as(u64, 1), sim.streamStats().local_resets);
+        var b: [4]u8 = undefined;
+        try expectError(error.ConnectionResetByPeer, s.read(&b, .none));
+        // Chunk 1 lands 1 µs later and must not re-arm it.
+        try rt_mod.sleep(.fromMicroseconds(1));
+        try expectEqual(@as(u64, 1), sim.streamStats().local_resets);
+        try expectEqual(@as(usize, 0), try s.read(&b, .none));
+        try expectEqual(@as(u64, 1), sim.streamStats().discarded[@backingInt(sim.Discard.shut_receiver)]);
+        try expectEqual(@as(u64, 1), sim.streamStats().discarded[@backingInt(sim.Discard.after_reset)]);
+        try t1.closeAll3(srv, c, s);
+    }
+};
+
+test "sim: stream bytes: under .linux, a read between two chunks that land after shutdown(.both) reports the local reset once; the second chunk does not re-arm it (review 3, finding 5)" {
+    if (comptime skip) return error.SkipZigTest;
+    try run(1, .linux, rearm.body);
+}
+
+const fin_wakes = struct {
+    var at: u64 = 0;
+    var got: anyerror!usize = 0;
+    fn reader(s: zio_net.Stream) void {
+        var b: [4]u8 = undefined;
+        got = s.read(&b, .none);
+        at = sim.clockNs();
+    }
+    fn body() !void {
+        const srv, const c, const s = try pair();
+        var h = try rt_mod.spawn(reader, .{s});
+        try rt_mod.sleep(.fromMicroseconds(10));
+        const t0 = sim.clockNs();
+        try c.shutdown(.send);
+        h.join();
+        try expectEqual(@as(usize, 0), try got);
+        try expectEqual(t0 + L, at);
+        try t1.closeAll3(srv, c, s);
+    }
+};
+
+test "sim: stream bytes: a receive parked when a FIN lands alone is woken at the landing and gives 0" {
+    if (comptime skip) return error.SkipZigTest;
+    try run(1, null, fin_wakes.body);
+}
+
+const owed_last = struct {
+    fn body() !void {
+        const srv, const c, const s = try pair();
+        sim.setStreamChunking(c.socket.handle, .off);
+        // Two sends in one instant land in one instant, T.
+        _ = try c.write("a", .none);
+        _ = try c.write("b", .none);
+        try rt_mod.sleep(.fromMicroseconds(L / us));
+        const t = sim.clockNs();
+        var b: [1]u8 = undefined;
+        // Two reads at T: the first's credit leaves, the second's is owed
+        // for T + L, when both closes' FINs and that credit also land.
+        _ = try s.read(&b, .none);
+        _ = try s.read(&b, .none);
+        try expectEqual(t, sim.clockNs());
+        try expect((try dir(true)).owed);
+        const stale0 = sim.streamStats().stale_credit;
+        s.close();
+        c.close();
+        try drain();
+        // At T + L the wire empties, and the owed credit still departs:
+        // its direction is terminal (c is dead), so nothing leaves and it
+        // is counted, as is the credit that landed at the dead c.
+        try expectEqual(stale0 + 2, sim.streamStats().stale_credit);
+        srv.close();
+    }
+};
+
+test "sim: stream bytes: a connection whose wire empties at the instant a credit is owed retires only after that departure" {
+    if (comptime skip) return error.SkipZigTest;
+    try run(1, null, owed_last.body);
+}
