@@ -4193,6 +4193,97 @@ test "sim: dgram refuses: a blocking receive on a socket that is not non-blockin
     }.body);
 }
 
+test "sim: dgram refuses: sendto with MSG_OOB" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: sendto with MSG_OOB", "sim: send flag oob on sim fd 100032 is not simulated", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
+            const to = dg.addr(127, 0, 0, 1, 7000);
+            _ = try dg.os_net.sendto(fd, &iov, .{ .oob = true }, @ptrCast(&to), @sizeOf(dg.os_net.sockaddr.in));
+        }
+    }.body);
+}
+
+test "sim: dgram refuses: sendto with MSG_FASTOPEN" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: sendto with MSG_FASTOPEN", "sim: send flag fastopen on sim fd 100032 is not simulated", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
+            const to = dg.addr(127, 0, 0, 1, 7000);
+            _ = try dg.os_net.sendto(fd, &iov, .{ .fastopen = true }, @ptrCast(&to), @sizeOf(dg.os_net.sockaddr.in));
+        }
+    }.body);
+}
+
+test "sim: dgram refuses: sendmsg with MSG_EOR" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: sendmsg with MSG_EOR", "sim: send flag eor on sim fd 100032 is not simulated", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
+            const to = dg.addr(127, 0, 0, 1, 7000);
+            _ = try dg.os_net.sendmsg(fd, &iov, .{ .eor = true }, @ptrCast(&to), @sizeOf(dg.os_net.sockaddr.in), null);
+        }
+    }.body);
+}
+
+test "sim: dgram refuses: sendDatagram with MSG_DONTROUTE" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: sendDatagram with MSG_DONTROUTE", "sim: send flag dont_route on sim fd 100032 is not simulated", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
+            const to = dg.addr(127, 0, 0, 1, 7000);
+            _ = try dg.os_net.sendDatagram(fd, &iov, .{ .dont_route = true }, &to, null);
+        }
+    }.body);
+}
+
+test "sim: dgram refuses: sendDatagram with MSG_CONFIRM" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: sendDatagram with MSG_CONFIRM", "sim: send flag confirm on sim fd 100032 is not simulated", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = try dg.open();
+            var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
+            const to = dg.addr(127, 0, 0, 1, 7000);
+            _ = try dg.os_net.sendDatagram(fd, &iov, .{ .confirm = true }, &to, null);
+        }
+    }.body);
+}
+
+test "sim: dgram: a send with MSG_NOSIGNAL or MSG_DONTWAIT is accepted through sendto, sendmsg and sendDatagram, and lands" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            const rx = try dg.open();
+            try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 7000));
+            const tx = try dg.open();
+            const to = dg.addr(127, 0, 0, 1, 7000);
+            var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
+            const flags = [_]dg.os_net.SendFlags{ .{ .no_signal = true, .dontwait = true }, .{ .no_signal = false }, .{ .dontwait = true } };
+            for (flags) |f| {
+                _ = try dg.os_net.sendto(tx, &iov, f, @ptrCast(&to), @sizeOf(dg.os_net.sockaddr.in));
+                _ = try dg.os_net.sendmsg(tx, &iov, f, @ptrCast(&to), @sizeOf(dg.os_net.sockaddr.in), null);
+                _ = try dg.os_net.sendDatagram(tx, &iov, f, &to, null);
+            }
+            try dg.settle();
+            var n: usize = 0;
+            var buf: [4]u8 = undefined;
+            while (dg.recvInto(rx, &.{&buf})) |_| n += 1 else |err| if (err != error.WouldBlock) return err;
+            try std.testing.expectEqual(@as(usize, 9), n);
+            dg.os_net.close(rx);
+            dg.os_net.close(tx);
+        }
+    }.body);
+}
+
 test "sim: dgram refuses: an IPv6 socket during a run" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     try refusal("sim: dgram refuses: an IPv6 socket during a run", "sim: socket(ipv6, dgram, ip) during a sim run", struct {

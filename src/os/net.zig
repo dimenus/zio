@@ -1455,7 +1455,7 @@ pub fn sendto(
 ) SendError!usize {
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
-        if (sim.isSimFd(fd)) return simSend(fd, buffers, simAddr("sendto", addr, addr_len), null);
+        if (sim.isSimFd(fd)) return simSend(fd, buffers, flags, simAddr("sendto", addr, addr_len), null);
     }
 
     const sys_flags = sendFlagsToSys(flags);
@@ -1758,7 +1758,7 @@ pub fn sendmsg(
                 sim.panic("sim: sendmsg with control data on sim fd {d}: use sendDatagram for a source address", .{fd});
             }
             const a = addr orelse sim.panic("sim: sendmsg with no address on sim fd {d}: connected UDP is not simulated", .{fd});
-            return simSend(fd, buffers, simAddr("sendmsg", a, addr_len), null);
+            return simSend(fd, buffers, flags, simAddr("sendmsg", a, addr_len), null);
         }
     }
 
@@ -1911,7 +1911,7 @@ pub fn sendDatagram(fd: fd_t, buffers: []const iovec_const, flags: SendFlags, to
     if (comptime builtin.os.tag == .windows) @compileError("sendDatagram: not on Windows yet");
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
-        if (sim.isSimFd(fd)) return simSend(fd, buffers, simAddrIn("sendDatagram", to), from);
+        if (sim.isSimFd(fd)) return simSend(fd, buffers, flags, simAddrIn("sendDatagram", to), from);
     }
     const f = from orelse return sendto(fd, buffers, flags, @ptrCast(to), @sizeOf(sockaddr.in));
     var control: [64]u8 align(@alignOf(posix.system.cmsghdr)) = @splat(0);
@@ -2065,7 +2065,16 @@ fn simRecvLen(r: sim.Received, flags: RecvFlags) usize {
     return if (flags.trunc and builtin.os.tag == .linux) r.len else r.copied;
 }
 
-fn simSend(fd: fd_t, buffers: []const iovec_const, to: sim.Ip4, from: ?[4]u8) SendError!usize {
+/// One datagram on a sim socket. Two send flags are accepted with no effect,
+/// as the kernel gives them none here: `no_signal` (SIGPIPE comes only from a
+/// stream socket; ENet passes MSG_NOSIGNAL on every send) and `dontwait` (a
+/// sim send never waits). Every other flag refuses, by name: a flag added to
+/// `SendFlags` later refuses too until someone decides what it means here.
+fn simSend(fd: fd_t, buffers: []const iovec_const, flags: SendFlags, to: sim.Ip4, from: ?[4]u8) SendError!usize {
+    inline for (comptime std.meta.fieldNames(SendFlags)) |name| {
+        const accepted = comptime std.mem.eql(u8, name, "no_signal") or std.mem.eql(u8, name, "dontwait");
+        if (!accepted and @field(flags, name)) sim.panic("sim: send flag " ++ name ++ " on sim fd {d} is not simulated", .{fd});
+    }
     if (buffers.len > sim_max_iovecs) sim.panic("sim: a send with {d} buffers (max {d})", .{ buffers.len, sim_max_iovecs });
     var sl: [sim_max_iovecs][]const u8 = undefined;
     for (buffers, 0..) |b, i| sl[i] = b.base[0..b.len];

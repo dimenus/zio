@@ -330,6 +330,9 @@ option, and hotseat's bridge will not; `IP_TTL` is not modelled.
 - IPv6.
 - `recvmmsg`/`sendmmsg`.
 - `MSG_PEEK`.
+- Send flags other than `MSG_NOSIGNAL` and `MSG_DONTWAIT` (accepted with no
+  effect): `MSG_OOB`, `MSG_EOR`, `MSG_DONTROUTE`, `MSG_CONFIRM`,
+  `MSG_FASTOPEN`, and any flag added later.
 - `connect` on a datagram socket.
 - The misuse class of section 8.
 - A sim fd at a native exit (section 3).
