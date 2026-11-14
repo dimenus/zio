@@ -201,6 +201,8 @@ const Slot = struct {
     /// `pipe_wake_ns` (a pipe op); a datagram op that waits must complete in
     /// the poll whose harvest landed its datagram.
     wake_since: ?u64 = null,
+    /// The end's registration proof gave this op, alone, what it waits for.
+    proving: bool = false,
 
     fn comp(s: *Slot) *ev.Completion {
         return switch (s.kind) {
@@ -385,6 +387,8 @@ const Counts = struct {
     /// Ops still waiting at the end that completed once given what they
     /// waited for: proof they were still registered.
     registration_proofs: u64 = 0,
+    /// Race groups of waiting receives submitted at the end.
+    end_groups: u64 = 0,
 
     fn add(a: *Counts, b: Counts) void {
         inline for (comptime std.meta.fieldNames(Counts)) |name| {
@@ -421,6 +425,8 @@ const M = struct {
     var last_timer_clock: u64 = std.math.maxInt(u64);
     var last_timer_poll: u64 = 0;
     var probe: Probe = .none;
+    var in_proof: bool = false;
+    var proof_done: bool = false;
     var wire: std.ArrayList(MWire) = .empty;
     var next_gen: u32 = 1;
     var next_serial: u64 = 1;
@@ -1019,6 +1025,7 @@ fn complete(s: *Slot) void {
         if (s.kind == .p_recv and want == .n) checkScatter(s, s.want, what);
         if (s.wake_since != null) M.c.woken_completed += 1;
     } else if (got == .err and got.err == error.Canceled) {
+        if (s.proving) fail("{s} op #{d} ended Canceled while it alone was given what it waits for: a cancel would hide a lost registration", .{ what, s.serial });
         if (!s.cancel_req) fail("{s} op #{d} ended Canceled, but no cancel was asked for it", .{ what, s.serial });
         clearWaiting(s);
     } else if (s.woken_closed) {
@@ -1028,6 +1035,7 @@ fn complete(s: *Slot) void {
         harvestAction(s, got);
         M.c.woken_completed += 1;
     }
+    if (s.proving) M.proof_done = true;
     finishOp(s);
     noteIoCompletion();
     if (!s.deferred) inBatch(s);
@@ -1143,7 +1151,7 @@ fn onGroup(_: *ev.Loop, cp: *ev.Completion) void {
     const n = g.n;
     for (freed[0..n]) |mi| M.slots[mi].used = false;
     g.used = false;
-    if (M.in_poll and !M.in_add and !M.in_cancel) followUps(freed[0..n]);
+    if (M.in_poll and !M.in_add and !M.in_cancel and !M.in_proof) followUps(freed[0..n]);
 }
 
 /// Submits new ops into the slots a group just freed, inside the harvest
@@ -1492,7 +1500,7 @@ fn wokenSock() ?u8 {
 /// receive (a woken receive on that socket then parks again), or cancel an
 /// op. Each can hit an op later in the same harvest batch.
 fn inBatch(from: ?*Slot) void {
-    if (!M.in_poll or M.in_add or M.in_cancel) return;
+    if (!M.in_poll or M.in_add or M.in_cancel or M.in_proof) return;
     if (M.probe == .dgram) probeDgram();
     const r = M.r();
     // A woken op later in this batch is rare; take its datagram often.
@@ -1778,31 +1786,51 @@ fn finish() void {
     // only to the next due op, and a pipe op is due up to 5 ms after a wake.
     settle(20 * std.time.ns_per_ms);
     checkAfterStep();
-    var round: usize = 0;
-    while (round < 4) : (round += 1) {
-        // First list them, then give: a gift is an op in a free slot, and
-        // the list must not see it.
-        var waiting: usize = 0;
-        var to_give: [n_slots]*Slot = undefined;
-        var n_give: usize = 0;
+    // Empty the queues (a layer receive each, checked), so every socket
+    // with nothing waiting can take part in an end group.
+    for (&M.socks, 0..) |*sk, k| {
+        while (sk.open and sk.qlen() > 0) layerRecv(@intCast(k));
+    }
+    endGroups();
+    // The proof: one waiting op at a time is given what it waits for, and
+    // the clock settles before the next. No close or cancel acts meanwhile
+    // (`inBatch` is off). The op must complete from what it was given: not
+    // stay, and not end Canceled (`complete` fails a proving op that does).
+    // Giving two race members at once would let one complete and cancel
+    // the other, which hides the other's lost registration (round 4,
+    // finding 2). A race member cancelled by the one proven is not proven.
+    M.in_proof = true;
+    defer M.in_proof = false;
+    var rounds: usize = 0;
+    while (true) : (rounds += 1) {
+        if (rounds == 4 * n_slots) fail("the registration proof did not end", .{});
+        var next: ?*Slot = null;
+        var woken: usize = 0;
         for (&M.slots) |*s| {
             if (!s.used or s.completions != 0) continue;
             if (s.at_submit != null or s.cancel_req or s.woken_closed) fail("{t} op #{d} never completed (decided at submit {any}, cancel asked {any}, woken by a close {any}, group {any}, deferred {any}, submitted at poll {d}, now {d} ns, must by {any} ns)", .{ s.kind, s.serial, s.at_submit, s.cancel_req, s.woken_closed, s.group, s.deferred, s.submit_poll, sim.clockNs(), s.must_by_clock });
-            waiting += 1;
             // Woken already (maybe late in the settle): `pollOnce` holds it
-            // to its wake time; give it nothing more.
-            if (s.wake_since == null) {
-                to_give[n_give] = s;
-                n_give += 1;
-            }
+            // to its wake time.
+            if (s.wake_since != null) {
+                woken += 1;
+            } else if (next == null) next = s;
         }
-        for (to_give[0..n_give]) |s| give(s);
-        if (waiting == 0) break;
+        const w = next orelse {
+            if (woken == 0) break;
+            settle(2 * pipe_wake_ns);
+            continue;
+        };
+        // Recorded by the op's own completion (`complete`): its slot can be
+        // free and hold another op by the time the settle ends.
+        const kind = w.kind;
+        const serial = w.serial;
+        w.proving = true;
+        M.proof_done = false;
+        give(w);
         settle(2 * pipe_wake_ns);
         checkAfterStep();
-    }
-    for (&M.slots) |*s| {
-        if (s.used and s.completions == 0) fail("{t} op #{d} still waits after what it waits for was given to it: it lost its registration", .{ s.kind, s.serial });
+        if (!M.proof_done) fail("{t} op #{d} still waits after it alone was given what it waits for: it lost its registration", .{ kind, serial });
+        M.c.registration_proofs += 1;
     }
     for (&M.groups) |*g| {
         if (g.used) fail("a race group never completed", .{});
@@ -1882,6 +1910,42 @@ fn finish() void {
     if (accepted != received + dropped + left) fail("pipes: {d} bytes accepted, {d} received, {d} dropped by a reset, {d} left at ends closed for reading", .{ accepted, received, dropped, left });
 }
 
+/// Race groups of two receives that wait, on sockets with nothing queued and
+/// nothing waiting, submitted at the end so the registration proof has race
+/// members to prove (round 4, finding 2): one member's readiness completes
+/// it and the race cancels its sibling, which could hide the sibling's lost
+/// registration.
+fn endGroups() void {
+    var free: [n_socks]u8 = undefined;
+    var n: usize = 0;
+    for (&M.socks, 0..) |*sk, k| {
+        if (sk.open and sk.waiting == null and sk.qlen() == 0) {
+            free[n] = @intCast(k);
+            n += 1;
+        }
+    }
+    var k: usize = 0;
+    while (k + 2 <= n) : (k += 2) {
+        const gi = freeGroup() orelse return;
+        const g = &M.groups[gi];
+        g.* = .{ .used = true, .n = 2, .deferred = false };
+        g.g = ev.Group.init(.race);
+        for (0..2) |j| {
+            const i = freeSlot() orelse fail("no free slot for an end group", .{});
+            const m = buildDgramRecv(i, free[k + j], false).?;
+            g.members[j] = i;
+            m.group = gi;
+            arm(m, false);
+            g.g.add(m.comp());
+        }
+        g.g.c.callback = onGroup;
+        g.g.c.userdata = g;
+        g.g.c.flags.defer_callback = false;
+        addToLoop(&g.g.c);
+        M.c.end_groups += 1;
+    }
+}
+
 /// Polls until the clock has moved by `ns`.
 fn settle(ns: u64) void {
     const until = sim.clockNs() + ns;
@@ -1891,7 +1955,6 @@ fn settle(ns: u64) void {
 /// Gives a waiting op what it waits for: bytes or room on its pipe, or a
 /// datagram on its socket. Its completion is then checked as any other.
 fn give(w: *Slot) void {
-    M.c.registration_proofs += 1;
     switch (w.kind) {
         .p_recv => {
             const p = w.target ^ 1;
@@ -1951,7 +2014,7 @@ fn printCounts(c: Counts, seeds: usize, steps: usize) void {
     std.debug.print("\n", .{});
     std.debug.print("op model counts: ops={d} parked={d} canceled={d} closed_hit={d} reused_number_ops={d} closed_then_reused={d} groups={d} f1_shape_groups={d} followups={d} followups_into_canceled_due={d}\n", .{ c.ops, c.parked, c.canceled, c.closed_hit, c.reused_number_ops, c.closed_then_reused, c.groups, c.f1_shape_groups, c.followups, c.followups_into_canceled_due });
     std.debug.print("op model counts: dgrams_sent={d} empty={d} truncated={d} scatter_recvs={d} dropped_rcvbuf={d} dropped_nosock={d} discarded_at_close={d} landed_in_new_socket={d} only_empty_left={d} landed_behind_empty={d} pipe_parked_sends={d} would_block={d} polls={d} no_free_slot={d}\n", .{ c.dgrams_sent, c.empty_dgrams, c.truncated, c.scatter_recvs, c.dropped_rcvbuf, c.dropped_nosock, c.discarded_at_close, c.landed_in_new_socket, c.only_empty_left, c.landed_behind_empty, c.pipe_parked_sends, c.would_block, c.polls, c.no_free_slot });
-    std.debug.print("op model counts: woken_completed={d} registration_proofs={d} in_batch_reopen={d} in_batch_steal={d} in_batch_cancel={d} timers_fired={d} timer_and_io_at_one_time={d} pipe_pairs={d} pipe_closes={d} pipe_shutdowns={d} pipe_resets={d} end_of_stream={d} broken_pipe={d} reset_errors={d}\n", .{ c.woken_completed, c.registration_proofs, c.in_batch_reopen, c.in_batch_steal, c.in_batch_cancel, c.timers_fired, c.timer_and_io_at_one_time, c.pipe_pairs, c.pipe_closes, c.pipe_shutdowns, c.pipe_resets, c.end_of_stream, c.broken_pipe, c.reset_errors });
+    std.debug.print("op model counts: woken_completed={d} registration_proofs={d} end_groups={d} in_batch_reopen={d} in_batch_steal={d} in_batch_cancel={d} timers_fired={d} timer_and_io_at_one_time={d} pipe_pairs={d} pipe_closes={d} pipe_shutdowns={d} pipe_resets={d} end_of_stream={d} broken_pipe={d} reset_errors={d}\n", .{ c.woken_completed, c.registration_proofs, c.end_groups, c.in_batch_reopen, c.in_batch_steal, c.in_batch_cancel, c.timers_fired, c.timer_and_io_at_one_time, c.pipe_pairs, c.pipe_closes, c.pipe_shutdowns, c.pipe_resets, c.end_of_stream, c.broken_pipe, c.reset_errors });
 }
 
 test "sim: op model: datagram sockets and a pipe under random sends, receives, polls, cancels, race groups, close and reopen, in a child process" {
@@ -1975,11 +2038,17 @@ test "sim: op model: datagram sockets and a pipe under random sends, receives, p
         return;
     }
     printCounts(total, n_seeds, steps);
+    // A replay with another length is a diagnostic, not the instrument: its
+    // counts prove nothing, and are not required.
+    if (std.c.getenv("ZIO_OP_MODEL_STEPS") != null) {
+        sim.childDone(child_name);
+        return;
+    }
     // A kind that never happened is a hole in the instrument, not a pass.
     for (total.steps, 0..) |n, k| {
         if (n == 0) fail("no step of kind {t} ran", .{@as(StepKind, @fromBackingInt(@intCast(k)))});
     }
-    inline for (.{ "parked", "canceled", "closed_hit", "reused_number_ops", "closed_then_reused", "f1_shape_groups", "followups_into_canceled_due", "empty_dgrams", "truncated", "scatter_recvs", "dropped_rcvbuf", "dropped_nosock", "discarded_at_close", "landed_in_new_socket", "pipe_parked_sends", "woken_completed", "registration_proofs", "in_batch_reopen", "in_batch_steal", "in_batch_cancel", "timers_fired", "timer_and_io_at_one_time", "pipe_closes", "pipe_shutdowns", "pipe_resets", "end_of_stream", "broken_pipe", "reset_errors" }) |name| {
+    inline for (.{ "parked", "canceled", "closed_hit", "reused_number_ops", "closed_then_reused", "f1_shape_groups", "followups_into_canceled_due", "empty_dgrams", "truncated", "scatter_recvs", "dropped_rcvbuf", "dropped_nosock", "discarded_at_close", "landed_in_new_socket", "pipe_parked_sends", "woken_completed", "registration_proofs", "end_groups", "in_batch_reopen", "in_batch_steal", "in_batch_cancel", "timers_fired", "timer_and_io_at_one_time", "pipe_closes", "pipe_shutdowns", "pipe_resets", "end_of_stream", "broken_pipe", "reset_errors" }) |name| {
         if (@field(total, name) == 0) fail("the counter {s} is 0: that case never ran", .{name});
     }
     sim.childDone(child_name);
@@ -2034,7 +2103,7 @@ test "sim: op model: datagram sockets and a pipe under random sends, receives, p
         return error.OpModelFailed;
     }
     try sim.checkDoneMarkers(child_name, res.stderr);
-    if (std.c.getenv("ZIO_OP_MODEL_SEED") != null) return;
+    if (std.c.getenv("ZIO_OP_MODEL_SEED") != null or std.c.getenv("ZIO_OP_MODEL_STEPS") != null) return;
     // The probes: in a run, at the first chance, a second ev op behind a
     // woken one; the sim must refuse it, naming the woken one's state.
     const probes = [_]struct { []const u8, []const u8 }{
