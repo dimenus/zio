@@ -1039,8 +1039,18 @@ fn atEof(i: u8) bool {
     return ends[i].buf_len == 0 and (ends[i].closed or ends[i].rd_shut or ends[p].closed or ends[p].wr_shut);
 }
 
+/// An ev receive on a sim pipe end, at its submit.
+///
+/// A receive with no buffer room (total length 0) is refused, before any
+/// side effect (t-4096, decided yes; design 17.4 refuses the same on a
+/// stream socket). The sim parked it on an empty pipe until bytes or end of
+/// stream came, and gave 0 at once on a pipe holding bytes; a kernel's
+/// `recv(fd, buf, 0)` was not measured, and on Linux it is expected to give
+/// 0 at once in both cases. So the sim's answer could differ from the
+/// kernel's, silently. No user of the sim submits one.
 pub fn recvInto(fd: i32, dst: anytype, recv_c: *anyopaque, dont_wait: bool) IoSubmit {
     checkIovecs("a receive", fd, dst.len);
+    if (totalLen(dst) == 0) panic("sim: a receive of 0 bytes on sim pipe fd {d} is refused (t-4096): what a kernel answers is not measured, and the sim would park it on an empty pipe", .{fd});
     const id = allocOpId(recv_c);
     const i = endIndex(fd) orelse {
         pushDueKind(recv_c, .recv, id);
@@ -1063,8 +1073,8 @@ pub fn recvInto(fd: i32, dst: anytype, recv_c: *anyopaque, dont_wait: bool) IoSu
     }
     const n = drainBuf(fd, dst);
     pushDueKind(recv_c, .recv, id);
-    // A receive with no room takes nothing and frees no room.
-    if (n > 0) wakeSender(i);
+    // It has room (above) and the pipe has bytes, so it took some.
+    wakeSender(i);
     return .{ .due = n };
 }
 
@@ -1097,7 +1107,7 @@ pub fn drainBuf(fd: i32, dst: anytype) usize {
 }
 
 /// A woken pipe receive at its harvest, not reset and not at end of stream:
-/// its bytes. A receive with no buffer room completes with 0 (t-4096).
+/// its bytes. It has room: `recvInto` refuses one without (t-4096).
 ///
 /// Its bytes are still there: only an ev receive takes a pipe's bytes (the
 /// socket layer refuses a sim pipe fd), and a second one on this end refuses
@@ -1106,8 +1116,7 @@ pub fn drainBuf(fd: i32, dst: anytype) usize {
 /// again (7c0c22e); now an empty end here is a broken invariant.
 pub fn harvestRecv(fd: i32, dst: anytype) usize {
     const i = endIndex(fd) orelse panic("sim: a harvested receive on sim fd {d}, which is not a pipe end", .{fd});
-    const room = totalLen(dst);
-    if (ends[i].buf_len == 0 and room > 0) panic("sim: a woken ev receive on sim pipe fd {d} found no bytes, no end of stream and no reset: only another ev receive takes bytes, and that refuses while this one is unresolved", .{fd});
+    if (ends[i].buf_len == 0) panic("sim: a woken ev receive on sim pipe fd {d} found no bytes, no end of stream and no reset: only another ev receive takes bytes, and that refuses while this one is unresolved", .{fd});
     return drainForRecv(fd, dst);
 }
 
@@ -8660,11 +8669,12 @@ const second_waiter = struct {
     }
 };
 
-/// A receive with no room on a full pipe takes no bytes, so it frees no room
-/// and must not wake the send parked on the other end: that send's harvest
-/// would find the pipe still full. A receive with room then wakes it.
+/// A receive with room on a full pipe frees room, so it wakes the send
+/// parked on the other end. (Until t-4096 this test also gave a receive with
+/// no room first, which took nothing and must not wake the send. Such a
+/// receive is refused now: the two tests after this one.)
 const pipe_zero_room = struct {
-    fn body() !void {
+    fn fill() !void {
         const w = second_waiter;
         w.fds = pipePair();
         const loop = &dg.rt_mod.getCurrentExecutor().loop;
@@ -8674,20 +8684,62 @@ const pipe_zero_room = struct {
         // S0 is done, S1 parked on the full pipe.
         try std.testing.expectEqual(@as(usize, pipe_buf_cap), try w.ops[0].send.getResult());
         try std.testing.expect(!w.ops[1].send.c.has_result);
-        loop.add(w.recv(2, w.fds[0], 0));
-        try dg.rt_mod.sleep(.fromMilliseconds(10));
-        try std.testing.expectEqual(@as(usize, 0), try w.ops[2].recv.getResult());
-        try std.testing.expect(!w.ops[1].send.c.has_result);
+    }
+
+    fn body() !void {
+        try fill();
+        const w = second_waiter;
+        const loop = &dg.rt_mod.getCurrentExecutor().loop;
         loop.add(w.recv(3, w.fds[0], 100));
         try dg.rt_mod.sleep(.fromMilliseconds(10));
         try std.testing.expectEqual(@as(usize, 100), try w.ops[3].recv.getResult());
         try std.testing.expectEqual(@as(usize, 10), try w.ops[1].send.getResult());
     }
+
+    /// t-4096's case: a receive of 0 bytes on an empty pipe. Before the
+    /// refusal it parked until bytes or end of stream came.
+    fn emptyPipe() !void {
+        const w = second_waiter;
+        w.fds = pipePair();
+        const loop = &dg.rt_mod.getCurrentExecutor().loop;
+        loop.add(w.recv(0, w.fds[0], 0));
+        try dg.rt_mod.sleep(.fromMilliseconds(10));
+        std.debug.print("a receive of 0 bytes on an empty pipe: has_result {}\n", .{w.ops[0].recv.c.has_result});
+    }
+
+    /// The case this test's first half had: a receive of 0 bytes on a
+    /// full pipe with a send parked on it. Before the refusal it gave 0.
+    fn fullPipe() !void {
+        try fill();
+        const w = second_waiter;
+        const loop = &dg.rt_mod.getCurrentExecutor().loop;
+        loop.add(w.recv(2, w.fds[0], 0));
+        try dg.rt_mod.sleep(.fromMilliseconds(10));
+        std.debug.print("a receive of 0 bytes on a full pipe: {any}\n", .{w.ops[2].recv.getResult()});
+    }
 };
 
-test "sim: pipe: a receive with no room on a full pipe does not wake the send parked on it, and one with room does" {
+test "sim: pipe: a receive with room on a full pipe wakes the send parked on it" {
     if (comptime !compiled_in) return error.SkipZigTest;
     for (1..9) |s| try dg.run(s, pipe_zero_room.body);
+}
+
+test "sim: pipe refuses: a receive of 0 bytes on an empty pipe (t-4096)" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: pipe refuses: a receive of 0 bytes on an empty pipe (t-4096)", "sim: a receive of 0 bytes on sim pipe fd 100000 is refused (t-4096)", struct {
+        fn body() !void {
+            try dg.run(1, pipe_zero_room.emptyPipe);
+        }
+    }.body);
+}
+
+test "sim: pipe refuses: a receive of 0 bytes on a full pipe with a send parked on it (t-4096)" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: pipe refuses: a receive of 0 bytes on a full pipe with a send parked on it (t-4096)", "sim: a receive of 0 bytes on sim pipe fd 100000 is refused (t-4096)", struct {
+        fn body() !void {
+            try dg.run(1, pipe_zero_room.fullPipe);
+        }
+    }.body);
 }
 
 /// Round 4 of the outside review, finding 1: the due list is the sim's, not a

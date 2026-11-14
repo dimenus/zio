@@ -615,8 +615,9 @@ in the message of the commit that added it.
    end, or whose peer's end, a callback earlier in it closes gets the bytes
    it was woken for`; `sim: dgram ev: a race group of two sends that finish
    without deferral completes each member once`, the same for pipe sends;
-   `sim: pipe: a receive with no room on a full pipe does not wake the send
-   parked on it, and one with room does`. One waiter at a time (round 3):
+   `sim: pipe: a receive with room on a full pipe wakes the send parked on
+   it` (a receive with no room is refused since t-4096: `sim: pipe
+   refuses: a receive of 0 bytes ...`). One waiter at a time (round 3):
    `sim: pipe refuses: a second ev receive on an end whose receive is woken
    and not yet harvested`, the same for a send; `sim: dgram ev refuses: a
    second ev receive on a socket whose receive is woken and not yet
@@ -727,8 +728,9 @@ select adapter, which 9ecfbc6 removed.
   a task that a CompletionQueue callback runs (`simCoopYield`), can close
   the socket and reuse its number. Fixed with a socket generation (round 3
   below).
-- **Open, not done:** t-4096, a zero-length receive on an empty sim pipe
-  parks; check what the kernels do first.
+- **t-4096, closed in sitting 31:** a zero-length receive on an empty sim
+  pipe parked. It is refused now, on any pipe end (`recvInto`'s doc
+  comment), as on a stream socket (17.4).
 
 ### Round 2 of the outside review (gpt-simnet4.md, of 1126ebe)
 
@@ -771,7 +773,7 @@ fix, then the fix and mutants. Each commit has the failing output.
   pipe code; zero to five slices.
 - **Not reached by any model test yet (t-4098):** datagram flows that
   share a landing instant against an op model; a waiting pipe op with a
-  deferred callback; a zero-room pipe receive (t-4096). (Pipe close,
+  deferred callback. (A zero-room pipe receive is refused since t-4096.) (Pipe close,
   shutdown and reset in the steps were added in round 3.)
 
 ### Round 3 of the outside review (gpt-simnet5.md, of b9b9bd1)
@@ -863,9 +865,9 @@ the mutants in its commits.
    bytes under random sends, receives, empty slices and a full buffer`;
    a336d63, 1143822). The pipe buffer alone (`sendBytes`, `drainBuf`),
    zero to five slices, with a reference that calls no pipe helper. Holes:
-   storage only (test 1 covers parking and harvest); a zero-length receive
-   on an empty sim pipe parks, and what the kernels do is not checked
-   (t-4096).
+   storage only (test 1 covers parking and harvest). A zero-length ev
+   receive is refused since t-4096; the pipe model test calls `drainBuf`
+   directly, so its empty slices still run.
 
 ### Next: phase 2 (faults and replay)
 
@@ -972,10 +974,10 @@ the mutants in its commits.
   jump 60 s with the old model green. Seeds 1 to 8 keep their counts.
 - **Phase 2 is built and reviewed.** This section is its acceptance record:
   the slices above, the gates in each commit, and rounds 5 and 6. Not done in it, by decision: NAT rebinding
-  (t-4100). Still open from phase 1: t-4096, t-4098 (the op model's
+  (t-4100). Still open from phase 1: t-4098 (the op model's
   holes; flows sharing a landing instant are still kept out of it).
-- Open and filed: t-4096 (zero-length receive on an empty sim pipe), t-4098
-  (the op model's holes above).
+- Open and filed: t-4098 (the op model's holes above). t-4096 is closed
+  (sitting 31: refused).
 - **The stream track (section 17).**
   - Revisions: 1 was 6e854fc; 2 was 2d987f7, with slice 0; 3 was 4e6459f.
     The grader accepted 17.17's three points and report 25's three open
