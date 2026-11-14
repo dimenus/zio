@@ -248,7 +248,7 @@ pub fn LocalRunQueue(comptime T: type, comptime stealable: bool) type {
         // past `h`, so the thief's CAS then fails and the copy is discarded
         // (Go's runqgrab makes the same argument). The value read is never
         // used, but two plain accesses would still be a data race, which TSan
-        // reports (t-3836). Monotonic is enough: a slot is published by the
+        // reports (#911). Monotonic is enough: a slot is published by the
         // release store of `tail` and claimed by the acq_rel CAS of `head`, not
         // by the slot access itself, and it compiles to a plain move on x86-64
         // and arm64. A non-stealable ring has one thread and stays plain.
