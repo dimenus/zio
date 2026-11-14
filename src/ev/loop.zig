@@ -1924,7 +1924,7 @@ pub const Loop = struct {
                 // A parked datagram op that a landing or a close made due.
                 const h = simOpHandle(c) orelse break :dgram;
                 if (!sim.isDgramFd(h)) break :dgram;
-                if (!sim.dgramIsOpen(h)) {
+                if (buf[i].closed or !sim.dgramIsOpen(h)) {
                     c.setError(error.FileDescriptorNotASocket);
                 } else if (!tryDgramOp(c)) {
                     sim.dgramPark(h, c, buf[i].id);

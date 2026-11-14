@@ -127,6 +127,10 @@ pub const DueKind = enum(u8) {
     /// Any ev op on a sim datagram socket (`dgramOpDone`, a landing or a
     /// close that wakes a parked op).
     dgram = 5,
+    /// A close woke an ev op parked on a sim datagram socket. The op ends
+    /// `FileDescriptorNotASocket` whatever the fd number holds when it is
+    /// harvested: by then a new open may have reused the number.
+    dgram_closed = 6,
 };
 
 const Due = struct {
@@ -139,6 +143,8 @@ const Due = struct {
 pub const TakenDue = struct {
     c: *anyopaque,
     id: u32,
+    /// The op was woken by a close of its socket (`DueKind.dgram_closed`).
+    closed: bool,
 };
 
 var due: [max_due]Due = undefined;
@@ -1010,7 +1016,7 @@ pub fn takeDue(out: []TakenDue) usize {
     while (i < due_len) : (i += 1) {
         if (due[i].due_at <= clock_ns) {
             if (n >= out.len) panic("sim: takeDue buffer too small", .{});
-            out[n] = .{ .c = due[i].c, .id = due[i].id };
+            out[n] = .{ .c = due[i].c, .id = due[i].id, .closed = due[i].kind == .dgram_closed };
             n += 1;
         } else {
             due[w] = due[i];
@@ -1430,7 +1436,10 @@ pub fn dgramClose(fd: i32) void {
     const d = dgramSlot("close", fd);
     // A real backend leaves such an op waiting for ever; the sim ends it, so
     // a test of close does not hang. It completes FileDescriptorNotASocket.
-    wakeParked(d);
+    if (d.parked) |p| {
+        d.parked = null;
+        pushDueAt(p.c, .dgram_closed, p.id, clock_ns);
+    }
     freeQueue(d);
     d.* = .{};
 }
@@ -4064,6 +4073,34 @@ test "sim: dgram: the receive queue matches a list of byte strings under random 
             return err;
         };
     }
+}
+
+// The outside review's sequence for finding 2 (review of 158ebba).
+test "sim: dgram ev: a receive parked on a socket that is closed and whose number is reused at once ends FileDescriptorNotASocket and leaves the new socket's datagram" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn parkedRecv(fd: i32) !usize {
+            var buf: [8]u8 = undefined;
+            return (try dg.evRecvFrom(fd, &buf)).len;
+        }
+        fn body() !void {
+            const rx = try dg.open();
+            try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
+            var h = try dg.runtime.spawn(parkedRecv, .{rx});
+            // Let the receive park.
+            try dg.rt_mod.sleep(.fromNanoseconds(1));
+            dg.os_net.close(rx);
+            const nx = try dg.open();
+            try std.testing.expectEqual(rx, nx);
+            try dg.bindTo(nx, dg.addr(127, 0, 0, 1, 0));
+            const tx = try dg.open();
+            _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, (try dg.local(nx)).port), null, "new");
+            try dg.settle();
+            try std.testing.expectError(error.FileDescriptorNotASocket, h.join());
+            var buf: [8]u8 = undefined;
+            try std.testing.expectEqualStrings("new", buf[0..(try dg.recvInto(nx, &.{&buf})).info.len]);
+        }
+    }.body);
 }
 
 test "sim: dgram: a closed fd number is reused by the next open, which does not see the old socket's data" {
