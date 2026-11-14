@@ -145,4 +145,6 @@ test {
     _ = @import("stderr.zig");
     _ = @import("os/syscall_cancel.zig");
     _ = @import("compat.zig");
+    // Its C half is compiled into the test binary on these two only (build.zig).
+    if (builtin.os.tag == .linux or builtin.os.tag == .macos) _ = @import("enet_bridge_test.zig");
 }

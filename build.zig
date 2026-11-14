@@ -29,13 +29,14 @@ pub fn build(b: *std.Build) void {
         .sim_mutant = sim_mutant orelse .none,
     };
 
+    const zio_build_options = build_options.create(b);
     const zio = b.addModule("zio", .{
         .root_source_file = b.path("src/zio.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = target.result.os.tag != .freestanding,
     });
-    zio.addOptions("zio_build_options", build_options.create(b));
+    zio.addOptions("zio_build_options", zio_build_options);
 
     const zio_lib = b.addLibrary(.{
         .name = "zio",
@@ -115,8 +116,27 @@ pub fn build(b: *std.Build) void {
     const emit_test_bin = b.option(bool, "emit-test-bin", "Build test binary without running") orelse false;
     const test_filter = b.option([]const u8, "test-filter", "Filter for test names");
 
+    // The test binary has its own root module: the same source and options as
+    // `zio`, plus the C half of the ENet-shaped bridge test on macOS and Linux
+    // (src/enet_bridge_test.c). `zio`, which the library and the examples
+    // build from, gets no C file.
+    const test_module = b.createModule(.{
+        .root_source_file = b.path("src/zio.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = target.result.os.tag != .freestanding,
+    });
+    test_module.addOptions("zio_build_options", zio_build_options);
+    switch (target.result.os.tag) {
+        .linux, .macos => test_module.addCSourceFile(.{
+            .file = b.path("src/enet_bridge_test.c"),
+            .flags = &.{ "-std=gnu11", "-Wall", "-Wextra", "-Werror" },
+        }),
+        else => {},
+    }
+
     const lib_unit_tests = b.addTest(.{
-        .root_module = zio,
+        .root_module = test_module,
         .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
         .filters = if (test_filter) |f| &.{f} else &.{},
     });
