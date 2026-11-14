@@ -2083,12 +2083,18 @@ fn checkSockStats(sk: *MSock) void {
 }
 
 fn pollOnce(cap_ns: u64) void {
+    // A poll moves the clock at most to the next landing the model predicts:
+    // a sim that scheduled it later would pass it (round 5, finding 2).
+    const earliest: ?u64 = if (M.wire.items.len > 0) M.wire.items[0].due else null;
     M.in_poll = true;
     M.loop.poll(.fromNanoseconds(cap_ns)) catch |e| fail("poll: {t}", .{e});
     M.in_poll = false;
     M.polls += 1;
     M.c.polls += 1;
-    syncLand();
+    if (earliest) |e| {
+        if (sim.clockNs() > e) fail("a poll moved the clock to {d} ns, past a landing the model has at {d} ns", .{ sim.clockNs(), e });
+    }
+    checkWire();
     const now = sim.clockNs();
     for (&M.slots) |*s| {
         if (!s.used or s.completions != 0 or s.cancel_req) continue;
@@ -2116,7 +2122,23 @@ fn pollOnce(cap_ns: u64) void {
     }
 }
 
+var wire_dues: [8192]u64 = undefined;
+
+/// The sim's wire must hold the datagrams the model has not landed yet, with
+/// the model's landing times, in its order (round 5 of the outside review,
+/// finding 2: the model computed landing times but compared none). Outside
+/// a harvest both have landed everything due by now.
+fn checkWire() void {
+    syncLand();
+    const n = sim.testWireDues(&wire_dues);
+    if (n != M.wire.items.len) fail("{d} datagrams on the sim's wire, {d} on the model's", .{ n, M.wire.items.len });
+    for (M.wire.items, wire_dues[0..n], 0..) |w, d, i| {
+        if (w.due != d) fail("datagram {d} on the wire lands at {d} ns in the sim, at {d} ns in the model", .{ i, d, w.due });
+    }
+}
+
 fn checkAfterStep() void {
+    checkWire();
     for (&M.socks) |*sk| {
         if (sk.open) checkSockStats(sk);
     }

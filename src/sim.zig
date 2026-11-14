@@ -1969,6 +1969,16 @@ fn recordLanding(w: WireDatagram, outcome: LandOutcome) void {
     wire_hasher.update(w.bytes);
 }
 
+/// The landing times of the datagrams on the wire, in landing order, so a
+/// test's model can compare them with its own (round 5 of the outside
+/// review, finding 2).
+pub fn testWireDues(out: []u64) usize {
+    if (comptime !builtin.is_test) @compileError("testWireDues is for tests");
+    if (wire.items.len > out.len) panic("sim: testWireDues: {d} datagrams on the wire, room for {d}", .{ wire.items.len, out.len });
+    for (wire.items, 0..) |w, i| out[i] = w.due_at;
+    return wire.items.len;
+}
+
 /// A hash of every datagram that reached its landing time in this run, in
 /// landing order: the time, both addresses and ports, landed or dropped, the
 /// length, and every payload byte. Two runs with equal digests delivered the
