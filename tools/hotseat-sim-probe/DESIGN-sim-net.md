@@ -1,8 +1,8 @@
 # Design brief: a sim network for zio (t-4086, t-4087), revision 3
 
-Status: **phase 1 (section 12) is built. Round 1 of the outside review
-(158ebba) is closed; round 2 (1126ebe) has F1 to F6 closed and three model
-tests open (section 15). The rest is for review.**
+Status: **phase 1 (section 12) is built. Rounds 1 (158ebba) and 2
+(1126ebe) of the outside review are closed, with the three model tests of
+round 2 (section 15). The rest is for review.**
 
 Revision 2 (dd55885) was reviewed by another vendor's model. This revision
 takes the decisions made after that review. Section 13 lists what changed
@@ -545,6 +545,9 @@ The scripts the gates below use are beside them, in `zio-sim6-tools/` there
   randomised model test of the sim pipe buffer (a336d63).** Each commit
   holds the failing run before the fix, the mutants, and what was rejected;
   the list is under "The outside review of 158ebba" below.
+- **Round 2 of the outside review, F1 to F6 (794ce5d to 47ac04c), and its
+  three model tests (4a228c9, 6299984, 1143822):** the list is under "Round
+  2 of the outside review" below.
 
 ### Phase 1 acceptance: what holds, group by group
 
@@ -712,19 +715,25 @@ fix, then the fix and mutants. Each commit has the failing output.
 - **F6, fixed in 47ac04c:** a sim fd in an `SCM_RIGHTS` message on a real
   socket refuses; a parameter named `control` is an fd carrier in the
   structural test, whose header now lists its known limits.
-- **Open, not started (the owner's list for sitting 15, in this order):**
-  - an op-level model test for datagram sockets and pipes together: a few
-    sockets and one pipe; random send, receive (ev, parked or not), poll,
-    cancel, race groups of two or three ops, close, open (number reuse),
-    SO_RCVBUF change and clock advance; a plain model of byte-string queues
-    and pending ops; after every step each op completed at most once and
-    with the model's result, nothing live or due at the end, no bytes lost
-    or doubled; seed and step on failure. It must find F1 and F2 on the old
-    code (`git revert` of 794ce5d and 7c0c22e in a scratch copy) and round
-    1's finding 2 (1b2d7ce reverted) within its normal run;
-  - the datagram queue model test: scatter buffers, the packet limit, a
-    drained tail;
-  - the pipe model test: an oracle that does not call `totalLen`.
+- **The op-level model test, 4a228c9:** `src/sim_op_model_test.zig`
+  (`sim: op model: ...`, run in a child process). Its header comment has
+  what it generates and checks, the rules that keep the model's answer
+  unique, and what it does not reach. With each fix reverted in a scratch
+  copy it finds round 1's finding 1 and finding 2 and round 2's F1 and F2
+  at its normal length (the seeds and steps are in the commit). Its
+  follow-ups (new ops submitted into a group's freed slots inside the
+  harvest) kill the two "pointer only" live-check mutants; with the
+  follow-ups off, both survive every model check.
+- **The datagram queue model test, 6299984:** scatter receives, the packet
+  limit, metadata wrap, SO_RCVBUF changes in flight and a drained tail, in
+  blocks that keep the first version's mix (which round 1's finding 1
+  needs).
+- **The pipe model test, 1143822:** the reference calls no helper of the
+  pipe code; zero to five slices.
+- **Not reached by any model test yet (t-4098):** pipe close,
+  shutdown and reset in the middle of the op-level test's steps; datagram
+  flows that share a landing instant against an op model; a waiting pipe
+  op with a deferred callback; a zero-room pipe receive (t-4096).
 
 ### Next
 
@@ -780,6 +789,20 @@ fix, then the fix and mutants. Each commit has the failing output.
   `build.zig`, `build.zig.zon` and `src/`. When they differ,
   `fndiff.py <a> <b>` lists the functions that differ, with only moved code
   and data normalized away. Control: the mutex's `locked` from 1 to 3.
+- **The op-level model test:** the filter `sim: op model`. It runs itself
+  in a child process; the parent prints the child's counts and, on a
+  failure, `op model: FAIL seed S step K: ...` or the last step the child
+  started. `ZIO_OP_MODEL_SEED=S` replays one seed, `ZIO_OP_MODEL_STEPS=N`
+  sets the length; both pass through `zig build test`. To run the child by
+  hand (to see all its output): the test binary from `.zig-cache/o/*/test`
+  with `ZIO_SIM_DEATH_CHILD=1` and `TEST_FILTER` set to the child's name.
+- **The revert check:** in a `git clone --shared` of the tree,
+  `mut/16-rev-edits.py <dir>` expects clones named after the four fix
+  commits under `<dir>` and reverts each fix's code there (only the code:
+  the tests that came with it stay); then run the filter `sim: op model` in
+  each. `mut/16-run-old-test.py <list.json>` runs a mutant list against an
+  older test in a clone at `mut/oldq` (`OLD_TEST`, `OLD_FILTER` name the
+  test and the filter).
 - **Mutants:** `mut/run.py <list.json> <out>`. A mutant counts only if it
   compiled and its named test is listed failed, or the test process crashed in
   it. Check the reason line of each kill, not just the verdict. It cuts each
@@ -849,6 +872,18 @@ fix, then the fix and mutants. Each commit has the failing output.
   with no control buffer on a socket asking for destination addresses sets
   `MSG_CTRUNC` on Linux 6.8 and not on macOS 25.6. Measure both before you
   write what "the kernel" does.
+- **A wider random test can lose a case the narrow one hit.** The first
+  wider queue mix let round 1's finding 1 survive: bursts kept the queue
+  long and big limits kept the ring big, and that defect needs a short
+  queue in a small ring that wraps. Keep the old mix as a block of the new
+  one, and keep the old defect in the mutant list.
+- **One poll moves the clock only to the next due op.** Settle by clock
+  time, not by a count of polls: 40 polls once ended at 28 ms while a pipe
+  send woken at 25.26 ms was due at 30.26 ms, and the end check took a
+  legal wait for a lost wake.
+- **Count skips by reason in a random test.** The op-level test's slot
+  pool was full in 7164 steps, which silently cut its traffic in half;
+  `no_free_slot` and the per-kind skip counts show it now.
 - **Tool rules for agents here:** a recursive `rm` of a path built from a
   variable is refused by a hook; make a new directory instead. Restoring a
   file with `git checkout <file>` is refused too, and would drop uncommitted
