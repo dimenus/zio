@@ -985,10 +985,24 @@ the mutants in its commits.
   own copy of the formula, with reorder on (218 overtaking) and off (218
   clamped). Mutants: `mut/20-s2.json` and `20-s2b.json` (28, all killed;
   one of them shows the check firing on a wake 1 ns late).
-- **Slices 3 and 4 are next** (section 12): the op model learns the faults
-  (a race group then holds at most one datagram send: `Group.add` puts a
-  member first, so the loop submits members in reverse, and a send's
-  number fixes its draws); then promise 3.
+- **Slice 3 (sitting 20): built.** The op-level model test predicts every
+  fault itself: its own rule table, burst states and copy of the draw
+  formula, the clamp, and the drop rules again at landing. It checks the
+  counts by cause and the draws after every step, each removed rule's
+  returned counts, and conservation per cause at the end. Seeds 1 to 8 are
+  the phase 1 mix, unchanged (each seed's counts equal those at bd82e2e);
+  seeds 9 to 16 add fault steps. With faults in every seed, the shapes
+  round 1's finding 1 needs fell by half, so the old mix stays a block of
+  its own. With faults, a race group holds at most one datagram send:
+  `Group.add` puts a member first, so the loop submits members in reverse,
+  and a send's number fixes its draws (mutant R1 shows the model failing
+  without this rule). Mutants: `mut/20-s3.json` (33, all killed by the
+  model's own FAIL line; the address mutant needed rules on 127.0.0.2,
+  which holds no socket). Full prediction held for every fault; nothing
+  falls back to conservation only.
+- **Slice 4 is next** (section 12): promise 3, a faulted workload in ten
+  fresh processes with the heap moved, and one changed rule giving
+  another digest.
 - Open and filed: t-4096 (zero-length receive on an empty sim pipe), t-4098
   (the op model's holes above).
 - **For hotseat, not zio:** ENet's receive returns 0 for an empty datagram,

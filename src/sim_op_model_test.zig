@@ -28,12 +28,21 @@
 // - Pipe steps also close an end, shut it down (receive, send or both), and
 //   arm a write error (`sim.setSendFaults(.fail_at_byte)`) that resets the
 //   pair.
+// - Fault steps (seeds 9 to 16; 1 to 8 keep the phase 1 mix), between
+//   polls, set or remove a datagram fault rule (design
+//   section 5): an impairment with random loss, burst, delay, jitter,
+//   reorder and duplication, a partition, or a silence, on paths of the
+//   sockets' ports with wildcards; at most `max_frules` in force. A removal
+//   checks the counts the sim returns against the model's. The end removes
+//   every rule before its proof.
 //
 // The model knows only byte strings, queues, ports and which ops are
 // pending. It shares no helper with the sim: it lands datagrams by the
 // design's rules (section 4 and 6: wire latency, the socket bound to the
 // destination port, the byte budget of length plus 256 and the 1024-packet
-// limit), and it keeps each pipe end as a list of bytes of at most
+// limit), decides every fault itself (section 5, with its own copy of the
+// draw formula of `sim.faultDraw`'s doc comment, its own rule table and
+// burst states, the order clamp, and the drop rules again at landing), and it keeps each pipe end as a list of bytes of at most
 // `pipe_buf_cap` with the sim's documented rules for close, shutdown and
 // reset written as its own (`pipeSendNow`, `pipeRecvNow`).
 //
@@ -46,8 +55,9 @@
 //   first); otherwise its result is computed from the model at its callback,
 //   and a pipe op must have been woken first.
 // - after every step: each open socket's `dropped_rcvbuf`, the run's
-//   no-socket drops, and the bytes buffered at each pipe end
-//   (`sim.testPipeBuffered`) equal the model's.
+//   no-socket drops, the bytes buffered at each pipe end
+//   (`sim.testPipeBuffered`), the fault counts by cause
+//   (`sim.netFaultStats`) and the fault draws equal the model's.
 // - after every poll, the wake obligations: a datagram op due before the
 //   poll began has completed; a receive or poll waiting on a socket that now
 //   has a datagram has completed; a pipe op woken (bytes, room, a close, a
@@ -58,7 +68,8 @@
 //   room or a datagram) and must then complete with the model's result: an
 //   op that lost its registration fails here, where a cancel would hide it.
 //   Then nothing is live or due, nothing is on the wire, every datagram sent
-//   was received once or counted as dropped, and every pipe byte accepted
+//   and every second copy was received once or counted as dropped (by the
+//   queue, no socket, a close, or a fault rule's cause), and every pipe byte accepted
 //   was received once, dropped by a reset, or left at an end closed for
 //   reading.
 // - probes (`ZIO_OP_MODEL_PROBE`, run by the parent in their own children):
@@ -72,7 +83,12 @@
 // - No op on a pipe end after the program closed it.
 // - Within one virtual instant, each destination port gets datagrams from
 //   one source only: the sim orders flows due at one time by the seed, and
-//   the model does not guess that order. Each flow is first in, first out.
+//   the model does not guess that order. The instants are the ones the model
+//   predicts for each copy, faults included (`flowClash`).
+// - With faults (seeds 9 to 16), a race group holds at most one datagram
+//   send. `ev.Group.add` puts each member first, so the loop submits
+//   members in reverse order, and a send's number in the run fixes its
+//   fault draws.
 // - A pipe op that will wait is never deferred: its harvest moves bytes, and
 //   a deferred callback would show that later than it happened.
 // - A callback acts inside a poll only on a socket whose waiting op does not
@@ -112,7 +128,15 @@ const os_net = @import("os/net.zig");
 const parent_name = "sim: op model: datagram sockets and a pipe under random sends, receives, polls, cancels, race groups, close and reopen";
 const child_name = parent_name ++ ", in a child process";
 
-const default_seeds = [_]u64{ 1, 2, 3, 4, 5, 6, 7, 8 };
+/// Seeds 1 to 8 run the phase 1 mix, unchanged; seeds 9 to 16 add fault
+/// steps (`faultsOn`). A wider mix loses rare shapes the narrow one hits
+/// (with faults in every seed, shapes round 1's finding 1 needs fell by
+/// half), so the old mix stays a block of its own.
+const default_seeds = [_]u64{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+
+fn faultsOn() bool {
+    return M.seed >= 9;
+}
 const default_steps: usize = 5000;
 
 const n_socks = 4;
@@ -274,7 +298,7 @@ const MSock = struct {
     }
 };
 
-const MWire = struct { due: u64, from_port: u16, to_port: u16, bytes: []const u8, to_gen: u32 };
+const MWire = struct { due: u64, from_port: u16, to_port: u16, bytes: []const u8, to_gen: u32, delayed: bool };
 
 /// One pipe end: `buf` holds the bytes sent TO it, not yet received. The
 /// flags are the sim's (`sim.End`), kept by the model from the steps.
@@ -325,6 +349,7 @@ const StepKind = enum {
     pipe_shutdown,
     pipe_reset,
     timer,
+    fault,
 };
 
 const step_weights = [_]struct { StepKind, u32 }{
@@ -332,7 +357,7 @@ const step_weights = [_]struct { StepKind, u32 }{
     .{ .layer_poll, 3 }, .{ .ev_poll, 5 },    .{ .pipe_send, 9 },  .{ .pipe_recv, 9 },
     .{ .cancel, 6 },     .{ .group, 9 },      .{ .close, 3 },      .{ .open, 4 },
     .{ .rcvbuf, 3 },     .{ .clock, 22 },     .{ .pipe_close, 1 }, .{ .pipe_shutdown, 1 },
-    .{ .pipe_reset, 1 }, .{ .timer, 3 },
+    .{ .pipe_reset, 1 }, .{ .timer, 3 },      .{ .fault, 4 },
 };
 
 const Counts = struct {
@@ -389,6 +414,23 @@ const Counts = struct {
     registration_proofs: u64 = 0,
     /// Race groups of waiting receives submitted at the end.
     end_groups: u64 = 0,
+    /// Fault rules set and removed (design section 5); datagrams the rules
+    /// dropped, by cause, and copies made, delayed, clamped and overtaking;
+    /// a waiting op woken by a delayed landing; removals whose returned
+    /// counts the model checked.
+    fault_sets: u64 = 0,
+    fault_removals: u64 = 0,
+    lost: u64 = 0,
+    lost_burst: u64 = 0,
+    partitioned_at_send: u64 = 0,
+    partitioned_in_flight: u64 = 0,
+    silenced_at_send: u64 = 0,
+    silenced_in_flight: u64 = 0,
+    duplicated: u64 = 0,
+    delayed: u64 = 0,
+    clamped: u64 = 0,
+    overtaking: u64 = 0,
+    delayed_wakes: u64 = 0,
 
     fn add(a: *Counts, b: Counts) void {
         inline for (comptime std.meta.fieldNames(Counts)) |name| {
@@ -438,6 +480,14 @@ const M = struct {
     var c: Counts = .{};
     var dropped_nosock: u64 = 0;
     var delivered: u64 = 0;
+    var frules: [max_frules]FRule = undefined;
+    var frules_len: usize = 0;
+    /// Distinct rule keys set in this run (the sim records at most 256).
+    var fkeys: std.ArrayList(FKey) = .empty;
+    var fstats: sim.NetFaultStats = .{};
+    var fdraws: u64 = 0;
+    /// The sim's send number of the next datagram.
+    var send_no: u64 = 0;
 
     fn r() std.Random {
         return rng.random();
@@ -463,6 +513,302 @@ fn sockAddr(port: u16) os_net.sockaddr.in {
     return .{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
 }
 
+// ---- the model's fault rules ----
+//
+// The test's own copy of design section 5 and of the draw formula in
+// `sim.faultDraw`'s doc comment. It uses the API's types (`sim.Endpoint`,
+// `sim.Impairment`) and nothing of the sim's fault code.
+
+const max_frules = 6;
+
+const FKind = enum { impairment, partition, silence };
+
+/// A rule's identity. A silence keeps its endpoint in `from`.
+const FKey = struct { kind: FKind, from: sim.Endpoint, to: sim.Endpoint };
+
+const FRule = struct {
+    key: FKey,
+    imp: sim.Impairment = .{},
+    bad: bool = false,
+    stats: sim.RuleStats = .{},
+};
+
+fn fmix(x: u64) u64 {
+    var z = x;
+    z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+    z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+    return z ^ (z >> 31);
+}
+
+fn fdraw(n: u64, purpose: u64, draws: *u64) u64 {
+    draws.* += 1;
+    return fmix(fmix(M.seed ^ 0x6e65745f6661756c) +% (n *% 8 +% purpose) *% 0x9e3779b97f4a7c15);
+}
+
+fn fhit(ppm: u32, n: u64, purpose: u64, draws: *u64) bool {
+    if (ppm == 0) return false;
+    if (ppm >= 1_000_000) return true;
+    return fdraw(n, purpose, draws) % 1_000_000 < ppm;
+}
+
+/// Every socket here is bound to 127.0.0.1.
+fn epMatches(e: sim.Endpoint, port: u16) bool {
+    if (e.ip) |ip| {
+        if (!std.mem.eql(u8, &ip, &[4]u8{ 127, 0, 0, 1 })) return false;
+    }
+    if (e.port) |p| {
+        if (p != port) return false;
+    }
+    return true;
+}
+
+fn ruleMatches(k: FKey, from: u16, to: u16) bool {
+    return switch (k.kind) {
+        .impairment, .partition => epMatches(k.from, from) and epMatches(k.to, to),
+        .silence => epMatches(k.from, from) or epMatches(k.from, to),
+    };
+}
+
+fn lastRule(kind: FKind, from: u16, to: u16) ?usize {
+    var i = M.frules_len;
+    while (i > 0) {
+        i -= 1;
+        if (M.frules[i].key.kind == kind and ruleMatches(M.frules[i].key, from, to)) return i;
+    }
+    return null;
+}
+
+const FDrop = enum { lost, lost_burst, partitioned, silenced };
+
+const Fate = struct {
+    drop: ?FDrop = null,
+    copies: u8 = 1,
+    due: [2]u64 = .{ 0, 0 },
+    draws: u64 = 0,
+};
+
+/// What the sim will do with the next datagram from `from` to `to` sent
+/// now. With `commit`, the model's counts, burst states and draws move as
+/// the sim's do; without, nothing in the model changes (a generator's
+/// look ahead).
+fn faultFate(from: u16, to: u16, commit: bool) Fate {
+    var f: Fate = .{};
+    const n = M.send_no;
+    if (commit) {
+        for (M.frules[0..M.frules_len]) |*r| {
+            if (ruleMatches(r.key, from, to)) r.stats.matched += 1;
+        }
+    }
+    if (lastRule(.silence, from, to)) |i| {
+        if (commit) {
+            M.frules[i].stats.dropped += 1;
+            M.fstats.silenced_at_send += 1;
+        }
+        f.drop = .silenced;
+        return f;
+    }
+    if (lastRule(.partition, from, to)) |i| {
+        if (commit) {
+            M.frules[i].stats.dropped += 1;
+            M.fstats.partitioned_at_send += 1;
+        }
+        f.drop = .partitioned;
+        return f;
+    }
+    const ai = lastRule(.impairment, from, to);
+    const imp: sim.Impairment = if (ai) |i| M.frules[i].imp else .{};
+    if (imp.burst) |b| {
+        var bad = M.frules[ai.?].bad;
+        if (bad) {
+            if (fhit(b.leave_ppm, n, 1, &f.draws)) bad = false;
+        } else {
+            if (fhit(b.enter_ppm, n, 1, &f.draws)) bad = true;
+        }
+        if (commit) M.frules[ai.?].bad = bad;
+        if (bad) {
+            if (commit) {
+                M.frules[ai.?].stats.dropped += 1;
+                M.fstats.lost_burst += 1;
+            }
+            f.drop = .lost_burst;
+            return f;
+        }
+    }
+    if (fhit(imp.loss_ppm, n, 2, &f.draws)) {
+        if (commit) {
+            M.frules[ai.?].stats.dropped += 1;
+            M.fstats.lost += 1;
+        }
+        f.drop = .lost;
+        return f;
+    }
+    if (fhit(imp.dup_ppm, n, 3, &f.draws)) {
+        f.copies = 2;
+        if (commit) {
+            M.frules[ai.?].stats.duplicated += 1;
+            M.fstats.duplicated += 1;
+        }
+    }
+    const now = sim.clockNs();
+    const base = now + sim.wire_latency_ns;
+    // The flow's latest datagram still on the wire: the sim's wire holds
+    // only datagrams due after now.
+    var latest: ?u64 = null;
+    for (M.wire.items) |w| {
+        if (w.due > now and w.from_port == from and w.to_port == to) latest = @max(latest orelse w.due, w.due);
+    }
+    for (0..f.copies) |c| {
+        var at = base + imp.delay_ns;
+        if (imp.jitter_ns != 0) at += fdraw(n, 4 + c, &f.draws) % (imp.jitter_ns + 1);
+        if (latest) |l| {
+            if (at < l) {
+                if (imp.reorder) {
+                    if (commit) M.fstats.overtaking += 1;
+                } else {
+                    at = l;
+                    if (commit) M.c.clamped += 1;
+                }
+            }
+        }
+        if (at > base and commit) {
+            M.fstats.delayed += 1;
+            if (ai) |i| M.frules[i].stats.delayed += 1;
+        }
+        f.due[c] = at;
+        latest = @max(latest orelse at, at);
+    }
+    return f;
+}
+
+/// The drop rules at a landing; true: dropped.
+fn faultInFlight(w: MWire) bool {
+    for (M.frules[0..M.frules_len]) |*r| {
+        if (r.key.kind != .impairment and ruleMatches(r.key, w.from_port, w.to_port)) r.stats.matched += 1;
+    }
+    if (lastRule(.silence, w.from_port, w.to_port)) |i| {
+        M.frules[i].stats.dropped += 1;
+        M.fstats.silenced_in_flight += 1;
+        return true;
+    }
+    if (lastRule(.partition, w.from_port, w.to_port)) |i| {
+        M.frules[i].stats.dropped += 1;
+        M.fstats.partitioned_in_flight += 1;
+        return true;
+    }
+    return false;
+}
+
+fn findFRule(k: FKey) ?usize {
+    for (M.frules[0..M.frules_len], 0..) |r, i| {
+        if (std.meta.eql(r.key, k)) return i;
+    }
+    return null;
+}
+
+fn removeFRule(i: usize) sim.RuleStats {
+    const st = M.frules[i].stats;
+    std.mem.copyForwards(FRule, M.frules[i .. M.frules_len - 1], M.frules[i + 1 .. M.frules_len]);
+    M.frules_len -= 1;
+    return st;
+}
+
+/// Room for one more rule key in the sim's record of the run (256).
+fn keyRoom(k: FKey) bool {
+    for (M.fkeys.items) |x| {
+        if (std.meta.eql(x, k)) return true;
+    }
+    if (M.fkeys.items.len == sim.max_rule_history) return false;
+    M.fkeys.append(M.gpa(), k) catch @panic("oom");
+    return true;
+}
+
+fn randomEndpoint(allow_ip: bool) sim.Endpoint {
+    const r = M.r();
+    return switch (r.uintLessThan(u8, 6)) {
+        0, 1 => .{},
+        // 127.0.0.2 holds no socket here: such a rule must match nothing.
+        2 => if (allow_ip) .{ .ip = .{ 127, 0, 0, 1 + r.uintLessThan(u8, 2) }, .port = base_port + r.uintLessThan(u16, 2 * n_socks) } else .{},
+        else => .{ .port = base_port + r.uintLessThan(u16, 2 * n_socks) },
+    };
+}
+
+fn randomImpairment() sim.Impairment {
+    const r = M.r();
+    const ppm = [_]u32{ 0, 0, 0, 100_000, 400_000, 1_000_000 };
+    var imp: sim.Impairment = .{
+        .loss_ppm = ppm[r.uintLessThan(usize, ppm.len)],
+        .delay_ns = ([_]u64{ 0, 0, 50_000, 1_000_000, 3_000_000 })[r.uintLessThan(usize, 5)],
+        .jitter_ns = ([_]u64{ 0, 0, 200_000, 2_000_000 })[r.uintLessThan(usize, 4)],
+        .reorder = r.boolean(),
+        .dup_ppm = ppm[r.uintLessThan(usize, ppm.len)],
+    };
+    if (r.uintLessThan(u8, 4) == 0) imp.burst = .{
+        .enter_ppm = ([_]u32{ 50_000, 300_000, 1_000_000 })[r.uintLessThan(usize, 3)],
+        .leave_ppm = ([_]u32{ 100_000, 500_000, 1_000_000 })[r.uintLessThan(usize, 3)],
+    };
+    if (std.meta.eql(imp, sim.Impairment{})) imp.delay_ns = 1_000_000;
+    return imp;
+}
+
+fn checkRemoved(what: []const u8, got: sim.RuleStats, want: sim.RuleStats) void {
+    if (!std.meta.eql(got, want)) fail("{s}: the sim's rule counts {any}, the model's {any}", .{ what, got, want });
+    M.c.fault_removals += 1;
+}
+
+/// A fault step: set or remove one rule, between polls. Everything due by
+/// now has landed in both the sim and the model first.
+fn faultStep() bool {
+    syncLand();
+    const r = M.r();
+    const choice = r.uintLessThan(u8, 12);
+    if (choice < 6) {
+        if (M.frules_len == max_frules) return false;
+        var k: FKey = switch (choice) {
+            0, 1, 2 => .{ .kind = .impairment, .from = randomEndpoint(false), .to = randomEndpoint(true) },
+            3, 4 => .{ .kind = .partition, .from = randomEndpoint(false), .to = randomEndpoint(true) },
+            else => .{ .kind = .silence, .from = randomEndpoint(true), .to = .{} },
+        };
+        // A silence of every endpoint would stop all traffic until removed.
+        if (k.kind == .silence and k.from.port == null) k.from.port = base_port;
+        if (k.kind != .impairment and findFRule(k) != null) return false;
+        if (!keyRoom(k)) return false;
+        const path: sim.Path = .{ .from = k.from, .to = k.to };
+        switch (k.kind) {
+            .impairment => {
+                const imp = randomImpairment();
+                sim.setImpairment(path, imp);
+                if (findFRule(k)) |i| _ = removeFRule(i);
+                M.frules[M.frules_len] = .{ .key = k, .imp = imp };
+            },
+            .partition => {
+                sim.setPartition(path);
+                M.frules[M.frules_len] = .{ .key = k };
+            },
+            .silence => {
+                sim.silence(k.from);
+                M.frules[M.frules_len] = .{ .key = k };
+            },
+        }
+        M.frules_len += 1;
+        M.c.fault_sets += 1;
+        return true;
+    }
+    if (M.frules_len == 0) return false;
+    removeRandomFRule(r.uintLessThan(usize, M.frules_len));
+    return true;
+}
+
+fn removeRandomFRule(i: usize) void {
+    const k = M.frules[i].key;
+    const want = removeFRule(i);
+    const path: sim.Path = .{ .from = k.from, .to = k.to };
+    switch (k.kind) {
+        .impairment => checkRemoved("clearImpairment", sim.clearImpairment(path), want),
+        .partition => checkRemoved("healPartition", sim.healPartition(path), want),
+        .silence => checkRemoved("unsilence", sim.unsilence(k.from), want),
+    }
+}
+
 // ---- the model's datagram wire ----
 
 /// Lands every model datagram due by the sim's clock. The sim lands them at
@@ -472,7 +818,10 @@ fn sockAddr(port: u16) os_net.sockaddr.in {
 fn syncLand() void {
     const now = sim.clockNs();
     var n: usize = 0;
-    while (n < M.wire.items.len and M.wire.items[n].due <= now) : (n += 1) landOne(M.wire.items[n]);
+    while (n < M.wire.items.len and M.wire.items[n].due <= now) : (n += 1) {
+        if (M.frules_len != 0 and faultInFlight(M.wire.items[n])) continue;
+        landOne(M.wire.items[n]);
+    }
     M.wire.replaceRange(M.gpa(), 0, n, &.{}) catch @panic("oom");
 }
 
@@ -486,6 +835,7 @@ fn landOne(w: MWire) void {
             return;
         }
         if (s.only_empty and w.bytes.len > 0) M.c.landed_behind_empty += 1;
+        if (w.delayed and s.waiting != null) M.c.delayed_wakes += 1;
         s.q.append(M.gpa(), .{ .bytes = w.bytes, .from_port = w.from_port }) catch @panic("oom");
         s.charged += cost;
         if (s.gen != w.to_gen) M.c.landed_in_new_socket += 1;
@@ -502,12 +852,16 @@ fn sockByPort(port: u16) ?*MSock {
     return null;
 }
 
-/// Whether a datagram from `from_port` to `to_port` sent now would share its
-/// landing instant with another flow to the same port.
+/// Whether a datagram from `from_port` to `to_port` sent now would share a
+/// landing instant with another flow to the same port: at the instants the
+/// model predicts for its copies, faults included.
 fn flowClash(from_port: u16, to_port: u16) bool {
-    const due = sim.clockNs() + sim.wire_latency_ns;
-    for (M.wire.items) |w| {
-        if (w.due == due and w.to_port == to_port and w.from_port != from_port) return true;
+    const f = faultFate(from_port, to_port, false);
+    if (f.drop != null) return false;
+    for (f.due[0..f.copies]) |due| {
+        for (M.wire.items) |w| {
+            if (w.due == due and w.to_port == to_port and w.from_port != from_port) return true;
+        }
     }
     return false;
 }
@@ -525,9 +879,19 @@ fn pickDestPort() u16 {
 
 fn modelSend(from: *MSock, to_port: u16, bytes: []const u8) void {
     const to_gen: u32 = if (sockByPort(to_port)) |t| t.gen else 0;
-    M.wire.append(M.gpa(), .{ .due = sim.clockNs() + sim.wire_latency_ns, .from_port = from.port, .to_port = to_port, .bytes = bytes, .to_gen = to_gen }) catch @panic("oom");
     M.c.dgrams_sent += 1;
     if (bytes.len == 0) M.c.empty_dgrams += 1;
+    const f = faultFate(from.port, to_port, true);
+    M.fdraws += f.draws;
+    M.send_no += 1;
+    if (f.drop != null) return;
+    const base = sim.clockNs() + sim.wire_latency_ns;
+    for (f.due[0..f.copies]) |due| {
+        // After every datagram due no later, as the sim's wire.
+        var pos = M.wire.items.len;
+        while (pos > 0 and M.wire.items[pos - 1].due > due) pos -= 1;
+        M.wire.insert(M.gpa(), pos, .{ .due = due, .from_port = from.port, .to_port = to_port, .bytes = bytes, .to_gen = to_gen, .delayed = due > base }) catch @panic("oom");
+    }
 }
 
 fn takeHead(s: *MSock) Dgm {
@@ -1193,13 +1557,17 @@ fn randomOpKind() OpKind {
 
 fn pickStep() StepKind {
     var total: u32 = 0;
-    for (step_weights) |w| total += w[1];
+    for (step_weights) |w| total += weight(w);
     var x = M.r().uintLessThan(u32, total);
     for (step_weights) |w| {
-        if (x < w[1]) return w[0];
-        x -= w[1];
+        if (x < weight(w)) return w[0];
+        x -= weight(w);
     }
     unreachable;
+}
+
+fn weight(w: @TypeOf(step_weights[0])) u32 {
+    return if (w[0] == .fault and !faultsOn()) 0 else w[1];
 }
 
 fn runStep(kind: StepKind) bool {
@@ -1286,6 +1654,7 @@ fn runStep(kind: StepKind) bool {
             }
         },
         .group => return runGroup(),
+        .fault => return faultStep(),
         .close => {
             const k = openSock(false) orelse return false;
             if (r.boolean()) {
@@ -1371,6 +1740,7 @@ fn runGroup() bool {
     const f1 = r.uintLessThan(u8, 3) == 0;
     var used_fds: [3]i32 = .{ -2, -2, -2 };
     var pipe_used = false;
+    var send_used = false;
     var members: [3]*Slot = undefined;
     var got: usize = 0;
     var tries: usize = 0;
@@ -1383,6 +1753,7 @@ fn runGroup() bool {
         } else randomOpKind();
         const is_pipe = kind == .p_send or kind == .p_recv;
         if (is_pipe and pipe_used) continue;
+        if (kind == .d_send and send_used and faultsOn()) continue;
         // Pick a target fd not used by another member.
         const s: ?*Slot = blk: {
             if (is_pipe) {
@@ -1408,6 +1779,7 @@ fn runGroup() bool {
         };
         const m = s orelse continue;
         if (is_pipe) pipe_used = true else used_fds[got] = m.fd;
+        if (kind == .d_send) send_used = true;
         members[got] = m;
         got += 1;
     }
@@ -1727,6 +2099,9 @@ fn checkAfterStep() void {
         if (got != e.buf.items.len) fail("pipe end fd {d} holds {d} bytes, the model {d}", .{ e.fd, got, e.buf.items.len });
     }
     if (sim.datagramsDroppedNoSocket() != M.dropped_nosock) fail("{d} datagrams dropped with no socket, the model {d}", .{ sim.datagramsDroppedNoSocket(), M.dropped_nosock });
+    const fs = sim.netFaultStats();
+    if (!std.meta.eql(fs, M.fstats)) fail("fault counts: the sim's {any}, the model's {any}", .{ fs, M.fstats });
+    if (sim.netFaultDraws() != M.fdraws) fail("{d} fault draws, the model {d}", .{ sim.netFaultDraws(), M.fdraws });
 }
 
 // ---- one seed ----
@@ -1754,6 +2129,11 @@ fn runSeed(seed_value: u64, steps: usize, child: bool) Counts {
     M.c = .{};
     M.dropped_nosock = 0;
     M.delivered = 0;
+    M.frules_len = 0;
+    M.fkeys = .empty;
+    M.fstats = .{};
+    M.fdraws = 0;
+    M.send_no = 0;
 
     sim.begin(seed_value);
     defer sim.end();
@@ -1782,8 +2162,12 @@ fn runSeed(seed_value: u64, steps: usize, child: bool) Counts {
 /// registration fails here, where cancelling it would have hidden it. Then
 /// drain and close everything, and check that nothing is left.
 fn finish() void {
+    // No fault acts on what the end sends to prove a registration.
+    syncLand();
+    while (M.frules_len > 0) removeRandomFRule(M.frules_len - 1);
     // Settle by clock time, not by a count of polls: a poll moves the clock
-    // only to the next due op, and a pipe op is due up to 5 ms after a wake.
+    // only to the next due op, a pipe op is due up to 5 ms after a wake, and
+    // a datagram up to delay plus jitter (5 ms) after its send.
     settle(20 * std.time.ns_per_ms);
     checkAfterStep();
     // Empty the queues (a layer receive each, checked), so every socket
@@ -1897,8 +2281,13 @@ fn finish() void {
     for (&M.slots) |*s| {
         if (s.used) fail("slot of op #{d} still held at the end", .{s.serial});
     }
-    const lost = M.c.dgrams_sent - M.delivered - M.c.dropped_rcvbuf - M.c.dropped_nosock - M.c.discarded_at_close;
-    if (lost != 0) fail("{d} datagrams sent, {d} received, {d} + {d} dropped, {d} discarded at close", .{ M.c.dgrams_sent, M.delivered, M.c.dropped_rcvbuf, M.c.dropped_nosock, M.c.discarded_at_close });
+    // Every datagram sent, and every second copy, was received, dropped
+    // with a cause, or discarded at a close; none is left on the wire.
+    const fs = M.fstats;
+    const by_fault = fs.lost + fs.lost_burst + fs.partitioned_at_send + fs.partitioned_in_flight + fs.silenced_at_send + fs.silenced_in_flight;
+    const lost = M.c.dgrams_sent + fs.duplicated - M.delivered - M.c.dropped_rcvbuf - M.c.dropped_nosock - M.c.discarded_at_close - by_fault;
+    if (lost != 0) fail("{d} datagrams sent and {d} copies, {d} received, {d} + {d} dropped, {d} discarded at close, {d} dropped by a fault rule", .{ M.c.dgrams_sent, fs.duplicated, M.delivered, M.c.dropped_rcvbuf, M.c.dropped_nosock, M.c.discarded_at_close, by_fault });
+    inline for (comptime std.meta.fieldNames(sim.NetFaultStats)) |name| @field(M.c, name) = @field(fs, name);
     var accepted: u64 = 0;
     var received: u64 = 0;
     var dropped: u64 = 0;
@@ -2015,6 +2404,7 @@ fn printCounts(c: Counts, seeds: usize, steps: usize) void {
     std.debug.print("op model counts: ops={d} parked={d} canceled={d} closed_hit={d} reused_number_ops={d} closed_then_reused={d} groups={d} f1_shape_groups={d} followups={d} followups_into_canceled_due={d}\n", .{ c.ops, c.parked, c.canceled, c.closed_hit, c.reused_number_ops, c.closed_then_reused, c.groups, c.f1_shape_groups, c.followups, c.followups_into_canceled_due });
     std.debug.print("op model counts: dgrams_sent={d} empty={d} truncated={d} scatter_recvs={d} dropped_rcvbuf={d} dropped_nosock={d} discarded_at_close={d} landed_in_new_socket={d} only_empty_left={d} landed_behind_empty={d} pipe_parked_sends={d} would_block={d} polls={d} no_free_slot={d}\n", .{ c.dgrams_sent, c.empty_dgrams, c.truncated, c.scatter_recvs, c.dropped_rcvbuf, c.dropped_nosock, c.discarded_at_close, c.landed_in_new_socket, c.only_empty_left, c.landed_behind_empty, c.pipe_parked_sends, c.would_block, c.polls, c.no_free_slot });
     std.debug.print("op model counts: woken_completed={d} registration_proofs={d} end_groups={d} in_batch_reopen={d} in_batch_steal={d} in_batch_cancel={d} timers_fired={d} timer_and_io_at_one_time={d} pipe_pairs={d} pipe_closes={d} pipe_shutdowns={d} pipe_resets={d} end_of_stream={d} broken_pipe={d} reset_errors={d}\n", .{ c.woken_completed, c.registration_proofs, c.end_groups, c.in_batch_reopen, c.in_batch_steal, c.in_batch_cancel, c.timers_fired, c.timer_and_io_at_one_time, c.pipe_pairs, c.pipe_closes, c.pipe_shutdowns, c.pipe_resets, c.end_of_stream, c.broken_pipe, c.reset_errors });
+    std.debug.print("op model counts: fault_sets={d} fault_removals={d} lost={d} lost_burst={d} partitioned_at_send={d} partitioned_in_flight={d} silenced_at_send={d} silenced_in_flight={d} duplicated={d} delayed={d} clamped={d} overtaking={d} delayed_wakes={d}\n", .{ c.fault_sets, c.fault_removals, c.lost, c.lost_burst, c.partitioned_at_send, c.partitioned_in_flight, c.silenced_at_send, c.silenced_in_flight, c.duplicated, c.delayed, c.clamped, c.overtaking, c.delayed_wakes });
 }
 
 test "sim: op model: datagram sockets and a pipe under random sends, receives, polls, cancels, race groups, close and reopen, in a child process" {
@@ -2048,7 +2438,7 @@ test "sim: op model: datagram sockets and a pipe under random sends, receives, p
     for (total.steps, 0..) |n, k| {
         if (n == 0) fail("no step of kind {t} ran", .{@as(StepKind, @fromBackingInt(@intCast(k)))});
     }
-    inline for (.{ "parked", "canceled", "closed_hit", "reused_number_ops", "closed_then_reused", "f1_shape_groups", "followups_into_canceled_due", "empty_dgrams", "truncated", "scatter_recvs", "dropped_rcvbuf", "dropped_nosock", "discarded_at_close", "landed_in_new_socket", "pipe_parked_sends", "woken_completed", "registration_proofs", "end_groups", "in_batch_reopen", "in_batch_steal", "in_batch_cancel", "timers_fired", "timer_and_io_at_one_time", "pipe_closes", "pipe_shutdowns", "pipe_resets", "end_of_stream", "broken_pipe", "reset_errors" }) |name| {
+    inline for (.{ "parked", "canceled", "closed_hit", "reused_number_ops", "closed_then_reused", "f1_shape_groups", "followups_into_canceled_due", "empty_dgrams", "truncated", "scatter_recvs", "dropped_rcvbuf", "dropped_nosock", "discarded_at_close", "landed_in_new_socket", "pipe_parked_sends", "woken_completed", "registration_proofs", "end_groups", "in_batch_reopen", "in_batch_steal", "in_batch_cancel", "timers_fired", "timer_and_io_at_one_time", "pipe_closes", "pipe_shutdowns", "pipe_resets", "end_of_stream", "broken_pipe", "reset_errors", "fault_sets", "fault_removals", "lost", "lost_burst", "partitioned_at_send", "partitioned_in_flight", "silenced_at_send", "silenced_in_flight", "duplicated", "delayed", "clamped", "overtaking", "delayed_wakes" }) |name| {
         if (@field(total, name) == 0) fail("the counter {s} is 0: that case never ran", .{name});
     }
     sim.childDone(child_name);
