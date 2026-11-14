@@ -408,6 +408,10 @@ pub const Waiter = struct {
     /// can see it. For a task the wake-up and the wake are one CAS on the
     /// task's state word (see `Executor.scheduleTask`).
     pub fn signal(self: *Waiter) void {
+        // Before the select claim, the trace write and the schedule below: a
+        // custom future can keep the waiter it was given and signal it from
+        // any thread.
+        @import("sim.zig").refuseOtherThread("Waiter.signal");
         switch (self.tag) {
             .direct => switch (self.mode.direct.tag) {
                 .task => {
@@ -460,6 +464,7 @@ pub const Waiter = struct {
     /// owner's re-poll can find it.
     ///
     pub fn tryClaim(self: *Waiter) ClaimResult {
+        @import("sim.zig").refuseOtherThread("Waiter.tryClaim");
         switch (self.tag) {
             .direct => return .won,
             .select => {

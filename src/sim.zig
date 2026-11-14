@@ -212,25 +212,36 @@ fn threadKey() u64 {
 }
 
 /// The rule, for a sim run (from `begin` to `end`): every public zio
-/// operation that changes state a task can later see runs on the thread that
-/// called `begin`, and is checked at its entry, before its first write. A
-/// change made by another thread lands at a real time the seed does not
-/// choose, so the run would stop being a function of its seed. The check is
-/// made whether or not a task waits at that moment: a refusal that fired only
-/// when one waits would itself depend on timing.
+/// operation that changes state a task can later see (zio's primitives, the
+/// runtime and its loops, the simulator, and kernel state reached through
+/// zio: files, sockets, the working directory, processes) runs on the thread
+/// that called `begin`, and is checked at its entry, before its first write.
+/// A change made by another thread lands at a real time the seed does not
+/// choose. The check is made whether or not a task waits at that moment: a
+/// refusal that fired only when one waits would itself depend on timing.
 ///
 /// Each such operation either calls `refuseOtherThread` first, or makes its
 /// first write through one that does (`RwLock.tryLock` through
 /// `Mutex.tryLock`; channels, semaphores, barriers through their mutex; every
-/// blocking wait through the waiter it creates, `Waiter.Direct.init`). Not
-/// covered, and out of the rule: read-only operations; operations whose own
-/// contract already requires the loop's thread in every build (`Loop.add`,
-/// `Loop.poll`, `Loop.cancel`, ...); plain atomics a program shares with a
-/// thread; C code. The simulator cannot see the last two. Compiled out
-/// without sim.
+/// blocking wait, file and socket op through the waiter it creates,
+/// `Waiter.Direct.init`; every spawn through `spawnTask`).
 ///
-/// The entry points and the reasoning for each public function are in the
-/// commit that added this list (t-4085 round 3).
+/// What the rule's enumeration covers, function by function (the lists are
+/// in the commits for t-4085 rounds 3 and 4): every `pub fn` in src/sync/,
+/// src/group.zig, task.zig, sim.zig, signal.zig, common.zig,
+/// completion_queue.zig, autocancel.zig, select.zig, runtime.zig, fs.zig,
+/// net.zig, dns/, the src/ev files that run under sim (loop, completion,
+/// thread_pool, blocking, heap, queue, buf, sockreg), and every entry of
+/// io.zig's `std.Io` vtable. Not enumerated: src/os/ (the syscall wrappers
+/// those call), coro/, utils/, and the backends, which never run under sim.
+///
+/// Out of the rule: read-only operations; writes only to a field of a value
+/// the caller owns (`TempFile.keep`, a reader's `setTimeout`), which zio does
+/// not share; operations whose own contract already requires the loop's
+/// thread or the select's owner in every build (`Loop.add`, `Loop.poll`,
+/// `Loop.cancel`, `Waiter.beginCommit`/`finishCommit`/`abortCommit`/
+/// `promotePending`); plain atomics a program shares with a thread; C code.
+/// The simulator cannot see the last two. Compiled out without sim.
 pub inline fn refuseOtherThread(comptime what: []const u8) void {
     if (comptime !compiled_in) return;
     checkSimThread(what);
@@ -1130,7 +1141,7 @@ const death = struct {
 
 test "sim: refuses a task spawn from another thread" {
     if (comptime !compiled_in) return error.SkipZigTest;
-    if (!isDeathChild()) return expectChildPanics("sim: refuses a task spawn from another thread", "sim: a task wake or spawn from a thread that is not the sim thread");
+    if (!isDeathChild()) return expectChildPanics("sim: refuses a task spawn from another thread", "sim: a task spawn from a thread that is not the sim thread");
     noCoreDump();
     const rt = try death.up(1);
     try death.onOtherThread(struct {
@@ -1255,8 +1266,12 @@ test "sim: every task parked with only the shrink timer pending is a deadlock, t
 
 // ---- Runs that must end normally (round 3) ----
 
-/// Like `expectChildPanics`, for a run that must end normally: the child
-/// must exit 0 within 30 s.
+/// Like `expectChildPanics`, for a run that must end normally. The child
+/// must exit 0 within 30 s, and must prove it ran exactly the requested case:
+/// each success case ends with `childDone`, which writes
+/// `sim-child-done: <name>`, and exactly one such line, naming this test,
+/// must appear. The runner's filter is a substring match and exits 0 when it
+/// matches nothing, so exit 0 alone proves nothing (round 4, A5).
 fn expectChildSucceeds(comptime test_name: []const u8) !void {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
@@ -1274,12 +1289,65 @@ fn expectChildSucceeds(comptime test_name: []const u8) !void {
     });
     defer gpa.free(res.stdout);
     defer gpa.free(res.stderr);
-    switch (res.term) {
-        .exited => |code| if (code == 0) return,
-        else => {},
+    const exited_zero = switch (res.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!exited_zero) {
+        std.debug.print("child of \"{s}\": term {any}, wanted exit 0; stderr:\n{s}\n", .{ test_name, res.term, res.stderr });
+        return error.ChildFailed;
     }
-    std.debug.print("child of \"{s}\": term {any}, wanted exit 0; stderr:\n{s}\n", .{ test_name, res.term, res.stderr });
-    return error.ChildFailed;
+    return checkDoneMarkers(test_name, res.stderr);
+}
+
+const done_marker = "sim-child-done: ";
+
+/// The end of a success case in a child: proof that this case ran to its end.
+fn childDone(comptime test_name: []const u8) void {
+    const line = done_marker ++ test_name ++ "\n";
+    if (comptime builtin.link_libc and builtin.os.tag != .windows) {
+        _ = std.c.write(2, line.ptr, line.len);
+    } else std.debug.print("{s}", .{line});
+}
+
+fn checkDoneMarkers(test_name: []const u8, stderr: []const u8) error{ ChildRanNoCase, ChildRanSeveralCases, ChildRanOtherCase }!void {
+    var count: usize = 0;
+    var named: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, stderr, '\n');
+    while (it.next()) |line| {
+        // The runner's progress output can share the line (an erase-line
+        // escape before it), so the marker is found anywhere in the line.
+        const at = std.mem.indexOf(u8, line, done_marker) orelse continue;
+        count += 1;
+        named = line[at + done_marker.len ..];
+    }
+    if (count == 0) return error.ChildRanNoCase;
+    if (count > 1) return error.ChildRanSeveralCases;
+    if (!std.mem.eql(u8, named.?, test_name)) return error.ChildRanOtherCase;
+}
+
+test "sim: success helper: fixture, case" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return;
+    childDone("sim: success helper: fixture, case");
+}
+
+test "sim: success helper: fixture, other case" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return;
+    childDone("sim: success helper: fixture, other case");
+}
+
+// `-Dtest-filter` is applied at compile time, and the child is the same
+// binary: the fixtures share this test's prefix so a filter that selects it
+// also compiles them in.
+test "sim: success helper: rejects a filter that runs no case, several cases, or another case" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (isDeathChild()) return;
+    try expectChildSucceeds("sim: success helper: fixture, case");
+    try std.testing.expectError(error.ChildRanNoCase, expectChildSucceeds("sim: success helper: fixture, none"));
+    try std.testing.expectError(error.ChildRanSeveralCases, expectChildSucceeds("sim: success helper: fixture, "));
+    try std.testing.expectError(error.ChildRanOtherCase, expectChildSucceeds("sim: success helper: fixture, other"));
 }
 
 /// A1 (round 3): a callback on executor 1 notifies an async handle on
@@ -1346,14 +1414,16 @@ test "sim: a wake left pending on a loop already polled is not a deadlock, two e
     noCoreDump();
     var s: u64 = 1;
     while (s <= 20) : (s += 1) try cross_loop.runSeed(s, true);
+    childDone("sim: a wake left pending on a loop already polled is not a deadlock, two executors");
 }
 
-test "sim: a wake left pending on a loop already polled is not a deadlock, two executors, no timer at all" {
+test "sim: with no timer armed, a wake left pending on a loop already polled is not a deadlock" {
     if (comptime !compiled_in) return error.SkipZigTest;
-    if (!isDeathChild()) return expectChildSucceeds("sim: a wake left pending on a loop already polled is not a deadlock, two executors, no timer at all");
+    if (!isDeathChild()) return expectChildSucceeds("sim: with no timer armed, a wake left pending on a loop already polled is not a deadlock");
     noCoreDump();
     var s: u64 = 1;
     while (s <= 20) : (s += 1) try cross_loop.runSeed(s, false);
+    childDone("sim: with no timer armed, a wake left pending on a loop already polled is not a deadlock");
 }
 
 /// The same cross-loop wake with a task timer armed elsewhere (a 1 s sleep
@@ -1403,6 +1473,7 @@ test "sim: a wake left pending on a loop already polled is handled before the cl
     noCoreDump();
     var s: u64 = 1;
     while (s <= 20) : (s += 1) try cross_loop_timed.runSeed(s);
+    childDone("sim: a wake left pending on a loop already polled is handled before the clock moves, two executors");
 }
 
 // ---- Round 3 refusals: one test per new check ----
@@ -1877,6 +1948,481 @@ test "sim: refuses thread-pool work on a worker thread during a run" {
             const rt = try r3.rt_mod.Runtime.init(std.heap.page_allocator, .{ .executors = .exact(1) });
             _ = rt;
             @import("common.zig").blockInPlace(r3.noopRet, .{});
+        }
+    }.body);
+}
+
+// ---- Round 4 (A2, A3): entry checks on the remaining public mutators ----
+
+const r4 = struct {
+    const Waiter = @import("common.zig").Waiter;
+    const AsyncWaitState = @import("common.zig").AsyncWaitState;
+    const select_mod = @import("select.zig");
+    const AnyTask = @import("task.zig").AnyTask;
+    const Work = @import("ev/completion.zig").Work;
+
+    /// A custom future that keeps the waiter zio gives it, as the Future
+    /// protocol allows, so another thread can reach that waiter.
+    const Stash = struct {
+        stashed: ?*Waiter = null,
+        pub const Result = void;
+        pub fn asyncWait(self: *Stash, waiter: *Waiter) AsyncWaitState {
+            self.stashed = waiter;
+            return .queued;
+        }
+        pub fn asyncCancelWait(self: *Stash, waiter: *Waiter) bool {
+            _ = waiter;
+            self.stashed = null;
+            return true;
+        }
+        pub fn getResult(self: *Stash) void {
+            _ = self;
+        }
+    };
+
+    var a: Stash = .{};
+    var b: Stash = .{};
+    var work: Work = undefined;
+
+    fn waitDirect() void {
+        _ = select_mod.wait(&a) catch {};
+    }
+
+    fn waitSelect() void {
+        _ = select_mod.select(.{ .a = &a, .b = &b }) catch {};
+    }
+
+    fn untilStashed() !void {
+        while (a.stashed == null) try r3.rt.yield();
+    }
+
+    fn noWork(_: *Work) void {}
+};
+
+test "sim: refuses Waiter.signal from another thread, on a direct waiter a custom future kept" {
+    try refusal("sim: refuses Waiter.signal from another thread, on a direct waiter a custom future kept", "sim: Waiter.signal" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r3_task.handle = try r3.rt.spawn(r4.waitDirect, .{});
+            try r4.untilStashed();
+            try r3.other(struct {
+                fn f() void {
+                    r4.a.stashed.?.signal();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Waiter.signal from another thread, on a select waiter a custom future kept" {
+    try refusal("sim: refuses Waiter.signal from another thread, on a select waiter a custom future kept", "sim: Waiter.signal" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r3_task.handle = try r3.rt.spawn(r4.waitSelect, .{});
+            try r4.untilStashed();
+            try r3.other(struct {
+                fn f() void {
+                    r4.a.stashed.?.signal();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Waiter.tryClaim from another thread, on a select waiter a custom future kept" {
+    try refusal("sim: refuses Waiter.tryClaim from another thread, on a select waiter a custom future kept", "sim: Waiter.tryClaim" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r3_task.handle = try r3.rt.spawn(r4.waitSelect, .{});
+            try r4.untilStashed();
+            try r3.other(struct {
+                fn f() void {
+                    _ = r4.a.stashed.?.tryClaim();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses AnyTask.setCanceled from another thread" {
+    try refusal("sim: refuses AnyTask.setCanceled from another thread", "sim: AnyTask.setCanceled" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r3_task.handle = try r3.rt.spawn(r3.waitForever, .{});
+            try r3.rt.yield();
+            try r3.other(struct {
+                fn f() void {
+                    _ = r4.AnyTask.fromAwaitable(r3_task.handle.awaitable.?).setCanceled(.user);
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses ThreadPool.submit from another thread, inline pool" {
+    try refusal("sim: refuses ThreadPool.submit from another thread, inline pool", "sim: ThreadPool.submit" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r4.work = r4.Work.init(r4.noWork, null);
+            try r3.other(struct {
+                fn f() void {
+                    r3.rt.thread_pool.submit(&r4.work);
+                }
+            }.f);
+        }
+    }.body);
+}
+
+// ---- Round 4 (A4): io.zig, net.zig, spawn and DNS entry points ----
+
+test "sim: refuses a task wake from another thread (AnyTask.wake)" {
+    try refusal("sim: refuses a task wake from another thread (AnyTask.wake)", "sim: a task wake or spawn" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+            r3_task.handle = try r3.rt.spawn(r3.waitForever, .{});
+            try r3.rt.yield();
+            try r3.other(struct {
+                fn f() void {
+                    r4.AnyTask.fromAwaitable(r3_task.handle.awaitable.?).wake();
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Socket.bind from another thread" {
+    try refusal("sim: refuses Socket.bind from another thread", "sim: Socket.bind" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    var sock: @import("net.zig").Socket = .{ .handle = 0, .address = undefined };
+                    sock.bind(.{ .ip = @import("net.zig").IpAddress.parseIp4("127.0.0.1", 0) catch unreachable }) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Socket.connect from another thread" {
+    try refusal("sim: refuses Socket.connect from another thread", "sim: Socket.connect" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    var sock: @import("net.zig").Socket = .{ .handle = 0, .address = undefined };
+                    sock.connect(.{ .ip = @import("net.zig").IpAddress.parseIp4("127.0.0.1", 9) catch unreachable }, .{}) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses a boolean socket option from another thread (Socket.setReuseAddress)" {
+    try refusal("sim: refuses a boolean socket option from another thread (Socket.setReuseAddress)", "sim: Socket option (setBoolOption)" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const sock: @import("net.zig").Socket = .{ .handle = 0, .address = undefined };
+                    sock.setReuseAddress(true) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses an integer socket option from another thread (Socket.setSendBufferSize)" {
+    try refusal("sim: refuses an integer socket option from another thread (Socket.setSendBufferSize)", "sim: Socket option (setIntOption)" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const sock: @import("net.zig").Socket = .{ .handle = 0, .address = undefined };
+                    sock.setSendBufferSize(4096) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses Socket.setNoDelay from another thread" {
+    try refusal("sim: refuses Socket.setNoDelay from another thread", "sim: Socket.setNoDelay" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const sock: @import("net.zig").Socket = .{ .handle = 0, .address = undefined };
+                    sock.setNoDelay(true) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io fileSeekBy from another thread" {
+    try refusal("sim: refuses std.Io fileSeekBy from another thread", "sim: std.Io fileSeekBy" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const io = r3.rt.io();
+                    const file: std.Io.File = .{ .handle = 0, .flags = .{ .nonblocking = false } };
+                    io.vtable.fileSeekBy(io.userdata, file, 1) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io fileSeekTo from another thread" {
+    try refusal("sim: refuses std.Io fileSeekTo from another thread", "sim: std.Io fileSeekTo" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const io = r3.rt.io();
+                    const file: std.Io.File = .{ .handle = 0, .flags = .{ .nonblocking = false } };
+                    io.vtable.fileSeekTo(io.userdata, file, 0) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io fileTryLock from another thread" {
+    try refusal("sim: refuses std.Io fileTryLock from another thread", "sim: std.Io fileTryLock" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const io = r3.rt.io();
+                    const file: std.Io.File = .{ .handle = 0, .flags = .{ .nonblocking = false } };
+                    _ = io.vtable.fileTryLock(io.userdata, file, .shared) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io fileUnlock from another thread" {
+    try refusal("sim: refuses std.Io fileUnlock from another thread", "sim: std.Io fileUnlock" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const io = r3.rt.io();
+                    const file: std.Io.File = .{ .handle = 0, .flags = .{ .nonblocking = false } };
+                    io.vtable.fileUnlock(io.userdata, file);
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io fileDowngradeLock from another thread" {
+    try refusal("sim: refuses std.Io fileDowngradeLock from another thread", "sim: std.Io fileDowngradeLock" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const io = r3.rt.io();
+                    const file: std.Io.File = .{ .handle = 0, .flags = .{ .nonblocking = false } };
+                    io.vtable.fileDowngradeLock(io.userdata, file) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io fileEnableAnsiEscapeCodes from another thread" {
+    try refusal("sim: refuses std.Io fileEnableAnsiEscapeCodes from another thread", "sim: std.Io fileEnableAnsiEscapeCodes" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const io = r3.rt.io();
+                    const file: std.Io.File = .{ .handle = 0, .flags = .{ .nonblocking = false } };
+                    io.vtable.fileEnableAnsiEscapeCodes(io.userdata, file) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io processSetCurrentDir from another thread" {
+    try refusal("sim: refuses std.Io processSetCurrentDir from another thread", "sim: std.Io processSetCurrentDir" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const io = r3.rt.io();
+                    io.vtable.processSetCurrentDir(io.userdata, .{ .handle = std.posix.AT.FDCWD }) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io processSetCurrentPath from another thread" {
+    try refusal("sim: refuses std.Io processSetCurrentPath from another thread", "sim: std.Io processSetCurrentPath" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const io = r3.rt.io();
+                    io.vtable.processSetCurrentPath(io.userdata, ".") catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io processReplace from another thread" {
+    try refusal("sim: refuses std.Io processReplace from another thread", "sim: std.Io processReplace" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const io = r3.rt.io();
+                    io.vtable.processReplace(io.userdata, .{ .argv = &.{"/nonexistent-zio-sim-probe"} }) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io processSpawn from another thread" {
+    try refusal("sim: refuses std.Io processSpawn from another thread", "sim: std.Io processSpawn" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const io = r3.rt.io();
+                    _ = io.vtable.processSpawn(io.userdata, .{ .argv = &.{"/nonexistent-zio-sim-probe"} }) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io childKill from another thread" {
+    try refusal("sim: refuses std.Io childKill from another thread", "sim: std.Io childKill" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const io = r3.rt.io();
+                    var child: std.process.Child = .{ .id = null, .thread_handle = {}, .stdin = null, .stdout = null, .stderr = null, .request_resource_usage_statistics = false };
+                    io.vtable.childKill(io.userdata, &child);
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io inheritParentDir from another thread" {
+    try refusal("sim: refuses std.Io inheritParentDir from another thread", "sim: std.Io inheritParentDir" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const io = r3.rt.io();
+                    _ = io.vtable.inheritParentDir(io.userdata, std.posix.AT.FDCWD) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io inheritParentFile from another thread" {
+    try refusal("sim: refuses std.Io inheritParentFile from another thread", "sim: std.Io inheritParentFile" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const io = r3.rt.io();
+                    _ = io.vtable.inheritParentFile(io.userdata, 0, .{ .nonblocking = false }) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io netSocketCreatePair from another thread" {
+    try refusal("sim: refuses std.Io netSocketCreatePair from another thread", "sim: std.Io netSocketCreatePair" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const io = r3.rt.io();
+                    _ = io.vtable.netSocketCreatePair(io.userdata, .{}) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io batchAwaitConcurrent from another thread" {
+    try refusal("sim: refuses std.Io batchAwaitConcurrent from another thread", "sim: std.Io batchAwaitConcurrent" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const io = r3.rt.io();
+                    var storage: [1]std.Io.Operation.Storage = undefined;
+                    var batch: std.Io.Batch = .init(&storage);
+                    io.vtable.batchAwaitConcurrent(io.userdata, &batch, .none) catch {};
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses std.Io batchCancel from another thread" {
+    try refusal("sim: refuses std.Io batchCancel from another thread", "sim: std.Io batchCancel" ++ other_thread_msg, struct {
+        fn body() !void {
+            try r3.up();
+
+            try r3.other(struct {
+                fn f() void {
+                    const io = r3.rt.io();
+                    var storage: [1]std.Io.Operation.Storage = undefined;
+                    var batch: std.Io.Batch = .init(&storage);
+                    io.vtable.batchCancel(io.userdata, &batch);
+                }
+            }.f);
+        }
+    }.body);
+}
+
+test "sim: refuses a DNS lookup during a run" {
+    try refusal("sim: refuses a DNS lookup during a run", "sim: a DNS lookup during a sim run", struct {
+        fn body() !void {
+            try r3.up();
+            var storage: [4]@import("dns/root.zig").LookupResult = undefined;
+            const host: @import("net.zig").HostName = .{ .bytes = "localhost" };
+            _ = host.lookup(&storage, .{ .port = 80 }) catch {};
         }
     }.body);
 }

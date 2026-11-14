@@ -989,6 +989,7 @@ pub const Socket = struct {
     /// A failure to enable it there is ignored: the stream works either way, and
     /// it can fail on a connection the peer has already reset.
     pub fn setNoDelay(self: Socket, enabled: bool) !void {
+        @import("sim.zig").refuseOtherThread("Socket.setNoDelay");
         try os.net.setNoDelay(self.handle, enabled);
     }
 
@@ -1032,6 +1033,7 @@ pub const Socket = struct {
 
     /// Helper function to set a boolean socket option (POSIX)
     fn setBoolOption(self: Socket, level: i32, optname: u32, enabled: bool) !void {
+        @import("sim.zig").refuseOtherThread("Socket option (setBoolOption)");
         if (builtin.os.tag == .windows) {
             const value: c_int = if (enabled) 1 else 0;
             const rc = os.windows.setsockopt(self.handle, level, optname, std.mem.asBytes(&value).ptr, @sizeOf(c_int));
@@ -1047,6 +1049,7 @@ pub const Socket = struct {
 
     /// Helper function to set an integer socket option
     fn setIntOption(self: Socket, level: i32, optname: u32, value: usize) !void {
+        @import("sim.zig").refuseOtherThread("Socket option (setIntOption)");
         const int_value: c_int = @intCast(value);
         if (builtin.os.tag == .windows) {
             const rc = os.windows.setsockopt(self.handle, level, optname, std.mem.asBytes(&int_value).ptr, @sizeOf(c_int));
@@ -1076,6 +1079,7 @@ pub const Socket = struct {
 
     /// Bind the socket to an address
     pub fn bind(self: *Socket, addr: Address) !void {
+        @import("sim.zig").refuseOtherThread("Socket.bind");
         // Copy addr to self.address so NetBind can update it with actual bound address
         self.address = addr;
         var addr_len = getSockAddrLen(&self.address.any);
@@ -1098,6 +1102,7 @@ pub const Socket = struct {
 
     /// Connect the socket to a remote address
     pub fn connect(self: *Socket, addr: Address, options: ConnectOptions) !void {
+        @import("sim.zig").refuseOtherThread("Socket.connect");
         self.address = addr;
         const addr_len = getSockAddrLen(&self.address.any);
 

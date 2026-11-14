@@ -178,6 +178,9 @@ pub const ThreadPool = struct {
     }
 
     pub fn submit(self: *ThreadPool, work: *Work) void {
+        // Also the inline branch: it runs the work and publishes its result
+        // on the caller's thread.
+        @import("../sim.zig").refuseOtherThread("ThreadPool.submit");
         if (builtin.single_threaded or self.max_threads == 0) {
             if (work.state.cmpxchgStrong(.pending, .running, .acq_rel, .acquire)) |state| {
                 std.debug.assert(state == .canceled);

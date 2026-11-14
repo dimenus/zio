@@ -449,6 +449,7 @@ pub const AnyTask = struct {
     /// Returns the `delivered` count at the time of the cancellation if it
     /// triggered, null if shadowed by prior user cancellation.
     pub fn setCanceled(self: *AnyTask, kind: CancelKind) ?u7 {
+        @import("sim.zig").refuseOtherThread("AnyTask.setCanceled");
         var current = self.canceled_status.load(.acquire);
         while (true) {
             var status: CanceledStatus = @bitCast(current);
@@ -929,6 +930,9 @@ pub fn spawnTask(
     group: ?*Group,
     placement: Placement,
 ) !*AnyTask {
+    // Before the group counter and the task allocation: every spawn path
+    // (Runtime.spawn, Group.spawn, std.Io async/concurrent) comes here.
+    @import("sim.zig").refuseOtherThread("a task spawn");
     // With `.auto` placement, new tasks are homed round-robin and scheduled
     // through the global queue with a wake of the home executor. Initial spread
     // matters: on epoll and kqueue backends a socket is pinned to the loop that

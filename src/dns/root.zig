@@ -67,6 +67,9 @@ pub fn lookup(
     storage: []LookupResult,
     options: LookupOptions,
 ) LookupError!usize {
+    // Real DNS until it is simulated: the system resolver runs inline on the
+    // calling thread with an inline pool, so this is refused on every thread.
+    @import("../sim.zig").refuseDuringRun("a DNS lookup");
     if (options.family) |required_family| {
         if (IpAddress.parseIp(options.name, 0)) |addr| {
             if (addr.getFamily() != required_family) return error.AddressFamilyUnsupported;

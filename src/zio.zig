@@ -86,7 +86,27 @@ pub const Event = @import("sync/Event.zig");
 pub const RwLock = @import("sync/RwLock.zig");
 pub const Semaphore = @import("sync/Semaphore.zig");
 pub const Barrier = @import("sync/Barrier.zig");
-pub const Futex = @import("sync/Futex.zig");
+/// The futex a program waits and wakes on. `prepareWait`, `cancelWait` and
+/// `FutexWaiter` are Group's select-arm machinery: they register and remove a
+/// queue node without the checks the public operations make, so they stay
+/// inside zio (t-4085 round 4).
+pub const Futex = struct {
+    const impl = @import("sync/Futex.zig");
+    pub const wait = impl.wait;
+    pub const waitUncancelable = impl.waitUncancelable;
+    pub const waitTimeout = impl.waitTimeout;
+    pub const timedWait = impl.timedWait;
+    pub const waitTimeoutClock = impl.waitTimeoutClock;
+    pub const timedWaitClock = impl.timedWaitClock;
+    pub const wake = impl.wake;
+};
+
+test "zio.Futex keeps the queue-node machinery inside zio" {
+    try std.testing.expect(!@hasDecl(Futex, "prepareWait"));
+    try std.testing.expect(!@hasDecl(Futex, "cancelWait"));
+    try std.testing.expect(!@hasDecl(Futex, "FutexWaiter"));
+    try std.testing.expect(@hasDecl(Futex, "wait") and @hasDecl(Futex, "wake"));
+}
 pub const Channel = @import("sync/channel.zig").Channel;
 pub const BroadcastChannel = @import("sync/broadcast_channel.zig").BroadcastChannel;
 pub const Future = @import("sync/future.zig").Future;

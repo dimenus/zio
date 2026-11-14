@@ -727,6 +727,7 @@ fn batchAwaitAsyncImpl(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!vo
 }
 
 fn batchAwaitConcurrentImpl(userdata: ?*anyopaque, batch: *Io.Batch, timeout: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
+    @import("sim.zig").refuseOtherThread("std.Io batchAwaitConcurrent");
     // Specialized path: exactly one submitted operation, none in flight.
     const only = batch.submitted.head;
     if (only != .none and only == batch.submitted.tail and batch.pending.head == .none) {
@@ -1176,6 +1177,7 @@ fn batchCancelPending(batch: *Io.Batch, state: *BatchState) void {
 }
 
 fn batchCancelImpl(_: ?*anyopaque, batch: *Io.Batch) void {
+    @import("sim.zig").refuseOtherThread("std.Io batchCancel");
     // Get state if it exists
     const state: *BatchState = @ptrCast(@alignCast(batch.userdata orelse return));
 
@@ -1771,10 +1773,12 @@ fn fileReadPositionalImpl(_: ?*anyopaque, file: Io.File, data: []const []u8, off
 }
 
 fn fileSeekByImpl(_: ?*anyopaque, file: Io.File, offset: i64) Io.File.SeekError!void {
+    @import("sim.zig").refuseOtherThread("std.Io fileSeekBy");
     return os_fs.fileSeekBy(stdIoHandleToZio(file.handle), offset);
 }
 
 fn fileSeekToImpl(_: ?*anyopaque, file: Io.File, offset: u64) Io.File.SeekError!void {
+    @import("sim.zig").refuseOtherThread("std.Io fileSeekTo");
     return os_fs.fileSeekTo(stdIoHandleToZio(file.handle), offset);
 }
 
@@ -1789,6 +1793,7 @@ fn fileIsTtyImpl(_: ?*anyopaque, file: Io.File) Io.Cancelable!bool {
 }
 
 fn fileEnableAnsiEscapeCodesImpl(userdata: ?*anyopaque, file: Io.File) Io.File.EnableAnsiEscapeCodesError!void {
+    @import("sim.zig").refuseOtherThread("std.Io fileEnableAnsiEscapeCodes");
     // Turning the mode on for a Windows console is the one thing this does that
     // is not a query, and it goes through the console driver protocol that std
     // implements; keep delegating there. On POSIX there is nothing to enable,
@@ -1847,6 +1852,7 @@ fn fileLockImpl(_: ?*anyopaque, file: Io.File, lock: Io.File.Lock) Io.File.LockE
 }
 
 fn fileTryLockImpl(_: ?*anyopaque, file: Io.File, lock: Io.File.Lock) Io.File.LockError!bool {
+    @import("sim.zig").refuseOtherThread("std.Io fileTryLock");
     const op: os_fs.FileLockOp = switch (lock) {
         .none => .unlock,
         .shared => .shared,
@@ -1863,6 +1869,7 @@ fn fileTryLockImpl(_: ?*anyopaque, file: Io.File, lock: Io.File.Lock) Io.File.Lo
 }
 
 fn fileUnlockImpl(_: ?*anyopaque, file: Io.File) void {
+    @import("sim.zig").refuseOtherThread("std.Io fileUnlock");
     while (true) {
         os_fs.fileLock(stdIoHandleToZio(file.handle), .unlock, .blocking) catch |err| switch (err) {
             error.Interrupted, error.WouldBlock => continue,
@@ -1873,6 +1880,7 @@ fn fileUnlockImpl(_: ?*anyopaque, file: Io.File) void {
 }
 
 fn fileDowngradeLockImpl(_: ?*anyopaque, file: Io.File) Io.File.DowngradeLockError!void {
+    @import("sim.zig").refuseOtherThread("std.Io fileDowngradeLock");
     while (true) {
         os_fs.fileLockDowngrade(stdIoHandleToZio(file.handle)) catch |err| switch (err) {
             error.Interrupted, error.WouldBlock => continue,
@@ -1966,6 +1974,7 @@ fn processCurrentPathImpl(userdata: ?*anyopaque, buffer: []u8) std.process.Curre
 }
 
 fn processSetCurrentDirImpl(userdata: ?*anyopaque, dir: Io.Dir) std.process.SetCurrentDirError!void {
+    @import("sim.zig").refuseOtherThread("std.Io processSetCurrentDir");
     return os_process.setCurrentDir(scratchAllocator(userdata), stdIoHandleToZio(dir.handle)) catch |err| switch (err) {
         error.AccessDenied => error.AccessDenied,
         error.NotDir => error.NotDir,
@@ -1978,6 +1987,7 @@ fn processSetCurrentDirImpl(userdata: ?*anyopaque, dir: Io.Dir) std.process.SetC
 }
 
 fn processSetCurrentPathImpl(userdata: ?*anyopaque, path: []const u8) std.process.SetCurrentPathError!void {
+    @import("sim.zig").refuseOtherThread("std.Io processSetCurrentPath");
     return os_process.setCurrentPath(scratchAllocator(userdata), path) catch |err| switch (err) {
         error.AccessDenied => error.AccessDenied,
         error.SymLinkLoop => error.SymLinkLoop,
@@ -1994,6 +2004,7 @@ fn processSetCurrentPathImpl(userdata: ?*anyopaque, path: []const u8) std.proces
 
 // TODO: implement using our own execve wrapper
 fn processReplaceImpl(userdata: ?*anyopaque, options: std.process.ReplaceOptions) std.process.ReplaceError {
+    @import("sim.zig").refuseOtherThread("std.Io processReplace");
     var threaded = processThreaded(scratchAllocator(userdata));
     defer threaded.deinit();
     const io = threaded.io();
@@ -2027,6 +2038,7 @@ fn processThreaded(allocator: std.mem.Allocator) Io.Threaded {
 
 // TODO: implement using our own posix_spawn/fork+exec wrapper
 fn processSpawnImpl(userdata: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+    @import("sim.zig").refuseOtherThread("std.Io processSpawn");
     var threaded = processThreaded(scratchAllocator(userdata));
     defer threaded.deinit();
     const io = threaded.io();
@@ -2040,11 +2052,13 @@ fn processSpawnImpl(userdata: ?*anyopaque, options: std.process.SpawnOptions) st
 }
 
 fn inheritParentDirImpl(_: ?*anyopaque, handle: Io.Dir.Handle) Io.InheritParentHandleError!Io.Dir {
+    @import("sim.zig").refuseOtherThread("std.Io inheritParentDir");
     const io = globalIo();
     return io.vtable.inheritParentDir(io.userdata, handle);
 }
 
 fn inheritParentFileImpl(_: ?*anyopaque, handle: Io.File.Handle, flags: Io.File.Flags) Io.InheritParentHandleError!Io.File {
+    @import("sim.zig").refuseOtherThread("std.Io inheritParentFile");
     const io = globalIo();
     return io.vtable.inheritParentFile(io.userdata, handle, flags);
 }
@@ -2061,6 +2075,7 @@ fn childWaitImpl(_: ?*anyopaque, child: *std.process.Child) std.process.Child.Wa
 }
 
 fn childKillImpl(_: ?*anyopaque, child: *std.process.Child) void {
+    @import("sim.zig").refuseOtherThread("std.Io childKill");
     process_impl.childKill(child);
 }
 
@@ -2515,6 +2530,7 @@ fn netConnectUnixImpl(
 }
 
 fn netSocketCreatePairImpl(_: ?*anyopaque, options: Io.net.Socket.CreatePairOptions) Io.net.Socket.CreatePairError![2]Io.net.Socket {
+    @import("sim.zig").refuseOtherThread("std.Io netSocketCreatePair");
     const domain: os_net.Domain = switch (options.family) {
         .ip4 => .ipv4,
         .ip6 => .ipv6,
