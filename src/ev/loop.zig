@@ -1948,9 +1948,9 @@ pub const Loop = struct {
                             c.setError(error.ConnectionResetByPeer);
                         } else if (sim.recvIsEof(op.handle)) {
                             c.setResult(.net_recv, 0);
-                        } else {
-                            c.setResult(.net_recv, sim.drainForRecv(op.handle, readSlices(op.buffers, &sl)));
-                        }
+                        } else if (sim.harvestRecv(op.handle, readSlices(op.buffers, &sl), c, buf[i].id)) |got| {
+                            c.setResult(.net_recv, got);
+                        } else continue;
                     },
                     .net_send => {
                         // Capacity-woken send: copy into the peer buffer.

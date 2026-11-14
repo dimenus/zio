@@ -945,6 +945,22 @@ pub fn drainBuf(fd: i32, dst: []const []u8) usize {
     return n;
 }
 
+/// A woken pipe receive at its harvest: its bytes, or null when another
+/// receive took them first and the end is open and not at end of stream. Then
+/// it parks again with its submit id, as a kernel reader keeps waiting. A
+/// receive with no buffer room completes with 0, as before (t-4096).
+pub fn harvestRecv(fd: i32, dst: []const []u8, c: *anyopaque, id: u32) ?usize {
+    const i = endIndex(fd) orelse panic("sim: a harvested receive on sim fd {d}, which is not a pipe end", .{fd});
+    var room: usize = 0;
+    for (dst) |d| room += d.len;
+    if (ends[i].buf_len == 0 and room > 0) {
+        if (ends[i].pending_recv != null) panic("sim: two recvs parked on one fd", .{});
+        ends[i].pending_recv = .{ .c = c, .id = id };
+        return null;
+    }
+    return drainForRecv(fd, dst);
+}
+
 /// For a harvested recv: drain, and wake a sender the drain made room for.
 pub fn drainForRecv(fd: i32, dst: []const []u8) usize {
     const n = drainBuf(fd, dst);
@@ -5089,6 +5105,70 @@ test "sim: pipe: a race group of two sends that finish without deferral complete
 test "sim: dgram ev: a race group of two sends that finish without deferral completes each member once" {
     if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
     try dg.run(1, dg_race.body);
+}
+
+/// Round 2 of the outside review, F2: a pipe receive R1 parked on an empty
+/// end is woken by a send, but a second receive R2 takes the bytes before
+/// R1's wake is harvested. R1 must wait for more bytes, not report end of
+/// file on an open pipe.
+const pipe_stale = struct {
+    var fds: [2]i32 = undefined;
+    var got: [2][16]u8 = undefined;
+    var len: [2]usize = .{ 0, 0 };
+    var r2_first: bool = false;
+
+    fn recvOne(k: usize) !void {
+        var iov: [1]dg.os_net.iovec = undefined;
+        var op = dg.ev.NetRecv.init(fds[0], .fromSlice(&got[k], &iov), .{});
+        try dg.io_common.waitForIo(&op.c);
+        len[k] = try op.getResult();
+    }
+
+    fn send(bytes: []const u8) !void {
+        var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice(bytes)};
+        var op = dg.ev.NetSend.init(fds[1], .{ .iovecs = &iov }, .{});
+        try dg.io_common.waitForIo(&op.c);
+        if (try op.getResult() != bytes.len) return error.ShortSend;
+    }
+
+    fn body() !void {
+        fds = pipePair();
+        len = .{ 0, 0 };
+        var r1 = try dg.runtime.spawn(recvOne, .{0});
+        try dg.rt_mod.sleep(.fromMilliseconds(1));
+        try send("first");
+        var r2 = try dg.runtime.spawn(recvOne, .{1});
+        try dg.rt_mod.sleep(.fromMilliseconds(20));
+        r2_first = len[1] == 5;
+        try send("second");
+        try r1.join();
+        try r2.join();
+        for (len, 0..) |n, k| {
+            if (n == 0) {
+                std.debug.print("receive {d} returned 0 (end of file) on an open pipe\n", .{k + 1});
+                return error.FalseEndOfFile;
+            }
+        }
+        var all: [32]u8 = undefined;
+        const first: usize = if (r2_first) 1 else 0;
+        @memcpy(all[0..len[first]], got[first][0..len[first]]);
+        @memcpy(all[len[first]..][0..len[1 - first]], got[1 - first][0..len[1 - first]]);
+        try std.testing.expectEqualStrings("firstsecond", all[0 .. len[0] + len[1]]);
+    }
+};
+
+test "sim: pipe: a receive woken by bytes another receive took waits for more, and never reports end of file on an open pipe" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    var stale_cases: usize = 0;
+    for (1..17) |s| {
+        dg.run(s, pipe_stale.body) catch |err| {
+            std.debug.print("seed {d}: {t}\n", .{ s, err });
+            return err;
+        };
+        if (pipe_stale.r2_first) stale_cases += 1;
+    }
+    std.debug.print("16 seeds; in {d} the second receive took the first bytes\n", .{stale_cases});
+    try std.testing.expect(stale_cases > 0);
 }
 
 test "sim: dgram ev: close wakes an ev receive parked on the socket" {
