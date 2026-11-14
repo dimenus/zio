@@ -4083,101 +4083,266 @@ test "sim: dgram: an empty datagram queued while the ring empties does not make 
 }
 
 /// The reference for the datagram queue's model test: a list of byte strings
-/// and the byte limit, with the landing and receive rules of design section 6
-/// written plainly. The packet limit is not reached here (1024 datagrams);
-/// `sim: dgram limits: with a large byte budget, the packet limit drops
-/// empty datagrams` covers it.
+/// and the two limits, with the landing and receive rules of design section 6
+/// written plainly. `wire` holds what was sent and has not landed yet, so the
+/// limit that decides a landing is the one in force when it lands.
 const QueueModel = struct {
+    wire: std.ArrayList([]const u8) = .empty,
     queued: std.ArrayList([]const u8) = .empty,
     head: usize = 0,
     limit: usize = default_rcvbuf_bytes,
     charged: usize = 0,
     dropped: u64 = 0,
+    /// Drops where the queue already held `rcv_packet_limit` datagrams.
+    dropped_for_packets: u64 = 0,
+    landed: u64 = 0,
+    taken: u64 = 0,
+
+    fn send(m: *QueueModel, gpa: std.mem.Allocator, bytes: []const u8) !void {
+        try m.wire.append(gpa, bytes);
+    }
+
+    /// Lands everything on the wire, in send order: one flow.
+    fn settle(m: *QueueModel, gpa: std.mem.Allocator) !void {
+        for (m.wire.items) |bytes| try m.land(gpa, bytes);
+        m.wire.clearRetainingCapacity();
+    }
 
     fn land(m: *QueueModel, gpa: std.mem.Allocator, bytes: []const u8) !void {
         const cost = bytes.len + datagram_overhead;
-        if (m.queued.items.len - m.head == rcv_packet_limit or m.charged + cost > m.limit) {
+        if (m.len() == rcv_packet_limit) {
+            m.dropped += 1;
+            m.dropped_for_packets += 1;
+            return;
+        }
+        if (m.charged + cost > m.limit) {
             m.dropped += 1;
             return;
         }
         try m.queued.append(gpa, bytes);
         m.charged += cost;
+        m.landed += 1;
+    }
+
+    fn len(m: *const QueueModel) usize {
+        return m.queued.items.len - m.head;
     }
 
     fn take(m: *QueueModel) ?[]const u8 {
         if (m.head == m.queued.items.len) return null;
         const b = m.queued.items[m.head];
         m.head += 1;
+        m.taken += 1;
         m.charged -= b.len + datagram_overhead;
         return b;
     }
 };
 
-// A random mix of sends (one to three per step, a quarter of them empty),
-// receives into buffers smaller or larger than the datagram, and SO_RCVBUF
-// changes small enough that the byte limit drops datagrams, checked against
-// `QueueModel` after every step. A failure prints the seed and the step.
-test "sim: dgram: the receive queue matches a list of byte strings under random sends, receives, truncation and SO_RCVBUF changes" {
-    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
-    const T = struct {
-        var model_seed: u64 = 0;
-        var step: usize = 0;
-        fn body() !void {
-            var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-            defer arena.deinit();
-            const gpa = arena.allocator();
-            var prng: std.Random.DefaultPrng = .init(model_seed);
-            const r = prng.random();
-            var model: QueueModel = .{};
-            const rx = try dg.open();
-            const tx = try dg.open();
-            try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
-            const to = dg.addr(127, 0, 0, 1, (try dg.local(rx)).port);
-            step = 0;
-            while (step < 400) : (step += 1) {
-                switch (r.uintLessThan(u8, 10)) {
-                    0...3 => {
-                        const n = r.intRangeAtMost(usize, 1, 3);
-                        for (0..n) |_| {
-                            const len: usize = if (r.uintLessThan(u8, 4) == 0) 0 else r.intRangeAtMost(usize, 1, 700);
-                            const bytes = try gpa.alloc(u8, len);
-                            r.bytes(bytes);
-                            _ = try dg.sendFrom(tx, to, null, bytes);
-                            try model.land(gpa, bytes);
-                        }
-                        try dg.settle();
-                    },
-                    4...7 => {
-                        const want = model.take();
-                        var buf: [800]u8 = undefined;
-                        const cap = if (want) |w| r.uintAtMost(usize, w.len + 2) else r.uintAtMost(usize, 8);
-                        if (want) |w| {
-                            const got = try dg.recvInto(rx, &.{buf[0..cap]});
-                            const copied = @min(cap, w.len);
-                            try std.testing.expectEqual(copied, got.info.len);
-                            try std.testing.expectEqual(w.len > cap, got.info.truncated);
-                            try std.testing.expectEqualSlices(u8, w[0..copied], buf[0..copied]);
-                        } else {
-                            try std.testing.expectError(error.WouldBlock, dg.recvInto(rx, &.{buf[0..cap]}));
-                        }
-                    },
-                    else => {
-                        const v = r.intRangeAtMost(c_int, 300, 3000);
-                        try dg.setInt(rx, sys.SOL.SOCKET, sys.SO.RCVBUF, v);
-                        model.limit = @intCast(v);
-                    },
-                }
-                try std.testing.expectEqual(model.dropped, datagramStats(rx).dropped_rcvbuf);
-            }
+const queue_model = struct {
+    const seeds = [_]u64{ 1, 2, 3, 4, 5 };
+    const steps = 1500;
+
+    var model_seed: u64 = 0;
+    var step: usize = 0;
+    /// Receive buffers: static, a task's stack is small.
+    var bufs: [3][8100]u8 = undefined;
+    var c: struct {
+        sent: u64 = 0,
+        large: u64 = 0,
+        empty: u64 = 0,
+        truncated: u64 = 0,
+        scatter: u64 = 0,
+        resizes_in_flight: u64 = 0,
+        dropped_for_bytes: u64 = 0,
+        dropped_for_packets: u64 = 0,
+        max_queued: usize = 0,
+        meta_wraps: u64 = 0,
+        tail: u64 = 0,
+    } = .{};
+
+    fn sendOne(tx: i32, to: dg.os_net.sockaddr.in, gpa: std.mem.Allocator, model: *QueueModel, len: usize, r: std.Random) !void {
+        const bytes = try gpa.alloc(u8, len);
+        r.bytes(bytes);
+        _ = try dg.sendFrom(tx, to, null, bytes);
+        try model.send(gpa, bytes);
+        c.sent += 1;
+        if (len == 0) c.empty += 1;
+        if (len > 1500) c.large += 1;
+    }
+
+    /// One receive into one to three buffers whose total room is near the
+    /// datagram's length, checked against the model's head.
+    fn recvOne(rx: i32, model: *QueueModel, r: std.Random) !void {
+        const want = model.take();
+        const wlen = if (want) |w| w.len else 8;
+        var room = r.uintAtMost(usize, wlen + 2);
+        const n = r.intRangeAtMost(usize, 1, 3);
+        var lens: [3]usize = .{ 0, 0, 0 };
+        for (0..n) |k| {
+            lens[k] = if (k == n - 1) room else r.uintAtMost(usize, room);
+            room -= lens[k];
         }
-    };
-    for ([_]u64{ 1, 2, 3, 4, 5 }) |s| {
-        T.model_seed = s;
-        dg.run(s, T.body) catch |err| {
-            std.debug.print("datagram queue model test: seed {d}, step {d}: {t}\n", .{ s, T.step, err });
+        var dst: [3][]u8 = undefined;
+        for (0..n) |k| {
+            @memset(&bufs[k], 0xAA);
+            dst[k] = bufs[k][0..lens[k]];
+        }
+        const w = want orelse {
+            try std.testing.expectError(error.WouldBlock, dg.recvInto(rx, dst[0..n]));
+            return;
+        };
+        var total: usize = 0;
+        for (lens[0..n]) |l| total += l;
+        const got = try dg.recvInto(rx, dst[0..n]);
+        const copied = @min(total, w.len);
+        try std.testing.expectEqual(copied, got.info.len);
+        try std.testing.expectEqual(w.len > total, got.info.truncated);
+        var at: usize = 0;
+        for (0..n) |k| {
+            const part = @min(lens[k], copied - at);
+            try std.testing.expectEqualSlices(u8, w[at..][0..part], bufs[k][0..part]);
+            // What did not fit leaves the rest of the buffer alone.
+            for (bufs[k][part..lens[k]]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+            at += part;
+        }
+        if (w.len > total) c.truncated += 1;
+        if (n > 1 and copied > lens[0]) c.scatter += 1;
+    }
+
+    /// One to three datagrams: a quarter empty, one in twenty large.
+    fn sendSome(tx: i32, to: dg.os_net.sockaddr.in, gpa: std.mem.Allocator, model: *QueueModel, r: std.Random) !void {
+        for (0..r.intRangeAtMost(usize, 1, 3)) |_| {
+            const len: usize = switch (r.uintLessThan(u8, 20)) {
+                0...4 => 0,
+                5 => r.intRangeAtMost(usize, 1501, 8000),
+                else => r.intRangeAtMost(usize, 1, 700),
+            };
+            try sendOne(tx, to, gpa, model, len, r);
+        }
+    }
+
+    fn setRcvbuf(rx: i32, model: *QueueModel, v: c_int) !void {
+        if (model.wire.items.len > 0) c.resizes_in_flight += 1;
+        try dg.setInt(rx, sys.SOL.SOCKET, sys.SO.RCVBUF, v);
+        model.limit = @intCast(v);
+    }
+
+    fn check(rx: i32, model: *const QueueModel) !void {
+        const st = datagramStats(rx);
+        try std.testing.expectEqual(model.dropped, st.dropped_rcvbuf);
+        try std.testing.expectEqual(model.landed, st.received);
+        const readable = (try dg.pollNow(rx, dg.os_net.POLL.IN)) & dg.os_net.POLL.IN != 0;
+        try std.testing.expectEqual(model.len() > 0, readable);
+        c.max_queued = @max(c.max_queued, model.len());
+    }
+
+    fn body() !void {
+        var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        defer arena.deinit();
+        const gpa = arena.allocator();
+        var prng: std.Random.DefaultPrng = .init(model_seed);
+        const r = prng.random();
+        var model: QueueModel = .{};
+        const rx = try dg.open();
+        const tx = try dg.open();
+        try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
+        const to = dg.addr(127, 0, 0, 1, (try dg.local(rx)).port);
+        step = 0;
+        while (step < steps) : (step += 1) {
+            // Blocks of 300 steps. Even blocks keep the queue short with
+            // small byte limits: a send lands at once, so landings and
+            // receives alternate one at a time and the ring wraps often.
+            // Round 1's finding 1 needs that shape (the mix of the first
+            // version of this test). Odd blocks fill the queue to the
+            // packet limit, drain it in runs, and change SO_RCVBUF while
+            // datagrams are on the wire.
+            if ((step / 300) % 2 == 0) switch (r.uintLessThan(u8, 10)) {
+                0...3 => {
+                    try sendSome(tx, to, gpa, &model, r);
+                    try dg.settle();
+                    try model.settle(gpa);
+                },
+                4...7 => try recvOne(rx, &model, r),
+                else => try setRcvbuf(rx, &model, r.intRangeAtMost(c_int, 300, 3000)),
+            } else switch (r.uintLessThan(u8, 12)) {
+                // Left on the wire until a settle step.
+                0...2 => try sendSome(tx, to, gpa, &model, r),
+                3 => {
+                    try dg.settle();
+                    try model.settle(gpa);
+                },
+                4...6 => try recvOne(rx, &model, r),
+                // A large limit lets the packet limit, not the bytes, fill
+                // the queue.
+                7, 8 => try setRcvbuf(rx, &model, switch (r.uintLessThan(u8, 3)) {
+                    0 => 400_000,
+                    1 => @intCast(default_rcvbuf_bytes),
+                    else => r.intRangeAtMost(c_int, 300, 3000),
+                }),
+                // A burst of tiny datagrams, landed at once.
+                9 => {
+                    for (0..r.intRangeAtMost(usize, 100, 700)) |_| try sendOne(tx, to, gpa, &model, r.uintAtMost(usize, 2), r);
+                    try dg.settle();
+                    try model.settle(gpa);
+                },
+                // A run of receives: it moves the metadata ring's head far.
+                else => for (0..r.intRangeAtMost(usize, 20, 300)) |_| try recvOne(rx, &model, r),
+            }
+            try check(rx, &model);
+        }
+        // The tail: land what is left, receive all of it, then nothing.
+        try dg.settle();
+        try model.settle(gpa);
+        try check(rx, &model);
+        while (model.len() > 0) {
+            const w = model.take().?;
+            const got = try dg.recvInto(rx, &.{bufs[0][0..w.len]});
+            try std.testing.expectEqual(w.len, got.info.len);
+            try std.testing.expect(!got.info.truncated);
+            try std.testing.expectEqualSlices(u8, w, bufs[0][0..w.len]);
+            c.tail += 1;
+        }
+        try check(rx, &model);
+        try std.testing.expectError(error.WouldBlock, dg.recvInto(rx, &.{bufs[0][0..8]}));
+        c.dropped_for_packets += model.dropped_for_packets;
+        c.dropped_for_bytes += model.dropped - model.dropped_for_packets;
+        // The metadata ring holds `rcv_packet_limit` entries; every
+        // receive moves its head one entry.
+        c.meta_wraps += model.taken / rcv_packet_limit;
+        dg.os_net.close(rx);
+        dg.os_net.close(tx);
+    }
+};
+
+// Random steps against `QueueModel`: sends of one to three datagrams (a
+// quarter empty, one in twenty from 1501 to 8000 bytes) that stay on the wire
+// until a settle step, so SO_RCVBUF can change between a send and its
+// landing; receives into one to three buffers (scatter), with room near the
+// datagram's length so some are truncated; bursts of 100 to 700 tiny
+// datagrams, so with a large SO_RCVBUF the 1024-packet limit drops; runs of
+// 20 to 300 receives, so the metadata ring wraps. After every step the drop
+// and landing counts and readiness must equal the model's; at the end the
+// whole tail is received and compared. A failure prints the seed and step.
+test "sim: dgram: the receive queue matches a list of byte strings under random sends, scatter receives, truncation, SO_RCVBUF changes in flight, the packet limit and metadata wrap, and a drained tail" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    queue_model.c = .{};
+    for (queue_model.seeds) |s| {
+        queue_model.model_seed = s;
+        dg.run(s, queue_model.body) catch |err| {
+            std.debug.print("datagram queue model test: seed {d}, step {d}: {t}\n", .{ s, queue_model.step, err });
             return err;
         };
     }
+    const c = queue_model.c;
+    std.debug.print("datagram queue model test: {d} seeds x {d} steps: {d} sent ({d} empty, {d} over 1500 bytes), {d} truncated, {d} scattered, {d} SO_RCVBUF changes in flight, {d} dropped for bytes, {d} for packets, at most {d} queued, {d} metadata ring wraps, {d} in the tail\n", .{ queue_model.seeds.len, queue_model.steps, c.sent, c.empty, c.large, c.truncated, c.scatter, c.resizes_in_flight, c.dropped_for_bytes, c.dropped_for_packets, c.max_queued, c.meta_wraps, c.tail });
+    // Each case this test is for must have happened, or it tested nothing.
+    inline for (.{ "empty", "large", "truncated", "scatter", "resizes_in_flight", "dropped_for_bytes", "dropped_for_packets", "meta_wraps", "tail" }) |name| {
+        if (@field(c, name) == 0) {
+            std.debug.print("datagram queue model test: {s} is 0\n", .{name});
+            return error.CaseNeverRan;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, rcv_packet_limit), c.max_queued);
 }
 
 /// What one direction of a sim pipe should hold: the bytes sent and not yet

@@ -642,8 +642,9 @@ select adapter, which 9ecfbc6 removed.
   emptied moved the ring head; two later payloads shared bytes. Tests: `sim:
   dgram: an empty datagram queued while the ring empties does not make two
   later payloads share bytes`, and the model test `sim: dgram: the receive
-  queue matches a list of byte strings under random sends, receives,
-  truncation and SO_RCVBUF changes` (it fails on the old line at seed 2).
+  queue matches a list of byte strings under random sends, scatter
+  receives, ...` (since sitting 16; it fails on the old line at seed 1,
+  step 1364).
 - **2 (P1), fixed in 1b2d7ce:** an op woken by close ran against the socket
   that reused its fd number. Test: `sim: dgram ev: a receive parked on a
   socket that is closed and whose number is reused at once ends
