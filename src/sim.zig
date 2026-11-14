@@ -38,8 +38,12 @@ var event_count: u64 = 0;
 var next_task_id: u32 = 1;
 
 const max_ends = 32;
-const max_due = 32;
 const max_live = 128;
+/// Every due entry is an op that holds a live id, and an op is parked or
+/// due, never both, so the due list can never hold more than `max_live`
+/// (`pushDueAt` checks it). A harvest buffer of this size takes every op
+/// that can be due at one time: 64 sockets each woken by one landing fit.
+pub const max_due = max_live;
 pub const pipe_buf_cap = 4096;
 /// The first sim fd number in a run (section 3.3 of the sim network design).
 const default_fd_base: i32 = 100000;
@@ -668,6 +672,7 @@ fn pushDueKind(c: *anyopaque, kind: DueKind, id: u32) void {
 
 fn pushDueAt(c: *anyopaque, kind: DueKind, id: u32, at: u64) void {
     if (due_len >= max_due) panic("sim: I/O due list full", .{});
+    if (due_len >= live_len) panic("sim: {d} ops due but only {d} live: an op is due twice, or due without an id", .{ due_len + 1, live_len });
     due[due_len] = .{
         .c = c,
         .due_at = at,
@@ -4709,6 +4714,45 @@ test "sim: dgram ev: a parked receive that is canceled gives Canceled, and the n
             try std.testing.expectEqualStrings("kept", buf[0..got.len]);
         }
     }.body);
+}
+
+const dg_wide = struct {
+    var fds: [max_dgram]i32 = undefined;
+    var got: [max_dgram]u8 = undefined;
+
+    fn recvOne(i: usize) !void {
+        var buf: [4]u8 = undefined;
+        const r = try dg.evRecvFrom(fds[i], &buf);
+        if (r.len != 1) return error.WrongLength;
+        got[i] = buf[0];
+    }
+
+    /// Every datagram slot open, an ev receive parked on each, and one of
+    /// them sends a datagram to every one (itself too) at one virtual time,
+    /// so all of them land, and wake their receive, together.
+    fn body() !void {
+        for (&fds, 0..) |*fd, i| {
+            fd.* = try dg.open();
+            try dg.bindTo(fd.*, dg.addr(127, 0, 0, 1, @intCast(7000 + i)));
+        }
+        @memset(&got, 0xff);
+        var hs: [max_dgram]@TypeOf(try dg.runtime.spawn(recvOne, .{0})) = undefined;
+        hs[0] = try dg.runtime.spawn(recvOne, .{0});
+        for (hs[1..], 1..) |*h, i| h.* = try dg.runtime.spawn(recvOne, .{i});
+        try dg.rt_mod.sleep(.fromMilliseconds(1));
+        for (0..max_dgram) |i| {
+            const b = [1]u8{@intCast(i)};
+            _ = try dg.sendFrom(fds[0], dg.addr(127, 0, 0, 1, @intCast(7000 + i)), null, &b);
+        }
+        for (&hs) |*h| try h.join();
+        for (got, 0..) |g, i| try std.testing.expectEqual(@as(u8, @intCast(i)), g);
+        for (fds) |fd| dg.os_net.close(fd);
+    }
+};
+
+test "sim: dgram ev: 64 sockets, each with a parked receive, all woken at one virtual time" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(3, dg_wide.body);
 }
 
 test "sim: dgram ev: close wakes an ev receive parked on the socket" {

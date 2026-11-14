@@ -1917,7 +1917,7 @@ pub const Loop = struct {
     /// Sim: complete every simulated op whose due time has come, in a
     /// seeded order.
     fn harvestSimIo(self: *Loop) void {
-        var buf: [32]sim.TakenDue = undefined;
+        var buf: [sim.max_due]sim.TakenDue = undefined;
         const n = sim.takeDue(&buf);
         var i: usize = 0;
         while (i < n) : (i += 1) {
