@@ -2222,17 +2222,19 @@ safe, and slice 1's timings stay as they are.)
    matches does not prevent release. Its values were drawn at the send
    and are kept. (Test: a partition and a delay over one entry; clear the
    partition.)
-5. **Release time.** Each entry lands at `release time + the delay drawn
-   at its send`, clamped behind the entry before it. Nothing is redrawn.
+5. **Release time.** Each entry lands at `release time + L + its extra
+   time` (its chunk spacing, delay and jitter, all fixed at its send),
+   clamped behind the entry before it. Nothing is redrawn (17.9a, point
+   6: revision 3 left out the L).
 6. **The same instant.** A landing at T takes the rule state at the
    moment `landDue` processes it. A rule that a task clears later in the
    same instant does not undo it. A rule set by a task that ran before
    the harvest at T holds it. This is UDP's order.
 7. **RST against held data.** An endpoint that aborts (close with unread
    bytes, linger 0, or an RST landing on it) discards its own held
-   outbound data and FIN at once. Their bytes count as `abort`. Its data
-   already on the wire lands before its RST. An RST obeys a partition
-   like any entry.
+   outbound data, FIN and credits at once (17.9a, point 9). Their bytes
+   count as `abort`. Its data already on the wire lands before its RST.
+   An RST obeys a partition like any entry.
 8. **Dead endpoints.** Held entries that are inbound to a dead endpoint
    stay held. When they are released, 17.8's landing rules apply: data is
    dropped, and an RST goes back at most once. A connection cannot retire
@@ -2266,6 +2268,103 @@ both ops the error would report it twice, which no kernel does.
 hotseat's case, "the host dies in the middle of the RTSP exchange", is
 `failStream(client_fd, .timed_out)`. A test that also wants the host side
 quiet partitions it, or closes the host's socket.
+
+### 17.9a Slice 3's design fixes (sitting 32)
+
+Read before the build: 17.9 to 17.12 left these points open or
+ambiguous. Each is decided here; the protocol goes inline beside the code
+when it is built.
+
+1. **Where the protocol lives: `Endpoint.protocol`, `.udp` by default.**
+   17.9 says "a rule gets a protocol" but not where. A TCP port 7000 and a
+   UDP port 7000 are different endpoints, so the field is the endpoint's.
+   One field then covers all three rule kinds (a silence takes one
+   endpoint, a path two), and a rule's identity includes it with no new
+   code. A path whose two endpoints name different protocols is refused.
+   `.{}` is still "every datagram". Rejected: a `Path.protocol` field (a
+   silence has no path, so it would need a second API); a parameter on
+   each call (it changes six signatures that phase 2 tests call).
+2. **The UDP code sees only `.udp` rules.** Every UDP decision skips a
+   `.tcp` rule, and "a run that ever set a rule takes the fault path"
+   becomes "ever set a `.udp` rule". So a stream run with `.tcp` rules
+   gives its datagrams exactly what a run with no rule gives (promise 1
+   for the UDP part of a mixed run). The fault digest hashes a rule's
+   protocol only when it is `.tcp`, so every phase 2 digest is unchanged.
+3. **What a `.tcp` rule matches.** An entry goes from its sender's local
+   address to the sender's peer (a SYN: to its destination). A path
+   matches on both; a silence on either. Last set wins among the `.tcp`
+   impairments that match, as for UDP.
+4. **A `.tcp` impairment** takes `delay_ns` and `jitter_ns`. `loss_ppm`,
+   `burst`, `dup_ppm` and `reorder` are refused at `setImpairment`, by
+   name (17.9). A delay is a fixed value and draws nothing. The jitter is
+   drawn once per entry, at its send, from a keyed SipHash of `(seed,
+   conn_id, direction, sequence, "jitter")` (the same key as the chunk
+   draw), uniform in 0 to `jitter_ns`, both ends included. TCP draws are
+   counted apart (`streamFaultDraws`).
+5. **An entry's extra time** is its chunk spacing (17.7), plus the delay,
+   plus the jitter, all fixed at its send. It lands at `send + L + extra`,
+   clamped to no earlier than the entry before it in its direction.
+6. **Release time (fixes 17.9 item 5).** Item 5 said "release time + the
+   delay drawn at its send", with no wire latency. A released entry
+   travels the wire after the path heals, like a retransmission, so it
+   lands at `release + L + extra`, clamped behind the entry before it.
+   This holds for an entry held at its send and for one held at its
+   landing alike: one rule, and a release never lands anything at the
+   instant of the release.
+7. **A held entry is not on the wire.** It is in a held list, in
+   (`conn_id`, direction, sequence) order. It counts in
+   `streamEntriesInFlight`, blocks retirement and is in the state digest
+   (17.11); it does not move the clock (17.9 item 9).
+8. **Held credits coalesce (17.9 item 3):** a credit that is about to be
+   held, in a direction that already holds one, replaces it (the newer
+   count). Counted (`credits_coalesced`).
+9. **What an abort discards (fixes 17.9 item 7).** Item 7 named held
+   data and FIN. An aborting endpoint also discards its held credits:
+   its peer's direction toward it is over, so they could only land stale.
+   Its held handshake entries (an ACK) stay held, and its RST is held
+   behind them if its direction still holds anything. The same applies
+   to `failStream` (17.9's table already names credits there).
+10. **Records.** A held entry that is discarded (abort, `failStream`, a
+    close in `C-syn`) is recorded in the trace and the wire digest at
+    that moment with the outcome `discarded_held` (6). A hold is not
+    recorded by itself: the entry's later landing record carries its
+    landing time, which differs.
+11. **`failStream` refusals** (completes 17.9's "any other phase"): an fd
+    that is not a stream endpoint's descriptor; an endpoint in a phase
+    other than `C-syn` or `est`; one that already failed; one that has
+    received a reset (the transport is already over: a second death has
+    no kernel meaning). `failStream` in `C-syn` with no parked connect
+    (the connect was canceled; the endpoint stays `C-syn`, 17.6) makes
+    it `C-failed` with nothing to report.
+12. **`failStream(.timed_out)` in `est`** gives `ConnectionTimedOut` to
+    the first receive or send (both error sets have it: `src/os/net.zig`
+    maps `ETIMEDOUT` there); in `C-syn`, `Timeout` (17.9).
+13. **The connect with no answer is a held SYN.** A partition or silence
+    that matches the SYN holds it; the connect stays parked until its
+    deadline (`Timeout`), a cancel (`Canceled`), or the release (then
+    17.6 as usual). A close in `C-syn` or `C-failed` discards a held SYN
+    at once (`syn_dropped_dead`, recorded `discarded_held`), so the
+    connection retires at once (17.9 item 9). `C-failed` is named too: a
+    client that `failStream` hit in `C-syn` is closed by zio's wrapper,
+    and its held SYN would otherwise block retirement until a release.
+14. **Sensitivity, for slice 3 (17.16 names it; it was not defined).**
+    - 17.11's snapshot tests: two runs equal except one setting give
+      different state digests: chunking `.off` against `.fixed = 1`,
+      another default window, another profile, another backlog; and for
+      slice 3, an entry held against the same entry on the wire, a
+      failed endpoint against one not failed, and a `.tcp` rule against
+      the same rule as `.udp`.
+    - A faulted run repeats in one process with equal wire digest, trace
+      and transcripts; one nanosecond more `.tcp` delay gives another
+      wire digest with the transcripts equal; another seed under jitter
+      gives another wire digest.
+15. **The op model with faults** keeps the handshake out of its rules
+    (17.15 item 2: "the handshake is not modelled"). Its partitions and
+    delays name a connection's two ports, and its silences a client's
+    port, so a new connection's handshake never matches one. The cases
+    that need a fault on a handshake (a SYN held past its deadline, then
+    released; a cancel at each handshake phase under a hold; the connect
+    with no answer) are scenario tests, as slice 1's handshake cases are.
 
 ### 17.10 One wire, flows, draw keys and the RNG (ruling 9; requirements D, E)
 
