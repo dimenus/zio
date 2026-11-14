@@ -978,6 +978,14 @@ pub fn drainForRecv(fd: i32, dst: []const []u8) usize {
     return n;
 }
 
+/// The bytes buffered for a read on pipe end `fd`. For tests that check a
+/// model of the pipe against the sim after each step.
+pub fn testPipeBuffered(fd: i32) usize {
+    if (comptime !builtin.is_test) @compileError("testPipeBuffered is for tests");
+    const i = endIndex(fd) orelse panic("sim: testPipeBuffered on fd {d}, which is not a pipe end", .{fd});
+    return ends[i].buf_len;
+}
+
 pub fn recvIsEof(fd: i32) bool {
     const i = endIndex(fd) orelse return true;
     return atEof(i);
@@ -1960,13 +1968,13 @@ test "submit I/O id is stable across cancel order" {
 // instead exits 0, and a child that runs on forever hits the timeout: both
 // fail the parent. The child sets RLIMIT_CORE to 0 first, so no core file.
 
-const death_child_env = "ZIO_SIM_DEATH_CHILD";
+pub const death_child_env = "ZIO_SIM_DEATH_CHILD";
 
-fn isDeathChild() bool {
+pub fn isDeathChild() bool {
     return std.c.getenv(death_child_env) != null;
 }
 
-fn noCoreDump() void {
+pub fn noCoreDump() void {
     std.posix.setrlimit(.CORE, .{ .cur = 0, .max = 0 }) catch {};
 }
 
@@ -2220,14 +2228,14 @@ fn expectChildSucceeds(comptime test_name: []const u8) !void {
 const done_marker = "sim-child-done: ";
 
 /// The end of a success case in a child: proof that this case ran to its end.
-fn childDone(comptime test_name: []const u8) void {
+pub fn childDone(comptime test_name: []const u8) void {
     const line = done_marker ++ test_name ++ "\n";
     if (comptime builtin.link_libc and builtin.os.tag != .windows) {
         _ = std.c.write(2, line.ptr, line.len);
     } else std.debug.print("{s}", .{line});
 }
 
-fn checkDoneMarkers(test_name: []const u8, stderr: []const u8) error{ ChildRanNoCase, ChildRanSeveralCases, ChildRanOtherCase }!void {
+pub fn checkDoneMarkers(test_name: []const u8, stderr: []const u8) error{ ChildRanNoCase, ChildRanSeveralCases, ChildRanOtherCase }!void {
     var count: usize = 0;
     var named: ?[]const u8 = null;
     var it = std.mem.splitScalar(u8, stderr, '\n');
@@ -5956,6 +5964,7 @@ test "sim: dgram trace: the state digest sees where a datagram still on the wire
 
 test {
     _ = @import("sim_exits_test.zig");
+    _ = @import("sim_op_model_test.zig");
 }
 
 // ---- Phase 1: the native-exit refusals, one test per class of exit ----
