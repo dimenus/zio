@@ -1059,8 +1059,11 @@ pub fn takeDue(out: []TakenDue) usize {
 //   `dgrams`. The lowest free slot is used, so a closed fd number is reused
 //   by the next open.
 // - Port 0 takes the next free port from a counter that starts at 49152 in
-//   every run. A socket that sends before it is bound is bound to 127.0.0.1
-//   and the next port first.
+//   every run. A socket that sends before it is bound is bound to the
+//   wildcard address (0.0.0.0) and the next port first, as the kernels do.
+// - A send's source is its `from` if given, else the bound address, or
+//   127.0.0.1 for a wildcard socket: Linux picks 127.0.0.1 for every 127/8
+//   destination (measured), and macOS has no other loopback address.
 // - A sent datagram goes on the wire and lands `wire_latency_ns` later. Each
 //   flow (source and destination address and port) is first-in first-out.
 //   Datagrams of different flows that are due at the same time land in a
@@ -1344,10 +1347,13 @@ pub fn dgramSend(fd: i32, src: []const []const u8, to: Ip4, from: ?[4]u8) error{
     const total = totalLen(src);
     if (total > max_datagram_len) panic("sim: a datagram of {d} bytes from sim fd {d}: the limit is {d}", .{ total, fd, max_datagram_len });
     if (!d.bound) {
-        const loopback: [4]u8 = .{ 127, 0, 0, 1 };
-        const port = ephemeralPort(loopback) catch panic("sim: no free ephemeral port to bind sim fd {d} for its first send", .{fd});
+        // As macOS and Linux do (design section 4): the wildcard address and
+        // the next port, so a datagram to any local address on that port
+        // lands here. The source is picked per send, below.
+        const wildcard: [4]u8 = .{ 0, 0, 0, 0 };
+        const port = ephemeralPort(wildcard) catch panic("sim: no free ephemeral port to bind sim fd {d} for its first send", .{fd});
         d.bound = true;
-        d.local = .{ .ip = loopback, .port = port };
+        d.local = .{ .ip = wildcard, .port = port };
     }
     var src_ip: [4]u8 = if (isWildcard(d.local.ip)) .{ 127, 0, 0, 1 } else d.local.ip;
     if (from) |f| {
@@ -3703,8 +3709,9 @@ test "sim: dgram: a datagram sent through the socket layer lands after the wire 
             try std.testing.expectEqual(Ip4{ .ip = .{ 127, 0, 0, 1 }, .port = 49152 }, rx_addr);
             // Two buffers sent, one datagram.
             try std.testing.expectEqual(@as(usize, 5), try dg.sendTo(tx, dg.addr(127, 0, 0, 1, 49152), &.{ "ab", "cde" }));
-            // The sender was bound on its first send: 127.0.0.1 and the next port.
-            try std.testing.expectEqual(Ip4{ .ip = .{ 127, 0, 0, 1 }, .port = 49153 }, try dg.local(tx));
+            // The sender was bound on its first send: the wildcard address
+            // and the next port, as the kernels do.
+            try std.testing.expectEqual(Ip4{ .ip = .{ 0, 0, 0, 0 }, .port = 49153 }, try dg.local(tx));
             var b1: [3]u8 = undefined;
             var b2: [10]u8 = undefined;
             // Not landed yet after half the latency, though the loop has

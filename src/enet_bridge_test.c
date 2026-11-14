@@ -736,3 +736,65 @@ int ebt_source_address(int sim) {
     }
     return 0;
 }
+
+// A socket that sends before it is bound, as an ENet client host does (it
+// never binds). Measured on real sockets, 3 runs each (design section 4):
+// on macOS and Linux the first send binds the wildcard address and an
+// ephemeral port, a reply to any local address on that port arrives, and a
+// send to any 127/8 address leaves from 127.0.0.1. macOS has only 127.0.0.1
+// on lo0, so the steps that use 127.0.0.2 run in a sim run and on Linux.
+static const uint8_t loopback2[4] = {127, 0, 0, 2};
+
+static int send_to(ENetSocket s, const uint8_t ip[4], uint16_t port, const char *text) {
+    ENetAddress to = ip4(ip, port);
+    ENetBuffer b = {.data = (void *)text, .dataLength = strlen(text)};
+    return enet_socket_send(s, &to, NULL, &b, 1);
+}
+
+static int receive_from(ENetSocket s, const char *what, int len, const uint8_t ip[4], uint16_t port) {
+    TRY(arrive(s));
+    char buf[8];
+    ENetBuffer b = {.data = buf, .dataLength = sizeof(buf)};
+    ENetAddress from;
+    EXPECT(what, enet_socket_receive(s, &from, NULL, &b, 1), len);
+    EXPECT_IP(what, &from, ip);
+    EXPECT(what, port_of(&from), port);
+    return 0;
+}
+
+static int open_unbound(ENetSocket *s) {
+    *s = enet_socket_create(AF_INET, ENET_SOCKET_TYPE_DATAGRAM);
+    if (*s == ENET_SOCKET_NULL) FAIL("enet_socket_create: ENET_SOCKET_NULL (errno %d)", errno);
+    track(*s);
+    EXPECT("set_option NONBLOCK 1", enet_socket_set_option(*s, ENET_SOCKOPT_NONBLOCK, 1), expect.ok);
+    return 0;
+}
+
+int ebt_send_before_bind(int sim) {
+    ENetSocket rx, c;
+    uint16_t rx_port;
+    TRY(open_bound(any, &rx, &rx_port));
+    TRY(open_unbound(&c));
+    ENetAddress got;
+    EXPECT("get_address before a send", enet_socket_get_address(c, &got), expect.ok);
+    EXPECT_IP("the address before a send", &got, any);
+    EXPECT("the port before a send", port_of(&got), 0);
+    EXPECT("the first send", send_to(c, loopback, rx_port, "hi"), 2);
+    EXPECT("get_address after it", enet_socket_get_address(c, &got), expect.ok);
+    EXPECT_IP("the address after the first send", &got, any);
+    uint16_t c_port = port_of(&got);
+    if (c_port == 0) FAIL("the port after the first send: 0");
+    TRY(receive_from(rx, "the first datagram at rx", 2, loopback, c_port));
+    EXPECT("a reply to 127.0.0.1", send_to(rx, loopback, c_port, "re1"), 3);
+    TRY(receive_from(c, "the reply to 127.0.0.1", 3, loopback, rx_port));
+    if (column(sim) == COL_MACOS) return 0;
+    EXPECT("a reply to 127.0.0.2", send_to(rx, loopback2, c_port, "re2"), 3);
+    TRY(receive_from(c, "the reply to 127.0.0.2", 3, loopback, rx_port));
+    ENetSocket c2;
+    TRY(open_unbound(&c2));
+    EXPECT("a second socket's first send, to 127.0.0.2", send_to(c2, loopback2, rx_port, "to2"), 3);
+    EXPECT("get_address of the second socket", enet_socket_get_address(c2, &got), expect.ok);
+    EXPECT_IP("its address", &got, any);
+    TRY(receive_from(rx, "its datagram at rx", 3, loopback, port_of(&got)));
+    return 0;
+}

@@ -166,11 +166,23 @@ a receive ring with byte and packet limits, and stats.
 - **Ports.** Port 0 binds the next free port from a counter that starts at
   49152, the same in every run.
 - **Binding and source address.**
-  - A socket that sends before it is bound is bound to 127.0.0.1 and the next
-    port first.
+  - A socket that sends before it is bound is bound to the wildcard address
+    (0.0.0.0) and the next port first, as both kernels do (table below).
   - A wildcard bind receives datagrams to any 127/8 address on its port.
   - With no `from`, the source is 127.0.0.1 for a wildcard socket, or its
     bound address.
+- **A send before bind.** Run on 2026-11-14, 3 times each, with a C probe on
+  real sockets (macOS 25.6.0 arm64; Linux 6.8.0 aarch64 in colima); the bridge
+  test `sim: enet bridge: a send before bind ...` asserts the same rows in
+  both builds:
+
+  | after an unbound socket's first send, to 127.0.0.1 | macOS | Linux 6.8 | sim |
+  |---|---|---|---|
+  | `getsockname` | 0.0.0.0, a new port | 0.0.0.0, a new port | 0.0.0.0, the next port |
+  | its datagram's source | 127.0.0.1 | 127.0.0.1 | 127.0.0.1 |
+  | a reply to 127.0.0.1 on that port | arrives | arrives | arrives |
+  | a reply to 127.0.0.2 on that port | sent, never arrives (lo0 has only 127.0.0.1) | arrives, from 127.0.0.1 | arrives, from 127.0.0.1 |
+  | an unbound socket's first send to 127.0.0.2 | sent, never arrives | arrives, from 127.0.0.1 | arrives, from 127.0.0.1 |
 - **The wire.** A sent datagram becomes an entry `{id, flow, bytes, due_at}`.
   A **flow** is the concrete pair (source address and port, destination
   address and port).

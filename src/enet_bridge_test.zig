@@ -157,6 +157,7 @@ extern fn ebt_wait() c_int;
 extern fn ebt_wait_interrupt() c_int;
 extern fn ebt_bind_conflict_and_destroy() c_int;
 extern fn ebt_source_address(sim: c_int) c_int;
+extern fn ebt_send_before_bind(sim: c_int) c_int;
 
 const sim_flag: c_int = @intFromBool(in_sim);
 
@@ -294,4 +295,8 @@ test "sim: enet bridge: a bind to a port in use is -1 with EADDRINUSE, destroy f
 
 test "sim: enet bridge: a source address the socket cannot use: the sim's column in a sim run, the kernel's otherwise" {
     try runCForBuild(ebt_source_address);
+}
+
+test "sim: enet bridge: a send before bind binds the wildcard address and a port, and a reply to any local address on that port arrives" {
+    try runCForBuild(ebt_send_before_bind);
 }
