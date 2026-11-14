@@ -1,20 +1,16 @@
-# Design brief: a sim network for zio (t-4086, t-4087), revision 2
+# Design brief: a sim network for zio (t-4086, t-4087), revision 3
 
-Status: **for a second review before anyone builds it.** Nothing here is built.
+Status: **phase 1 (section 12) is being built; the rest is for review.**
 
-Revision 1 (5db05ef) was reviewed by another vendor's model. This revision
-takes the decisions made after that review. The main change: **one socket path
-in every build.** zio's own non-suspending socket layer is the seam, and zio
-exports no C. Section 13 lists what changed from revision 1 and why.
+Revision 2 (dd55885) was reviewed by another vendor's model. This revision
+takes the decisions made after that review. Section 13 lists what changed
+and why.
 
 This repo keeps no design notes (`docs/` is the user-facing mkdocs site), so
 the brief sits beside the probe that found the gaps. As each phase is built,
 its protocol moves into doc comments beside the code, its reasoning into the
 commit message, and this file loses that section. When the last phase lands,
 the file is deleted.
-
-Line numbers are for this branch (`hotseat/sim-second-user`) unless a file
-names another repo.
 
 ## 1. Goal and users
 
@@ -24,449 +20,390 @@ The goal: code that opens its own sockets runs under the simulator
 - **Datagram track (t-4087), for hotseat:** UDP on 127.0.0.0/8, with message
   boundaries and truncation, `net_poll`, and seeded loss, delay, reorder and
   duplication. hotseat's ENet control link and its media run over it.
-- **Stream track (t-4086), for starh2:** `listen`, `connect`, `accept`,
-  `getpeername` on 127.0.0.0/8, so `dst-conn` can run through the accept loop
-  and admission. Its scope line lists "the accept loop and admission",
-  "getpeername" and "more than one connection" as unsimulated (starh2
-  `tools/dst-conn/main.zig:982`).
+- **Stream track (t-4086), for starh2:** `listen`, `connect`, `accept` and
+  `getpeername` on 127.0.0.0/8, so `dst-conn` can run through the accept
+  loop and admission (starh2 `tools/dst-conn/main.zig:982`).
 
 ## 2. Non-goals
 
-- A TCP stack. A connected stream stays today's pipe: bytes in order, no
-  segments, no windows, no retransmit timing.
+- A TCP stack.
 - Addresses that are not loopback, DNS, multicast, broadcast, IPv6 (to start).
 - A C API exported by zio.
+- The sim network on Windows. Handles there are not small integers, so the
+  fd-namespace proof of section 3 does not apply, and `sim.begin` refuses a
+  run that opens a sim socket there.
 - Any change to a run that uses none of this (section 7, promise 1).
 
-## 3. The seam: one non-suspending socket layer, every build
+## 3. The seam: a logical socket interface
 
-**zio's non-suspending socket layer** is the only way a program touches a
-socket by its fd, outside the suspending `zio.net` API. The functions return
-at once. In a normal build each one is the syscall. Under sim, a sim fd (one
-from the sim socket table) goes to the table; a real fd under sim is refused.
+The seam is **logical**, not one file. A sim socket is reachable in exactly
+three ways, and every other way out of zio refuses it.
 
-It starts from the wrappers that already exist in `src/os/net.zig` (`socket`
-:327, `bind` :524, `listen` :585, `connect` :631, `accept` :669,
-`getsockname` :746, `setsockopt` :773, `getsockopt` :801, `recvfrom` :1295,
-`sendto` :1377, `recvmsg` :1463, `sendmsg` :1653, `close` :153). It adds what
-is missing:
+1. **The Loop-level sim dispatch** (`src/ev/loop.zig`, `submitSimIo`). The
+   suspending ev ops (`NetOpen`, `NetBind`, `NetRecvFrom`, `NetSendTo`,
+   `NetRecvMsg`, `NetSendMsg`, `NetPoll`, `NetClose`, and today's
+   `NetRecv`/`NetSend`/`NetShutdown`) go there under sim and never reach a
+   backend. **This stays.** io_uring and IOCP submit ops without going through
+   any `os/` wrapper, so a branch in `os/net.zig` alone could not stop them.
+2. **The non-suspending socket layer**, the functions in `src/os/net.zig` a
+   program calls by fd (section 3.1). Each has a sim branch for a sim fd.
+3. **Nothing else.** Every other native exit inside zio that takes an fd
+   refuses a sim fd: `sim: a sim fd reached <exit>`. That covers:
+   - the generic file and pipe paths: `File.fromFd(...)` and then `close`,
+     `read`, `write`, `readStreaming`, `stat`, ...;
+   - the blocking dispatch (`ev/blocking.zig` `executeBlocking`, which a call
+     with no current task takes);
+   - the direct calls left in `net.zig` and `io.zig`: socket options through
+     `setBoolOption`/`setIntOption` on Windows, `setNoDelay`, `getNoDelay`,
+     `fileSeek*`, `fileLock*`, `isTty`, ....
 
-- `getpeername`;
-- `setNonBlocking(fd, bool)` and `isNonBlocking(fd)`, the check hotseat makes
-  today with a direct `fcntl`;
-- a source address on `sendmsg` and the destination address on `recvmsg`, as
-  typed values (the job `IP_PKTINFO` does in C).
+   **How the exits are found:** a script lists every function in
+   `src/os/*.zig` that takes an fd or handle and calls the kernel. Every
+   caller of those functions in `src/` is then either the socket layer or
+   gets the refusal. The list, with each exit's verdict, is in phase 1's
+   commit.
 
-**The manifest** of what the layer offers, and so of what a sim fd can do:
+### 3.1 The manifest of the non-suspending layer
 
-| function | datagram | stream (stream track) |
+In a normal build each row is the syscall. Under sim each row works on the
+sim socket table, or does what the row says.
+
+| function | datagram, under sim | normal build |
 |---|---|---|
-| `socket` | yes | yes |
-| `bind` | yes (port 0: next ephemeral) | yes |
-| `listen` | refused | yes |
-| `connect` | refused (connected UDP is not modelled) | yes, non-blocking: in progress, then ready |
-| `accept` | refused | yes |
-| `getsockname` / `getpeername` | `getsockname` | both |
-| `setNonBlocking` / `isNonBlocking` | yes (stored and read back) | yes |
-| `setsockopt` / `getsockopt` | only the options in section 8 | same |
-| `sendto` / `sendmsg` | yes; `sendmsg` may name a source address | refused (use `send`) |
-| `recvfrom` / `recvmsg` | yes; destination address, truncation flag, `WouldBlock` when empty | refused |
-| `send` / `recv` | refused (unconnected) | today's pipe |
-| `shutdown` | refused | today's pipe |
-| `close` | yes | yes |
+| `socket(.ipv4, .dgram)` | a sim fd | `socket` |
+| `bind(fd, addr)` | port 0 takes the next ephemeral port; `AddressInUse`; any 127/8 address or 0.0.0.0 | `bind` |
+| `getsockname(fd)` | the bound address | `getsockname` |
+| `setNonBlocking(fd, on)` / `isNonBlocking(fd)` | stored and read back | `fcntl` |
+| `setsockopt` / `getsockopt` | per option, section 8 | as asked |
+| `enableDestinationAddress(fd)` | turns on `to` in `recvmsg` (stored flag) | `IP_PKTINFO` (Linux) / `IP_RECVDSTADDR` (BSD, macOS) |
+| `sendto(fd, to, iov)` | one datagram; completes at once | `sendto` |
+| `sendmsg(fd, to, from: ?Addr, iov)` | `from`, if given, must be an address the socket can receive on, else `error.AddressUnavailable` | `sendmsg` with `IP_PKTINFO` (Linux) / `IP_SENDSRCADDR` (BSD, macOS) |
+| `recvfrom(fd, iov, .{ .dontwait, .trunc })` | one datagram, its source; `WouldBlock` when empty; `trunc` reports the full length, and the datagram is consumed | `recvfrom` |
+| `recvmsg(fd, iov, flags)` | as `recvfrom`, plus `to: ?Addr` (null unless enabled) | `recvmsg` and the control message |
+| `poll(fd, events, timeout = 0)` | `{ readable, writable }` now | `poll` with timeout 0 |
+| `pollInterruptible(fd, events, timeout_ms)` | timeout 0 only; a positive timeout is refused under sim | `poll`; returns `.interrupted` on `EINTR` instead of retrying |
+| `close(fd)` | frees the fd and the port | `close` |
+| `connect`, `listen`, `accept`, `shutdown`, `send`, `recv` on a datagram fd | refused (`error.OperationNotSupported`) | as the kernel answers |
 
-The suspending ev ops (`NetOpen`, `NetBind`, `NetConnect`, `NetAccept`,
-`NetRecvFrom`, `NetSendTo`, `NetRecvMsg`, `NetSendMsg`, `NetPoll`, and today's
-`NetRecv`/`NetSend`/`NetClose`/`NetShutdown`) route a sim fd to the same table
-through the same functions. **There is one sim implementation, and two ways
-to reach it.**
+**Send errors keep the distinctions a consumer needs:** `SendError` gains
+`AddressUnavailable` (`EADDRNOTAVAIL`). Today it falls into `Unexpected`
+(`src/os/net.zig:956-1003`). ENet treats it as transient and returns 0.
 
-**Consumers move every socket call to the layer, in every build:**
+### 3.2 Consumers, in every build
 
-- **hotseat** owns a small C-callable bridge in its own repo. It implements
+- **hotseat** owns a small C-callable bridge in its repo that implements
   ENet's socket functions (`enet_socket_create`, `_bind`, `_get_address`,
-  `_set_option`, `_get_option`, `_send`, `_receive`, `_wait`, `_destroy`) by
-  calling the layer, in production too. It returns ENet's own codes: 0 for
-  would-block, -2 for truncation (ENet `unix.c:763-860`). It does not compile
-  ENet's socket half of `unix.c`. ENet's other socket entry points (`listen`,
-  `connect`, `accept`, `shutdown`, `select` in `unix.c:410,578,593,606,885`)
-  get bridge versions that return -1. With no libc socket call left in the
-  bridge, those paths cannot reach the kernel with a sim fd. hotseat's own
-  `requireNonBlocking` (`src/enet_control.zig:1648-1653`, a direct
-  `std.c.fcntl`) moves to `isNonBlocking`. Its `ev.NetPoll` wait is already
-  a zio op.
-- **starh2** moves `peerFromHandle`'s `std.c.getpeername`
-  (`src/edge/connection.zig:630`) and `setTcpNoDelay`'s
-  `posix.system.setsockopt` (`src/http1/oneshot.zig:473-477`, and its twin in
-  `src/edge/server.zig`) to the layer, in every build.
+  `_set_option`, `_get_option`, `_send`, `_receive`, `_wait`, `_destroy`,
+  and `enet_socketset_select`) over this layer, in production too. It
+  returns ENet's own codes:
+  - 0 for would-block and for `AddressUnavailable` on send;
+  - -2 for truncation;
+  - `ENET_SOCKET_WAIT_INTERRUPT` from `pollInterruptible`;
+  - -1 for an unsupported option, which ENet ignores (`host.c:66-68`).
 
-**What remains possible, and how it is caught:** consumer code that still
-calls libc directly with a sim fd gets `EBADF` from the kernel. A sim fd is
-not a real descriptor, and it is above any real one: `fd_base` is 100000. The
-consumer catches this with a gate in its own repo, a grep for direct socket
-calls, as hotseat already gates names like `enet_address_set_host`. That is
-the consumer's protection, not the simulator's. This brief says so plainly.
+  hotseat's `requireNonBlocking` moves to `isNonBlocking`.
+- **starh2** moves `getpeername` and `TCP_NODELAY` to the layer (stream
+  track).
+- A consumer keeps a grep gate in its own repo for direct libc socket calls.
+  That is a second line of defence; section 3.3 is the first.
 
-**Production cost (expected, to be measured; not measured yet):**
+### 3.3 A sim fd is provably invalid to the kernel
 
-- zio: none in a build without sim. The sim branch inside each wrapper is
-  `if (comptime sim)`, as for t-4085's checks, which left the machine code of
-  seven examples unchanged (c6965cf's commit message).
-- hotseat: one direct C-to-Zig call per ENet socket call. That is no extra
-  syscall, and the layer's error mapping replaces ENet's `errno` checks.
-  The expected cost is tens of nanoseconds, against a loopback `sendmsg` of
-  a few microseconds. **This is an inference.**
-- How to measure:
-  1. a microbenchmark in hotseat of a million `enet_socket_send` of 100 bytes
-     on loopback, with unix.c's version and with the bridge, at least 5 runs
-     each, giving the median and the spread;
-  2. hotseat's own key-to-wire samples (`key_wire` in `src/enet_control.zig`)
-     for the same input script with each version, at least 3 runs each.
+A sim fd is `fd_base + index`, where `fd_base = 100000`. A process can own a
+real descriptor at that number: `dup2(0, 100000)` succeeded in this shell,
+whose soft limit is 1048576. So at `sim.begin`:
 
-  Adopt the bridge only if the difference is inside the run-to-run spread.
+1. Read `RLIMIT_NOFILE`. If the soft limit is above `fd_base`, lower it to
+   `fd_base`. The kernel then never hands out a descriptor at or above
+   `fd_base`, and refuses `dup2` to one (`EBADF`).
+2. Read it back, and check that no descriptor is open in the sim range
+   (`fcntl(F_GETFD)` gives `EBADF` for each number in the table).
+3. If either fails, panic at `begin`.
+
+Every sim socket open re-reads the soft limit, so code that raised it during
+the run is caught at the next open. `sim.end` restores the old soft limit.
+
+**Rejected: lowering the hard limit.** It would make the proof permanent, but
+it cannot be undone by an unprivileged process, and it would outlive the run.
 
 ## 4. Model
 
-One sim host per run, one socket table in `sim.zig`.
-
-```
-Socket = {
-  kind: datagram | stream | listener,
-  local: ?Addr, peer: ?Addr,         // Addr = { ip: 127.x.y.z or 0.0.0.0, port }
-  nonblocking: bool,
-  options: the modelled options (section 8),
-  rx: per-socket receive ring        // datagram: slots and bytes, limits in §6
-  stream: ?pipe end                   // connected stream: today's End
-  accept_q: connected ends not yet accepted (listener)
-  stats
-}
-```
+One sim host per run, one socket table in `sim.zig`. For each datagram socket
+it holds: the local address, the non-blocking flag, the options (section 8),
+a receive ring with byte and packet limits, and stats.
 
 - **Ports.** Port 0 binds the next free port from a counter that starts at
-  49152, the same in every run. Stream and datagram ports are separate
-  spaces.
-- **Binding and source address.** A datagram socket that sends before it is
-  bound is bound first, implicitly, to 127.0.0.1 and the next port.
-  A wildcard bind (0.0.0.0) receives datagrams sent to any 127.0.0.0/8
-  address on its port, and nothing else. Its source address, when `sendmsg`
-  names none, is 127.0.0.1. `sendmsg` may name a source address in 127/8 that
-  the socket could receive on (its bound address, or any 127/8 address if it
-  is wildcard-bound); any other source is refused. `recvmsg` returns the
-  destination address the datagram was sent to. ENet needs this to reply
-  from the right address (`unix.c:679-709` sends `IP_PKTINFO`).
-- **The wire.** A datagram sent becomes an entry `{id, flow, bytes, due_at}`.
+  49152, the same in every run.
+- **Binding and source address.**
+  - A socket that sends before it is bound is bound to 127.0.0.1 and the next
+    port first.
+  - A wildcard bind receives datagrams to any 127/8 address on its port.
+  - With no `from`, the source is 127.0.0.1 for a wildcard socket, or its
+    bound address.
+- **The wire.** A sent datagram becomes an entry `{id, flow, bytes, due_at}`.
   A **flow** is the concrete pair (source address and port, destination
-  address and port). With reorder off, each flow is first-in first-out: a
-  datagram's due time is at least that of the previous one in its flow.
-  Datagrams in one flow due at the same time keep their send order. **The
-  existing same-time shuffle (`takeDue`) is applied across flows only.**
-- **Receiving.** A due datagram lands in the socket bound to its destination,
-  or is dropped and counted (`dropped_no_socket`). If the socket's ring is
-  over either limit (section 6), it is dropped and counted (`dropped_rcvbuf`).
-  The sender has already succeeded either way.
-- **Peers that move.** A receiver sees each datagram's real source. A socket
-  that replies to "the last source" follows a peer to its new address with no
-  extra model. That is what ENet does (`protocol.c:1088-1089` copies the
-  received address into the peer).
-- **Streams (stream track).** `listen` makes a listener with a backlog.
-  `connect` to a listener makes a `pipePair` and queues one end; the connect
-  completes after the usual seeded I/O delay. `accept` takes the oldest
-  queued end. Connecting where nothing listens gives `ConnectionRefused`
-  after the delay. A full backlog refuses the connect (section 10 says this
-  is not modelled like a kernel).
+  address and port).
+  - With reorder off, each flow is first-in first-out, and datagrams in one
+    flow due at the same time keep their send order.
+  - The same-time shuffle (`takeDue`) is applied across flows only.
+- **Receiving.**
+  - A due datagram lands in the socket bound to its destination. If none is
+    bound there, it is dropped and counted (`dropped_no_socket`).
+  - If the socket's ring is over a limit (section 6), the datagram is dropped
+    and counted (`dropped_rcvbuf`).
+  - The sender has already succeeded either way.
+- **Peers that move.** A receiver sees each datagram's real source, so a
+  socket that replies to the last source follows a peer to its new port.
+  ENet does that (`protocol.c:1088-1089`).
 
-## 5. The test's API
-
-All in `zio.sim`, sim builds only, on the sim thread (t-4085 refuses other
-threads, from the round-3 checks onward).
+## 5. The test's API (phase 2 adds faults; phase 1 has none)
 
 ```zig
-pub const Path = struct {
-    from_ip: ?[4]u8 = null, from_port: ?u16 = null,
-    to_ip: ?[4]u8 = null,   to_port: ?u16 = null,
-};
-
+pub const Path = struct { from_ip: ?[4]u8 = null, from_port: ?u16 = null, to_ip: ?[4]u8 = null, to_port: ?u16 = null };
 pub const DatagramFaults = struct {
-    /// Per million datagrams on the path, dropped when sent. 0..1_000_000.
-    loss_ppm: u32 = 0,
-    /// Per million, delivered twice; the copy draws its own delay. 0..1_000_000.
-    dup_ppm: u32 = 0,
-    /// Wire delay, uniform in [min_ns, max_ns]. Null: the default (below).
-    delay: ?struct { min_ns: u64, max_ns: u64 } = null,
-    /// Off: each flow keeps its order (section 4). On: each datagram keeps
-    /// its own drawn delay, so a range wider than the gap between sends
-    /// reorders within a flow.
+    loss_ppm: u32 = 0,                 // 0..1_000_000, validated
+    dup_ppm: u32 = 0,                  // 0..1_000_000, validated
+    delay: ?struct { min_ns: u64, max_ns: u64 } = null,   // min <= max, validated
     reorder: bool = false,
-    /// Drop everything on the path: a link broken in this direction.
     blackhole: bool = false,
 };
-
 pub fn setDatagramFaults(path: Path, faults: DatagramFaults) void;
 pub fn clearDatagramFaults(path: Path) void;
-
-pub const ConnectOutcome = enum { accept, refuse, no_answer };
+pub const ConnectOutcome = enum { accept, refuse, no_answer };     // stream track
 pub fn setConnectOutcome(path: Path, outcome: ConnectOutcome) void;
-
-pub const DatagramStats = struct {
-    sent: u64, delivered: u64, duplicated: u64,
-    dropped_loss: u64, dropped_blackhole: u64,
-    dropped_rcvbuf: u64, dropped_no_socket: u64,
-};
 pub fn datagramStats(fd: i32) DatagramStats;
-
-/// Bytes on the wire, for replay across processes: a hash over every
-/// datagram delivered, in delivery order (id, flow, payload).
-pub fn wireDigest() u64;
+pub fn wireDigest() u64;      // phase 1
 ```
 
-- **Rules: last set wins.**
-  - `setDatagramFaults` replaces a rule with an equal `Path`, or adds one.
-  - `clearDatagramFaults` removes the rule with that exact `Path`.
-  - A datagram uses the most recently set rule whose `Path` matches it.
-  - A rule whose knobs are all off is stored as no rule (section 7, promise 2).
-  - At most 32 rules. A 33rd panics: it is a harness limit, not a network
-    condition.
-- **Validation at set:** a rate above 1_000_000, `min_ns > max_ns`, or a
-  `Path` with an address outside 127/8 panics with the field's name.
-- **The default delay**, with no rule: the seeded 1 ms or 5 ms that stream
-  I/O uses today, kept in flow order.
-- **No schedule API.** A test changes faults from a task, after it sleeps on
-  the virtual clock.
-- `datagramPair` stays private to zio's tests. No consumer needs it.
+- **Last set wins.** `set` replaces the rule with an equal `Path`, or adds
+  one. `clear` removes it. A datagram uses the most recently set rule that
+  matches it.
+- **An all-off rule means removal**, and only removal. Setting one removes any
+  rule with that exact `Path`; it does **not** exempt the path from a wider
+  rule. A specific all-off setting under a wildcard blackhole leaves the
+  blackhole in force for that path.
+- `datagramPair` stays private to zio's tests.
 
-## 6. Receive limits, and losses that are not network faults
+## 6. Receive limits
 
-Each datagram socket has two limits:
-- **bytes:** the `SO_RCVBUF` value set, else 212992 (Linux's default);
+Each datagram socket has two limits, set independently:
+
+- **bytes:** `SO_RCVBUF`, else 212992;
 - **packets:** 1024.
 
 Each datagram costs its length plus 256 bytes against the byte limit, so an
-empty datagram still costs something, and one packet against the packet
-limit. The storage for both is provisioned per socket from the runtime's
-allocator when the socket is opened. So the documented overflow behaviour is
-always reachable: a full ring drops the newest datagram and counts it in
-`dropped_rcvbuf`. **It never panics.** ENet's 256 KiB request (`host.c:67`,
-`enet.h:204`) is honoured as given.
+empty one costs something, and 1 against the packet limit.
 
-A harness that wants "no receive loss" asserts it: `dropped_rcvbuf == 0`.
-That is the harness's budget, a separate assertion from the socket's
-overflow behaviour.
+**Storage:**
+- It is provisioned per socket, from the runtime allocator, at open.
+- A later `SO_RCVBUF` re-provisions it. Datagrams already queued stay; if
+  they now exceed the new limit, nothing is dropped, but new ones are dropped
+  until the queue is under the limit.
+- If the allocation fails, `setsockopt` returns `error.SystemResources`, the
+  error a kernel gives, and the old limit stays.
 
-Fixed tables that remain, and panic when full because a full table is a
-harness limit: sockets (256), wire entries in flight (4096), fault rules (32).
+**Overflow is a counted receive loss (`dropped_rcvbuf`), never a panic.** A
+harness asserts its own budget (`dropped_rcvbuf == 0`) separately.
 
-## 7. Determinism: three separate promises
+## 7. Determinism: three promises, and the consumer rules
 
-1. **Old workloads are unchanged.** A run that opens no sim socket draws the
-   same numbers, emits the same events and digests the same as before.
-   - Event numbers, draw sites and pipe behaviour stay as they are.
-   - New event kinds (`dgram`, `conn`) are emitted only by the new code.
-   - *Test:* starh2's `dst-zio` trace hashes and `dst-conn`'s `MUTANT_FOUND`
-     seeds and hashes are the same as at the pin, plus zio's own sim tests.
-     This is the gate t-4085 used.
-2. **Inactive fault settings draw nothing.**
-   - The fault code counts its own draws (`sim.netFaultDraws()`).
-   - *Test:* a datagram workload with no rule and with an all-off rule makes
-     **0** fault draws, and the two give equal traces and digests.
-   - An all-off rule is normalized to no rule before it is stored or
-     digested, so equal configurations digest equally.
-   - *Mutant:* draw for loss when `loss_ppm == 0`. The draw counter catches
-     it even if both runs drew.
-3. **Faulted workloads repeat.**
-   - *Test:* a run with loss, duplication and a reorder range is run in two
-     **fresh processes** with the same seed. The second process first makes
-     an allocation of a size taken from its process id, so heap addresses
-     differ between the two.
-   - The test compares the trace hash, the state digest and `wireDigest()`.
-     Comparing scheduler events alone would miss bytes that differ on the
-     wire.
+1. **Old workloads are unchanged.** Test: starh2's three sim steps keep their
+   trace hashes, and zio's own sim tests pass. **Two `dst-zio` fixtures
+   (`spawn_cancel_race`, `spawn_read_after_publish`) are not repeatable at
+   the pin itself** (round 4: two or three values over 13 pin runs). For
+   them the gate compares the *set* of values over 10 runs at the pin and
+   10 on the change, not one run, until t-4092 is fixed.
+2. **Inactive fault settings draw nothing** (phase 2). `netFaultDraws()`
+   counts the fault code's own draws. A run with no rule and one with an
+   all-off rule both make 0 such draws, and give equal traces and digests,
+   because an all-off rule is removed.
+3. **Faulted workloads repeat** (phase 2). This depends on t-4092: today
+   `sim.taskId` keys tasks by pointer, and a workload that frees and spawns
+   tasks can get different ids in different processes. The same seed is run in two fresh
+   processes, with the heap moved in the second. The test compares the trace,
+   the state digest, `wireDigest()`, and the receiver's own byte transcript,
+   which it builds by itself.
 
-**Consumers' entropy (the rule for foreign code):** every source of entropy
-in code under sim must be seeded from the sim.
+**Sensitivity**, so equal digests mean something (phase 1 for the wire):
 
-- *ENet's example:* ENet seeds `host->randomSeed` from the host's address plus
-  the time (`host.c:79-81`, `unix.c:219-226`). The seed makes `connectID`
-  (`host.c:215`), which goes on the wire in the CONNECT command (`host.c:260`).
-  hotseat must set `host->randomSeed` from a seeded source, on both peers,
-  before the first connect. Patching the clock alone leaves the pointer in.
-- *What the simulator offers:* `zio.random` (`src/random.zig:35`). On an
-  executor under sim it is filled from that executor's generator, which is
-  seeded from the run's seed (`src/runtime.zig:731`).
-- **A gap to close in phase 1:** off an executor, `zio.random` falls back to
-  the operating system (`src/random.zig:38-43`). Under sim, phase 1 makes
-  that fallback refuse during a run, so a consumer cannot take real entropy
-  by mistake.
+- the same run with one payload byte changed gives a different
+  `wireDigest()`, while the seed, lengths and endpoints are the same;
+- the receiver's transcript is compared directly, not only through the hash.
 
-## 8. Options: modelled, or refused
+**Consumer rules (foreign code under sim):**
 
-An option whose effect is not modelled is **refused**, never recorded and
-ignored.
+- Its clock goes to zio's routed clock. hotseat routes ENet's time function
+  (`src/enet_patch/monotonic_time.c`, which calls `clock_gettime` today) to
+  `zio.Timestamp.now`. That is hotseat's work.
+- Every source of entropy in it is seeded from the sim. ENet's
+  `host->randomSeed` mixes in the host pointer (`host.c:79-81`) and is sent
+  in `connectID` (`host.c:215, 260`). Both peers set it from `zio.random` on
+  an executor before the first connect.
+- **zio's side** (phase 1):
+  - `zio.randomSecure` is refused during a run, on every thread, including
+    through `std.Io`'s `randomSecure`. It is **never** replaced with
+    deterministic bytes.
+  - `zio.random` off an executor is refused during a run.
 
-| option | effect under sim |
-|---|---|
-| non-blocking (`setNonBlocking`) | stored and read back; sim calls never block either way, and a blocking call shape (section 9) is refused |
-| `SO_RCVBUF` | the byte limit of section 6 |
-| `TCP_NODELAY = 1` | modelled: a sim stream never holds back small writes, which is what it asks for |
-| `TCP_NODELAY = 0` | refused (Nagle is not modelled) |
-| `SO_REUSEADDR = 1` | modelled for datagrams (no TIME_WAIT exists for UDP); for streams, see below |
-| `SO_SNDBUF` | **refused**: send pressure is not modelled |
-| anything else | refused |
+## 8. Options: three classes
 
-- **Send pressure is not modelled.** A datagram send never fails with
-  `EAGAIN`, `ENOBUFS` or `EMSGSIZE` under sim. hotseat's Darwin tests that
-  set a 1-byte `SO_SNDBUF` to get `EMSGSIZE` (`src/enet_control.zig:2554,
-  2687, 2764, 2852`) stay real-socket tests. Under sim their `SO_SNDBUF`
-  call is refused, so they cannot pass by mistake.
-- **Stream ports after close.** TIME_WAIT is not modelled. Binding a stream
-  port that has carried a connection in this run is refused, unless the new
-  socket set `SO_REUSEADDR = 1` (which, on a real kernel, also allows it).
-  This brief does not claim "close frees the port" in general.
+| class | under sim | examples |
+|---|---|---|
+| **modelled** | the option has its documented effect | `SO_RCVBUF` (byte limit), non-blocking, `enableDestinationAddress`, `TCP_NODELAY = 1` and `SO_REUSEADDR = 1` (stream track) |
+| **unsupported, advisory** | returns `error.OptionUnsupported`; nothing changes; the caller may ignore it | `SO_SNDBUF`, `IP_TOS`, ENet's QoS option, `SO_RCVLOWAT`, `TCP_NODELAY = 0` |
+| **misuse** | panics with the option's name | an option on a closed or unknown fd; `SO_REUSEPORT` sharing a port; broadcast and multicast options; an option level the layer does not know |
+
+- An unsupported option returns an error, so ENet's ignored -1 works
+  (`host.c:66-68`).
+- hotseat's Darwin tests that need a 1-byte `SO_SNDBUF` to get `EMSGSIZE`
+  stay real-socket tests. Under sim they would see `OptionUnsupported`, and
+  their sends would succeed. Send pressure is not modelled (section 10).
+- **TIME_WAIT is not modelled.** Stream rebinding without `SO_REUSEADDR` is
+  refused (stream track). starh2's listeners set `reuse_address = true`
+  (`src/edge/server.zig:1984, 2033, 2063, 2151`).
 
 ## 9. What is refused, by name
 
 - Non-loopback addresses.
-- IPv6 (to start).
+- IPv6.
 - `recvmmsg`/`sendmmsg`.
 - `MSG_PEEK`.
 - `connect` on a datagram socket.
-- Broadcast and multicast.
-- The options of section 8.
-- A real fd passed to a sim op or to the layer during a run.
-- A blocking call shape: `recvfrom`/`recvmsg` without `dontwait` on a socket
-  not set non-blocking, or a poll with a timeout.
-- `zio.random` off an executor during a run (section 7).
-- A datagram over 65507 bytes (the IPv4 limit). Any size up to that is
-  carried; nothing is cut.
+- The misuse class of section 8.
+- A sim fd at a native exit (section 3).
+- A real fd passed to a sim op during a run.
+- A positive poll timeout.
+- A blocking receive on a socket not set non-blocking.
+- `zio.randomSecure` and off-executor `zio.random` during a run.
+- A datagram over 65507 bytes.
 
 ## 10. Fidelity limits: what is not modelled, so not tested under sim
 
-- Send pressure and local send failures (`EAGAIN`, `ENOBUFS`, `EMSGSIZE`).
-- Connected UDP: peer filtering, and ICMP-driven `ECONNREFUSED` on a later
-  send. Refused, not simulated as loss.
-- TCP: segments, Nagle, windows, retransmits, keepalive, TIME_WAIT, abortive
-  close (RST on close with unread data), backlog overflow as a real kernel
-  does it (SYN queue, silent drop). Half-close is modelled (today's
-  `shutdown`).
-- The MTU and IP fragmentation. Datagrams up to 65507 bytes arrive whole.
-- Real loopback ordering under load. Sim keeps flow order unless reorder is
-  set; a kernel under pressure can drop instead.
-- Interface and address changes (a NAT rebinding is modelled only as a socket
-  that sends from a new port).
-- Timing of the network relative to CPU work: wire delays are the seeded
-  values, not a function of load.
+- **Send pressure** and local send failures (`EAGAIN`, `ENOBUFS`,
+  `EMSGSIZE`). `AddressUnavailable` occurs only for a bad `from`.
+- **Connected UDP:** peer filtering, and ICMP-driven `ECONNREFUSED`.
+- **TCP internals:** segments, Nagle, windows, retransmits, keepalive,
+  TIME_WAIT, abortive close, kernel backlog overflow. Half-close is modelled.
+- **MTU and fragmentation.**
+- **Loopback ordering and loss under load.**
+- **Interface and address changes.**
+- **Network timing relative to CPU load.**
+- **Memory accounting:** the receive limits are a declared model, not
+  Linux's.
+- **Signals interrupting a poll:** `pollInterruptible` cannot be interrupted
+  under sim, because its timeout is 0.
 
-## 11. Tests and the mutants they must kill
+## 11. Phase 1 acceptance
 
-All tests are in this repo's suite with a `sim: ` name prefix. Refusals use
-the death harness, which matches the panic's own line, not a source line in
-its trace (round 3).
+Each property gets a test and a mutant that fails it. The tests are in this
+repo's suite under `sim: `.
 
-| test | property | mutant it must kill |
-|---|---|---|
-| two `sendto` of 3 bytes, two `recvfrom` of 3 | boundaries | concatenate datagrams |
-| `recvfrom` on an empty non-blocking socket | `WouldBlock`, nothing parked | park instead |
-| a task in `net_poll(.recv)` wakes when a datagram lands | readiness | complete only on the next send |
-| an undersized receive **through the test's C bridge**, written like ENet's `enet_socket_receive` | the bridge returns -2 | drop the truncation flag |
-| receive-buffer overflow: `SO_RCVBUF` small, 50 datagrams sent, none read | sends succeed, the first K arrive, `dropped_rcvbuf == 50 - K` | ignore `SO_RCVBUF`; panic when full |
-| packet limit with empty datagrams | the packet limit drops them | charge empty datagrams nothing |
-| a peer moves: A sends from port p1, B replies to the last source; A sends from a new socket at p2 | B's next reply reaches p2 | deliver only from the first source |
-| wildcard bind, `recvmsg` destination, `sendmsg` with that source | the reply's source is the address used | ignore the source address |
-| per-flow order, reorder off, two flows due at the same time, seeds 1..20 | each flow in order on every seed; the flows interleave differently on some seed | shuffle within a flow |
-| reorder on with a delay range | some seed delivers a flow out of order | ignore `reorder` |
-| loss 50 %, 1000 datagrams, seeds 1..5 | `dropped_loss + delivered == sent` and both are non-zero on each seed | never draw loss |
-| duplicate 50 % | `duplicated` > 0, each copy delivered | no second copy |
-| blackhole one direction | one way dead, the other works | blackhole both ways |
-| promise 2: no rule vs all-off rule | `netFaultDraws() == 0` in both; equal trace and digest | draw when a knob is off; digest the stored zero rule |
-| promise 3: fresh-process replay with heap perturbation | equal trace, digest, `wireDigest()` | hash a pointer; leave payloads out of `wireDigest` |
-| event contribution | a workload of N sends and M deliveries emits exactly N + M `dgram` events, counted per kind | omit `dgram` events from the trace |
-| rates and ranges validated | `loss_ppm = 2_000_000` and `min > max` panic | accept them |
-| refused names (section 9), one test each | each panics with its message | each check removed |
-| stream track: connect with no listener, three connects and accepts, `no_answer` with a 1 s timeout, `getpeername`, two clients from 127.0.0.2 and 127.0.0.3 seen as different peers by an admission check | as named | `ConnectionRefused` never given; LIFO accept; answer anyway; return the listener's address; one peer for all |
+1. **Cross-interface exchange.**
+   - C sends to an ev receiver, and ev sends to C.
+   - Check the actual bytes, the source and destination addresses, and
+     scatter/gather boundaries (two iovecs sent, one datagram received whole;
+     one datagram read into two iovecs).
+2. **Real bridge semantics, from C:**
+   - verified non-blocking state;
+   - an empty receive gives 0 (would-block);
+   - a zero-length datagram arrives as a datagram of length 0;
+   - truncation returns -2, and the truncated datagram is consumed (the next
+     receive is the next datagram);
+   - an unsupported option returns -1 and nothing changes;
+   - **an ENet-shaped host creation:** socket, non-blocking, `RCVBUF`,
+     `SNDBUF` (ignored -1), `enableDestinationAddress`, bind to port 0,
+     `getsockname`.
+3. **Addressing:**
+   - port 0 gives 49152, 49153, ... in every run;
+   - a bind conflict gives `AddressInUse`;
+   - a wildcard receiver gets the destination address;
+   - a reply with `from` set leaves from that address;
+   - a bad `from` gives `AddressUnavailable`.
+4. **Readiness lifecycle:**
+   - `poll(…, 0)` reports readable only once a datagram has landed;
+   - a `NetPoll` parked before the datagram is sent wakes when it lands,
+     with no second send;
+   - a parked `NetRecvFrom` cancelled gives `Canceled`, and the datagram is
+     still there for the next receive;
+   - rearming after a wake works;
+   - `close` wakes a parked op;
+   - a closed fd number is reused by the next open, and does not see the old
+     socket's data.
+5. **Independent limits:**
+   - a small byte budget drops by bytes;
+   - with a large byte budget, the packet limit drops empty datagrams;
+   - raising `SO_RCVBUF` after open lets more in;
+   - one socket's overflow does not drop or block another socket's
+     datagrams.
+6. **Isolation and replay:**
+   - a real fd in a sim op is refused;
+   - `File.fromFd(sim_fd).close()` and the blocking dispatch are refused;
+   - a sim socket call from another thread is refused;
+   - the fd namespace check of section 3.3 panics when it cannot hold;
+   - two fresh processes give the same byte transcript and `wireDigest`;
+   - one changed payload byte gives a different `wireDigest`;
+   - starh2's three sim steps keep their hashes.
+7. **Production-path parity:** the same tiny C bridge runs against the real
+   layer in a normal build (real loopback sockets), with the same return
+   values and the same metadata checks (destination address, source address,
+   truncation, would-block).
+
+**Phase 1 passing is not approval to replace hotseat's production ENet
+sockets.** hotseat's phase has its own gate.
+
+### hotseat's acceptance gate (the consumer's, not zio's)
+
+Before hotseat replaces ENet's socket half in production:
+
+- old and new builds run **interleaved** (ABAB...), with representative
+  **receive** traffic (a host sending media and control while keys flow);
+- **exact** per-key samples (`key_wire`), not histogram buckets;
+- an **explicit bound**, set before the run, on the difference of the median
+  and of a high percentile;
+- a **positive control:** a build that adds 10 µs per send must be detected
+  by the same procedure. If it is not, the experiment is inconclusive, not a
+  pass.
 
 ## 12. Build order
 
-- **Phase 1 (datagram track): addressed UDP on 127/8 through the
-  non-suspending layer, no faults.**
-  - The layer's sim branch for datagram sockets: `socket`, `bind`,
-    `getsockname`, `setNonBlocking`/`isNonBlocking`, `sendto`/`sendmsg` with
-    a source address, `recvfrom`/`recvmsg` with the destination address and
-    truncation, `close`.
-  - The same through the ev ops, and `net_poll` for datagram sockets.
-  - Per-flow order, receive limits, `dgram` events, digest entries,
-    `wireDigest`.
-  - `zio.random` refusing off an executor during a run.
-  - **A test that drives it from C through a tiny bridge, the way a consumer
-    would:** a C file in the test calls Zig exports that call the layer, and
-    sends and receives between two fixed loopback endpoints.
-- **Phase 2:** faults, counters, validation, `netFaultDraws`, and the three
-  promises, including fresh-process replay.
-- **Phase 3 (hotseat's, briefed separately):** a real ENet exchange under sim
-  through hotseat's bridge, with seeded `randomSeed` on both peers.
-- **Stream track (starh2's), in parallel:** `listen`, `connect`, `accept`,
-  `getpeername`, `setConnectOutcome`, the stream options of section 8.
-  - It shares with the datagram track: the socket table, fd allocation, the
-    port allocator, address validation and binding rules, the layer's sim
-    branch and the ev op dispatch for `net_open`/`net_bind`/`net_close`, and
-    the trace and digest framework.
-  - So its first round should start after phase 1 has merged the table and
-    the layer, or the two tracks agree on those types first.
-  - Its consumer step, starh2 moving `getpeername` and `TCP_NODELAY` to the
-    layer, is starh2's work.
+- **Phase 1:**
+  - addressed UDP on 127/8 through the logical socket interface: the table,
+    the layer's sim branch, the ev ops, `net_poll`, boundaries and
+    truncation, per-flow order, limits;
+  - `dgram` trace events, digest entries and `wireDigest`;
+  - the fd-namespace proof and the native-exit refusals;
+  - the entropy refusals;
+  - `AddressUnavailable` and `pollInterruptible`;
+  - the C-bridge tests in both builds.
+- **Phase 2:** faults, counters, validation, and promises 2 and 3.
+- **Phase 3 (hotseat's):** ENet over its bridge, under sim and with the
+  production gate above.
+- **Stream track (starh2's):** shares the table, fds, ports, address rules,
+  the layer's sim branch, the op dispatch and the trace framework. It starts
+  after phase 1 has merged those.
 
-## 13. Changes from revision 1, and alternatives rejected
+## 13. Changes from revision 2
 
-| revision 1 | now | why |
+| finding | revision 2 | now |
 |---|---|---|
-| zio exports a POSIX C shim; hotseat renames ENet's calls in the sim build only | one non-suspending layer in every build; the consumer owns a C bridge that uses it in every build | the rename was two integration paths. It also missed hotseat's own `fcntl` check (review B2) and ENet's `listen`/`connect`/`accept`/`shutdown`/`select` (B4) |
-| ENet deterministic once its clock is patched | consumers seed every entropy source; ENet's seed has the host pointer | review B1, `host.c:79-81` |
-| due time raised to keep order, then a same-time shuffle | order per concrete flow; shuffle across flows only | review B3: the shuffle could reorder within a flow |
-| shared slot table, panic when full | per-socket byte and packet limits with storage; overflow is a counted loss | review B5 |
-| one "no faults vs zero faults" test | three promises, each tested, draws counted, configuration normalized | review B7 |
-| `SO_SNDBUF` recorded | refused; send pressure stated as not modelled | review B8 |
-| four weak tests | rewritten (section 11) | review B9 |
-| phase 1: a pair with no ports | phase 1: addressed UDP through the layer, with a C bridge test | review B10 and the decision |
-| two connect booleans, independent nullable delay bounds | one outcome enum, one optional range, validated rates | review |
-| most specific path wins | last set wins | review answer to question 1 |
+| B11 | "a sim fd is above any real one" | false: `dup2(0, 100000)` succeeds here. Soft-limit proof at `begin`, re-checked at each open (3.3) |
+| B12 | `os/net.zig` is the only way to a socket | a logical interface: the Loop dispatch stays, the layer branches, every other native exit refuses a sim fd, found by a script (3) |
+| B13 | `SO_SNDBUF` refused with a panic, which would kill every ENet host | three option classes; unsupported means an error the caller can ignore; destination and source addresses as typed data; an ENet-shaped host creation in the acceptance list (8, 11) |
+| B14 | the layer's error mapping replaces ENet's | `AddressUnavailable` on send; `pollInterruptible`; a `poll(…, 0)` row; `enet_socketset_select` named (3) |
+| B15 | entropy only | the clock rule restored for consumers; `randomSecure` refused during a run, also through `std.Io`; never deterministic (7) |
+| B16 | "adopt if inside the spread" | interleaved runs, receive traffic, exact samples, a bound, a positive control; it is hotseat's gate (11) |
+| B17 | equal digests in two runs | one-byte sensitivity, an independent byte transcript, the packet limit isolated from the byte budget (7, 11) |
+| all-off rules | normalized to no rule | stated: removal only, which does not override a wider rule (5) |
+| the three questions | open | answered: keep the packet charge; refuse off-executor random; keep the rebind restriction (starh2 sets reuse) |
 
-Rejected:
-- **Interposing libc** (`LD_PRELOAD`, `--wrap`): platform-specific, and it
-  catches every caller, wanted or not.
-- **A sim-only C shim in zio:** two integration paths (above).
-- **Real sockets with a fault proxy thread:** real time, not replayable.
-- **A TCP stack:** large, and neither user tests TCP timing.
-- **Per-fd datagram faults:** tests think in links, and often do not hold the
-  peer's fd.
-- **Seeded random ports:** a counter already replays.
-- **Reorder on by default:** real loopback keeps order.
+Rejected again, as in revision 2 (section 13 there): libc interposition, a
+sim-only C shim, a proxy thread, a TCP stack, per-fd faults, random ports,
+reorder by default.
 
-The answers to the review's four questions are taken as given:
-- last set wins;
-- no delay before a send completes;
-- 127/8 is enough to start, with binding and source selection defined in
-  section 4;
-- `errno` is now moot. zio exports no C, and the consumer's bridge returns
-  ENet's own codes.
+## 14. Premises and open points
 
-## 14. Premises and open questions
-
-Premises:
 - hotseat calls ENet from one task, with a service timeout of 0. This was
-  read: `enet_host_service` returns at `protocol.c:1935` before its only wait
-  at `:1953`.
-- **To check:** hotseat's ENet build can drop `unix.c`'s socket half and keep
-  the rest (time and address parsing).
-- **To check:** starh2's listener sets `SO_REUSEADDR`. If it does not, its
-  sim runs must not rebind a used stream port (section 8).
-- The production cost of the bridge is within run-to-run spread (section 3,
-  to be measured).
-
-Questions for the reviewer:
-1. Is the per-datagram overhead of 256 bytes against the byte limit the
-   right way to make empty datagrams cost something, or should the packet
-   limit alone do that?
-2. Should `zio.random` off an executor under sim draw from the run's
-   generator instead of refusing? Drawing would change the trace of any run
-   that does it today. Refusing would break such runs, and none is known.
-3. Is refusing a stream rebind without `SO_REUSEADDR` too strict? It would
-   refuse a test that restarts a server on the same port within one run
-   (check whether any starh2 sim test does).
+  read: `protocol.c:1861, 1935, 1953`.
+- hotseat's ENet build can drop `unix.c`'s socket half. The review judged this
+  feasible; hotseat confirms it in its phase.
+- Phase 1 runs on macOS and Linux. Windows sim sockets are refused (2).
