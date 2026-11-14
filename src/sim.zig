@@ -653,6 +653,30 @@ fn allocOpId(c: *anyopaque) u32 {
     return next_io_id;
 }
 
+/// Whether the op submitted as (`c`, `id`) is still live: not completed, not
+/// canceled. Compares the pointer and never reads through it, so it is safe
+/// for a completion whose frame may already be freed.
+pub fn isLive(c: *anyopaque, id: u32) bool {
+    for (live[0..live_len]) |l| {
+        if (l.c == c and l.id == id) return true;
+    }
+    return false;
+}
+
+/// Ends the live op (`c`, `id`) at its harvest. It must be live: the caller
+/// checked `isLive` first, and nothing in between may end it.
+pub fn endOp(c: *anyopaque, id: u32) void {
+    var i: usize = 0;
+    while (i < live_len) : (i += 1) {
+        if (live[i].c == c and live[i].id == id) {
+            live[i] = live[live_len - 1];
+            live_len -= 1;
+            return;
+        }
+    }
+    panic("sim: op {d} completed but not live: it ended twice, or was never submitted", .{id});
+}
+
 pub fn takeOpId(c: *anyopaque) ?u32 {
     var i: usize = 0;
     while (i < live_len) : (i += 1) {
@@ -4992,6 +5016,79 @@ test "sim: dgram ev: an op woken by a landing, with its socket closed and its nu
     std.debug.print("{d} runs; receive: {d} got A's datagram, {d} FileDescriptorNotASocket; poll: {d} readable, {d} FileDescriptorNotASocket\n", .{ runs, seen[0][0], seen[0][1], seen[1][0], seen[1][1] });
     // Both sides of the close were reached, for both kinds of op.
     for (seen) |row| for (row) |n| try std.testing.expect(n > 0);
+}
+
+/// Round 2 of the outside review, F1: two ops of a race group that complete
+/// in one harvest, each finishing without deferral. The first one's group
+/// callback cancels the second, which then completes through the cancel; the
+/// harvest must not complete it again from its batch.
+const dg_race = struct {
+    var calls: [2]u32 = .{ 0, 0 };
+
+    fn counted(_: *dg.ev.Loop, c: *dg.ev.Completion) void {
+        const i: usize = @intFromPtr(c.userdata.?) - 1;
+        calls[i] += 1;
+    }
+
+    fn body() !void {
+        const tx = try dg.open();
+        const rx = try dg.open();
+        try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 7000));
+        const to = dg.addr(127, 0, 0, 1, 7000);
+        calls = .{ 0, 0 };
+        var iov_a = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("a")};
+        var iov_b = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("b")};
+        var a = dg.ev.NetSendTo.init(tx, .{ .iovecs = &iov_a }, .{}, @ptrCast(&to), @sizeOf(dg.os_net.sockaddr.in));
+        var b = dg.ev.NetSendTo.init(tx, .{ .iovecs = &iov_b }, .{}, @ptrCast(&to), @sizeOf(dg.os_net.sockaddr.in));
+        for ([_]*dg.ev.Completion{ &a.c, &b.c }, 1..) |c, k| {
+            c.flags.defer_callback = false;
+            c.callback = counted;
+            c.userdata = @ptrFromInt(k);
+        }
+        var g = dg.ev.Group.init(.race);
+        g.add(&a.c);
+        g.add(&b.c);
+        try dg.io_common.waitForIo(&g.c);
+        try std.testing.expectEqual([2]u32{ 1, 1 }, calls);
+        try std.testing.expectEqual(@as(usize, 0), live_len);
+        try std.testing.expectEqual(@as(usize, 0), due_len);
+        dg.os_net.close(tx);
+        dg.os_net.close(rx);
+    }
+};
+
+/// F1 of round 2 on pipe ops, which share the harvest. A pipe send is due
+/// after a seeded 1 or 5 ms, so some seeds put both sends in one harvest.
+fn pipeRaceBody() !void {
+    const pa = pipePair();
+    const pb = pipePair();
+    dg_race.calls = .{ 0, 0 };
+    var ia = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("a")};
+    var ib = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("b")};
+    var a = dg.ev.NetSend.init(pa[0], .{ .iovecs = &ia }, .{});
+    var b = dg.ev.NetSend.init(pb[0], .{ .iovecs = &ib }, .{});
+    for ([_]*dg.ev.Completion{ &a.c, &b.c }, 1..) |c, k| {
+        c.flags.defer_callback = false;
+        c.callback = dg_race.counted;
+        c.userdata = @ptrFromInt(k);
+    }
+    var g = dg.ev.Group.init(.race);
+    g.add(&a.c);
+    g.add(&b.c);
+    try dg.io_common.waitForIo(&g.c);
+    try std.testing.expectEqual([2]u32{ 1, 1 }, dg_race.calls);
+    try std.testing.expectEqual(@as(usize, 0), live_len);
+    try std.testing.expectEqual(@as(usize, 0), due_len);
+}
+
+test "sim: pipe: a race group of two sends that finish without deferral completes each member once" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    for (1..9) |s| try dg.run(s, pipeRaceBody);
+}
+
+test "sim: dgram ev: a race group of two sends that finish without deferral completes each member once" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, dg_race.body);
 }
 
 test "sim: dgram ev: close wakes an ev receive parked on the socket" {

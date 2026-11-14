@@ -1921,6 +1921,12 @@ pub const Loop = struct {
         const n = sim.takeDue(&buf);
         var i: usize = 0;
         while (i < n) : (i += 1) {
+            // `markCompleted` below can run callbacks at once (an op that does
+            // not defer its finish). A group callback can cancel an op that is
+            // still in this batch: it completes through the cancel, and its
+            // frame can be freed. So the pointer is used only while this
+            // exact submit (pointer and op id) is still live.
+            if (!sim.isLive(buf[i].c, buf[i].id)) continue;
             const c: *Completion = @ptrCast(@alignCast(buf[i].c));
             if (!c.has_result) dgram: {
                 // A parked datagram op that a landing or a close made due.
@@ -1967,8 +1973,8 @@ pub const Loop = struct {
                 }
             }
             if (!c.has_result) continue;
-            const id = sim.takeOpId(c) orelse buf[i].id;
-            sim.emit(.io_complete, @backingInt(c.op), id);
+            sim.endOp(buf[i].c, buf[i].id);
+            sim.emit(.io_complete, @backingInt(c.op), buf[i].id);
             self.state.markCompleted(c);
         }
     }
