@@ -3747,6 +3747,7 @@ fn isCygwinPty(handle: fd_t) bool {
 pub const ioctl = if (builtin.os.tag == .windows) ioctlWindows else ioctlPosix;
 
 fn ioctlPosix(fd: fd_t, code: u32, arg: ?*anyopaque) i32 {
+    sim.refuseSimFd(@src(), fd);
     while (true) {
         const rc = posix.system.ioctl(fd, @bitCast(code), @intFromPtr(arg));
         switch (posix.errno(rc)) {
@@ -3761,6 +3762,7 @@ fn ioctlPosix(fd: fd_t, code: u32, arg: ?*anyopaque) i32 {
 }
 
 fn ioctlWindows(handle: fd_t, code: std.os.windows.CTL_CODE, in: []const u8, out: []u8) std.os.windows.IO_STATUS_BLOCK {
+    sim.refuseSimFd(@src(), handle);
     var io_status: std.os.windows.IO_STATUS_BLOCK = undefined;
     const status = std.os.windows.ntdll.NtDeviceIoControlFile(
         handle,

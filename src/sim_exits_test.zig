@@ -12,10 +12,17 @@
 //
 // How "takes an fd" is decided:
 // - by type: a parameter whose type is `fd_t` or ends in `.fd_t`;
-// - by name: a parameter named `fd`, `dirfd`, `dir`, `oldfd`, `newfd`,
-//   `old_dir`, `new_dir`, `handle` or `sock` whose type is `i32` or `c_int`.
-//   An fd-like name with any other type is unclassified and fails, unless the
-//   pair is in `not_fds` below with a reason.
+// - by name: a parameter whose name is in `fd_names` and whose type is `i32`
+//   or `c_int`. An fd-like name with any other type is unclassified and
+//   fails, unless the pair is in `not_fds` below with a reason.
+// - any other plain integer parameter (or `anytype`, which can be one) fails
+//   unless its name is in `non_fd_ints`. An fd is just an integer, so a name
+//   this check does not know is no proof that it is not one.
+//
+// A private function or an extern is covered when every call to it in its
+// file is from a covered function. That holds only while nothing else can
+// reach it: so a name used as a value (`pub const x = y`, a pointer in a
+// table) makes the function need its own refusal.
 //
 // What it cannot see, listed by hand (`fd_carriers`) and tested by death
 // tests in `sim.zig`: an fd inside a struct or a slice (`pollfd`, `msghdr`,
@@ -58,7 +65,13 @@ const files = [_]File{
     .{ .path = "windows/win32error.zig", .verdict = .windows_only, .src = "" },
 };
 
-const fd_names = [_][]const u8{ "fd", "dirfd", "dir", "oldfd", "newfd", "old_dir", "new_dir", "handle", "sock" };
+const fd_names = [_][]const u8{ "fd", "dirfd", "dir", "oldfd", "newfd", "old_dir", "new_dir", "handle", "sock", "epoll_fd", "fromfd", "tofd" };
+
+/// Integer (and `anytype`) parameter names that are never an fd in
+/// `src/os/`. Every other integer parameter fails the test unless its name is
+/// in `fd_names`: an fd can be any integer, so a name this check does not know
+/// is not proof that it is not one.
+const non_fd_ints = [_][]const u8{ "_", "advice", "af", "argsz", "backlog", "code", "count", "current", "end", "err", "events", "expected", "flags", "futex_op", "ifindex", "index", "initval", "len", "length", "level", "maxevents", "min_complete", "mode", "nbytes", "number", "offset", "op", "operation", "optname", "port", "prot", "protocol", "rc", "sig", "sock_type", "start", "timeout", "timeout_ms", "timeout_us", "to_submit", "val", "val2", "val3", "value", "vlen", "wake_value", "whence" };
 
 /// Parameters with an fd-like name that are not fds, each with why.
 const not_fds = [_]struct { file: []const u8, func: []const u8, param: []const u8, why: []const u8 }{};
@@ -95,6 +108,7 @@ const extern_fds = [_]struct { file: []const u8, func: []const u8, callers: []co
     .{ .file = "system/c.zig", .func = "mmap", .callers = "posix.zig mmap (refuses)" },
     .{ .file = "system/c.zig", .func = "utimensat", .callers = "fs.zig dirSetFileTimestamps (refuses), the backends" },
     .{ .file = "system/c.zig", .func = "lseek", .callers = "its own wrapper lseek in system/c.zig (refuses)" },
+    .{ .file = "darwin.zig", .func = "renameatx_np", .callers = "fs.zig renameatPreserve (refuses)" },
 };
 
 /// Private functions called with an fd their caller made itself, not one it
@@ -290,6 +304,18 @@ fn stripComments(s: []const u8) []const u8 {
 
 const Kind = enum { fd, carrier, other, unclassified };
 
+/// A plain integer type, or `anytype`, which can be one: such a parameter
+/// can carry an fd whatever its name, so its name must say which it is.
+fn isIntType(ty: []const u8) bool {
+    const t = if (std.mem.startsWith(u8, ty, "?")) ty[1..] else ty;
+    for ([_][]const u8{ "anytype", "usize", "isize", "comptime_int", "c_int", "c_uint", "c_long", "c_ulong", "c_short", "c_ushort", "c_longlong", "c_ulonglong", "c_char" }) |n| {
+        if (std.mem.eql(u8, t, n)) return true;
+    }
+    if (t.len < 2 or (t[0] != 'i' and t[0] != 'u')) return false;
+    for (t[1..]) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
 fn classify(file: []const u8, func: []const u8, p: Param) Kind {
     const last = if (std.mem.lastIndexOfScalar(u8, p.ty, '.')) |d| p.ty[d + 1 ..] else p.ty;
     if (std.mem.eql(u8, last, "fd_t")) return .fd;
@@ -300,11 +326,13 @@ fn classify(file: []const u8, func: []const u8, p: Param) Kind {
     for (fd_names) |n| if (std.mem.eql(u8, p.name, n)) {
         fd_like = true;
     };
-    if (!fd_like) return .other;
-    if (std.mem.eql(u8, p.ty, "i32") or std.mem.eql(u8, p.ty, "c_int")) return .fd;
+    if (fd_like and (std.mem.eql(u8, p.ty, "i32") or std.mem.eql(u8, p.ty, "c_int"))) return .fd;
     for (not_fds) |x| {
         if (std.mem.eql(u8, x.file, file) and std.mem.eql(u8, x.func, func) and std.mem.eql(u8, x.param, p.name)) return .other;
     }
+    if (fd_like) return .unclassified;
+    if (!isIntType(p.ty)) return .other;
+    for (non_fd_ints) |n| if (std.mem.eql(u8, p.name, n)) return .other;
     return .unclassified;
 }
 
@@ -365,7 +393,7 @@ fn checkFile(file: []const u8, src: []const u8, r: *Report) void {
             },
             .carrier => carrier = true,
             .other => {},
-            .unclassified => problem(r, "{s}: {s}: parameter `{s}: {s}` has an fd-like name and a type this check does not know", .{ file, f.name, p.name, p.ty }),
+            .unclassified => problem(r, "{s}: {s}: parameter `{s}: {s}` is not classified: an integer (or anytype) whose name is in neither fd_names nor non_fd_ints, or an fd-like name with a type this check does not know", .{ file, f.name, p.name, p.ty }),
         };
         if (carrier) {
             if (!isListed(fd_carriers, file, f.name)) problem(r, "{s}: {s} carries fds in a struct or slice and is not in fd_carriers", .{ file, f.name });
@@ -403,6 +431,21 @@ fn checkFile(file: []const u8, src: []const u8, r: *Report) void {
         if (f.is_pub) r.uncovered += 1;
         if (f.is_pub) problem(r, "{s}: pub fn {s} takes an fd but does not start with sim.refuseSimFd(@src(), ...) for all of them, and has no sim branch", .{ file, f.name });
     }
+    // A private function or an extern whose name is used as a value (an
+    // alias such as `pub const x = y`, a pointer in a table) can be called
+    // from anywhere, so its callers here cannot cover it: it must refuse
+    // first itself.
+    for (fns[0..n], 0..) |f, idx| {
+        if (!takes_fd[idx] or covered[idx] or (f.is_pub and !f.is_extern)) continue;
+        // A listed extern is re-exported on purpose; its callers in other
+        // files were checked by hand when it was listed.
+        if (f.is_extern and isListed(extern_fds, file, f.name)) continue;
+        if (valueUse(src, f.name)) |at| {
+            r.uncovered += 1;
+            covered[idx] = true; // reported here, not again below
+            problem(r, "{s}: {s} takes an fd and is used as a value at line {d} (an alias or a pointer), so it must start with sim.refuseSimFd(@src(), ...) itself", .{ file, f.name, lineOf(src, at) });
+        }
+    }
     // A private function or an extern that takes an fd is covered when every
     // call to it is from a covered function in this file; repeat until
     // nothing changes, then report what is left.
@@ -427,6 +470,38 @@ fn checkFile(file: []const u8, src: []const u8, r: *Report) void {
             problem(r, "{s}: extern {s} takes an fd, is called only from other files, and is not in extern_fds", .{ file, f.name });
         } else problem(r, "{s}: {s} takes an fd and is called from a function that does not refuse a sim fd first", .{ file, f.name });
     }
+}
+
+/// The first use of `name` in `src` that is neither its declaration
+/// (`fn name(`), a call (`name(`, also `x.name(`) nor a doctest's name
+/// (`test name {`), outside comments and
+/// strings: an alias, a pointer, a field of that name. Fails toward noise: a
+/// same-named field of some other value counts too.
+fn valueUse(src: []const u8, name: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < src.len) {
+        if (skipLiteral(src, i) catch null) |next| {
+            i = next;
+            continue;
+        }
+        if (std.mem.startsWith(u8, src[i..], name) and (i == 0 or !isIdent(src[i - 1]))) {
+            const after = i + name.len;
+            if (after >= src.len or !isIdent(src[after])) {
+                const is_call = after < src.len and src[after] == '(';
+                const is_decl = i >= 3 and std.mem.eql(u8, src[i - 3 .. i], "fn ");
+                const is_test_name = i >= 5 and std.mem.eql(u8, src[i - 5 .. i], "test ");
+                if (!is_call and !is_decl and !is_test_name) return i;
+            }
+            i = after;
+            continue;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+fn lineOf(src: []const u8, at: usize) usize {
+    return std.mem.count(u8, src[0..at], "\n") + 1;
 }
 
 fn allCallersCovered(src: []const u8, fns: []const Fn, covered: []const bool, name: []const u8) bool {

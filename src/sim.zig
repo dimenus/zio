@@ -5273,6 +5273,29 @@ test "sim: exits refuse: an ioctl on a sim fd" {
     }.body);
 }
 
+test "sim: exits refuse: an ioctl through the public fs.ioctl alias" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: exits refuse: an ioctl through the public fs.ioctl alias", "sim: sim fd 100000 reached the native exit os/fs.zig ioctlPosix", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = pipePair()[0];
+            _ = @import("os/fs.zig").ioctl(fd, 0, null);
+        }
+    }.body);
+}
+
+test "sim: exits refuse: epoll_pwait2 on a sim fd" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    try refusal("sim: exits refuse: epoll_pwait2 on a sim fd", "sim: sim fd 100000 reached the native exit os/linux.zig epoll_pwait2", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = pipePair()[0];
+            var evs: [1]std.os.linux.epoll_event = undefined;
+            _ = @import("os/linux.zig").epoll_pwait2(fd, &evs, 1, null);
+        }
+    }.body);
+}
+
 test "sim: exits refuse: a poll set of sim pipe fds" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     try refusal("sim: exits refuse: a poll set of sim pipe fds", "sim: poll on sim fd 100000, which is not a datagram socket", struct {

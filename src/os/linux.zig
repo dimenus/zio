@@ -52,6 +52,7 @@ pub fn futex(uaddr: *const u32, futex_op: u32, val: u32, timeout: ?*const posix.
 /// the syscall returns ENOSYS. Returns the raw syscall result; the caller is
 /// responsible for checking errno.
 pub fn epoll_pwait2(epoll_fd: i32, events: [*]linux.epoll_event, maxevents: u32, timeout: ?*const linux.kernel_timespec) usize {
+    sim.refuseSimFd(@src(), epoll_fd);
     return linux.syscall6(
         .epoll_pwait2,
         @bitCast(@as(isize, epoll_fd)),
