@@ -973,9 +973,22 @@ the mutants in its commits.
   its own copy of the draw formula, and the records test hashes the
   records it expects and compares that with `wireDigest()`. Mutants:
   `zio-sim6-tools/mut/20-s1.json` (56, all killed).
-- **Slices 2 to 4 are next** (section 12): delay, jitter, the order clamp,
-  reorder and duplication with the delayed-wake tests; the op model; then
-  promise 3.
+- **Slice 2 (sitting 20): built.** Delay, jitter, the order clamp, reorder
+  and duplication, with the copy bit in the records. The clamp holds after
+  every rule is cleared too (a cleared rule's delayed datagrams may still
+  be on the wire), so in a run that ever set a rule every send takes the
+  fault path. The `pushDueAt` check stays; the delayed-wake tests run with
+  it: `sim: net faults: an ev receive parked before a delayed datagram
+  ...`, `... an ev poll parked ...`, `... a receive whose socket is closed
+  and its number reused while a delayed datagram is in flight ...`. The
+  delay model tests compute every copy's landing time and order from their
+  own copy of the formula, with reorder on (218 overtaking) and off (218
+  clamped). Mutants: `mut/20-s2.json` and `20-s2b.json` (28, all killed;
+  one of them shows the check firing on a wake 1 ns late).
+- **Slices 3 and 4 are next** (section 12): the op model learns the faults
+  (a race group then holds at most one datagram send: `Group.add` puts a
+  member first, so the loop submits members in reverse, and a send's
+  number fixes its draws); then promise 3.
 - Open and filed: t-4096 (zero-length receive on an empty sim pipe), t-4098
   (the op model's holes above).
 - **For hotseat, not zio:** ENet's receive returns 0 for an empty datagram,

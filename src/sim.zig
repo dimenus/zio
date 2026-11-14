@@ -562,7 +562,7 @@ fn digestNet(h: *std.hash.Wyhash) void {
     for (wire.items) |w| {
         var e: [32]u8 = undefined;
         std.mem.writeInt(u64, e[0..8], w.due_at, .little);
-        std.mem.writeInt(u64, e[8..16], w.seq, .little);
+        std.mem.writeInt(u64, e[8..16], w.seq | (@as(u64, @intFromBool(w.copy)) << 63), .little);
         @memcpy(e[16..20], &w.from.ip);
         std.mem.writeInt(u16, e[20..22], w.from.port, .little);
         @memcpy(e[22..26], &w.to.ip);
@@ -1286,6 +1286,9 @@ const WireDatagram = struct {
     to: Ip4,
     bytes: []u8,
     due_at: u64,
+    /// The second copy of a duplicated datagram (`dup_ppm`). Its records
+    /// set bit 0x80 of the outcome.
+    copy: bool = false,
 };
 
 /// Socket queues and datagrams on the wire. Not the runtime's allocator: the
@@ -1525,17 +1528,34 @@ pub fn dgramSend(fd: i32, src: []const []const u8, to: Ip4, from: ?[4]u8) error{
         @memcpy(bytes[at..][0..sl.len], sl);
         at += sl.len;
     }
-    if (rules_len != 0) {
+    if (rule_history_len != 0) {
         const src_addr: Ip4 = .{ .ip = src_ip, .port = d.local.port };
-        if (faultAtSend(wire_seq, src_addr, to)) |outcome| {
-            // The sender succeeded; the datagram is recorded at its send
-            // time, bytes and all, and never reaches the wire.
-            recordLanding(.{ .seq = wire_seq, .from = src_addr, .to = to, .bytes = bytes, .due_at = clock_ns }, outcome);
-            net_alloc.free(bytes);
-            wire_seq += 1;
-            d.stats.sent += 1;
-            return total;
+        switch (faultAtSend(wire_seq, src_addr, to)) {
+            .dropped => |outcome| {
+                // The sender succeeded; the datagram is recorded at its
+                // send time, bytes and all, and never reaches the wire.
+                recordLanding(.{ .seq = wire_seq, .from = src_addr, .to = to, .bytes = bytes, .due_at = clock_ns }, outcome);
+                net_alloc.free(bytes);
+            },
+            .sent => |s| {
+                // Both copies' memory first, so a failure leaves nothing on
+                // the wire.
+                const second: ?[]u8 = if (s.copies == 2) net_alloc.dupe(u8, bytes) catch {
+                    net_alloc.free(bytes);
+                    return error.SystemResources;
+                } else null;
+                wire.ensureUnusedCapacity(net_alloc, s.copies) catch {
+                    net_alloc.free(bytes);
+                    if (second) |b| net_alloc.free(b);
+                    return error.SystemResources;
+                };
+                wireInsert(.{ .seq = wire_seq, .from = src_addr, .to = to, .bytes = bytes, .due_at = s.due[0] });
+                if (second) |b| wireInsert(.{ .seq = wire_seq, .from = src_addr, .to = to, .bytes = b, .due_at = s.due[1], .copy = true });
+            },
         }
+        wire_seq += 1;
+        d.stats.sent += 1;
+        return total;
     }
     const entry: WireDatagram = .{
         .seq = wire_seq,
@@ -1600,6 +1620,13 @@ pub fn dgramRecv(fd: i32, dst: []const []u8, dont_wait: bool) error{WouldBlock}!
     }
     d.charged -= q.len + datagram_overhead;
     return .{ .copied = copied, .len = q.len, .from = q.from, .to = if (d.dst_addr) q.to else null };
+}
+
+/// Puts `w` on the wire after every entry due no later (capacity reserved).
+fn wireInsert(w: WireDatagram) void {
+    var pos = wire.items.len;
+    while (pos > 0 and wire.items[pos - 1].due_at > w.due_at) pos -= 1;
+    wire.insertAssumeCapacity(pos, w);
 }
 
 fn ringRead(d: *const Dgram, off: usize, out: []u8) void {
@@ -1884,14 +1911,15 @@ const LandOutcome = enum(u8) {
 
 /// Records a datagram at its landing time in the trace and the wire digest.
 fn recordLanding(w: WireDatagram, outcome: LandOutcome) void {
-    emit(.dgram, @as(u32, w.from.port) | (@as(u32, @backingInt(outcome)) << 16), (@as(u32, w.to.port) << 16) | @as(u32, @intCast(w.bytes.len)));
+    const code: u8 = @backingInt(outcome) | (@as(u8, @intFromBool(w.copy)) << 7);
+    emit(.dgram, @as(u32, w.from.port) | (@as(u32, code) << 16), (@as(u32, w.to.port) << 16) | @as(u32, @intCast(w.bytes.len)));
     var h: [25]u8 = undefined;
     std.mem.writeInt(u64, h[0..8], w.due_at, .little);
     @memcpy(h[8..12], &w.from.ip);
     std.mem.writeInt(u16, h[12..14], w.from.port, .little);
     @memcpy(h[14..18], &w.to.ip);
     std.mem.writeInt(u16, h[18..20], w.to.port, .little);
-    h[20] = @backingInt(outcome);
+    h[20] = code;
     std.mem.writeInt(u32, h[21..25], @intCast(w.bytes.len), .little);
     wire_hasher.update(&h);
     wire_hasher.update(w.bytes);
@@ -2009,7 +2037,8 @@ fn isFlowHead(rest: []const WireDatagram, k: usize) bool {
 // a run. The sender of a faulted datagram succeeds, as a kernel's does.
 //
 // Rules, of three kinds:
-// - An impairment (`setImpairment`) on a `Path`: loss and burst loss. Among
+// - An impairment (`setImpairment`) on a `Path`: loss, burst loss, delay,
+//   jitter, reorder and duplication (`Impairment`). Among
 //   the impairments whose path matches a datagram, only the one set most
 //   recently acts ("last set wins"). Setting one on a path that has one
 //   replaces it, resets its burst to the good state, and makes it the most
@@ -2030,14 +2059,28 @@ fn isFlowHead(rest: []const WireDatagram, k: usize) bool {
 //    state moves (good to bad with `enter_ppm`, bad to good with
 //    `leave_ppm`) and in the bad state the datagram is lost (`lost_burst`);
 //    else `loss_ppm` loses it (`lost`). The burst state is the rule's, shared
-//    by every flow it matches: a link has one bad period.
+//    by every flow it matches: a link has one bad period. Else `dup_ppm`
+//    makes a second copy (`duplicated`), and each copy lands at
+//    `now + wire_latency_ns + delay_ns + jitter`, jitter drawn per copy in
+//    0..jitter_ns. Then, unless the acting rule says `reorder`, a copy lands
+//    no earlier than the latest datagram of its flow already on the wire
+//    (the first copy counts as on the wire for the second): the order
+//    clamp, which also holds with no rule in force once a rule was set in
+//    the run, since datagrams delayed by a cleared rule may still be on the
+//    wire. Under `reorder`, a copy due before such a datagram counts as
+//    `overtaking`. A copy that lands later than `now + wire_latency_ns` for
+//    any of these reasons counts as `delayed`. Copies of one flow due at one
+//    instant land in the order they went on the wire; flows due at one
+//    instant land in a seeded order (`landDue`), as in phase 1.
 // 2. At its landing (`faultInFlight`, the first harvest at or after its
 //    time): a silence or partition in force then that matches it drops it
 //    (`silenced_in_flight`, `partitioned_in_flight`). A link that goes down
 //    loses what is in it.
 // When several drop rules match, a silence acts before a partition, and of
 // one kind the most recent acts. Each drop is in the trace and the wire
-// digest (`LandOutcome` 3 to 8). Rule changes are not: a rule that acts on
+// digest (`LandOutcome` 3 to 8; a second copy sets bit 0x80 of the outcome,
+// landed or dropped). A delay needs no record of its own: a landing's
+// record holds its time. Rule changes are not recorded: a rule that acts on
 // nothing leaves both unchanged (promise 2). The state digest covers the
 // rules, the counts and the draws of a run that set a rule.
 //
@@ -2051,7 +2094,8 @@ fn isFlowHead(rest: []const WireDatagram, k: usize) bool {
 // change the outcome draws nothing (`netFaultDraws` counts them).
 //
 // Misuse panics, naming the call: a call outside a run or off the sim
-// thread; ppm over 1_000_000; a burst whose `enter_ppm` or `leave_ppm` is 0
+// thread; ppm over 1_000_000; `delay_ns + jitter_ns` over
+// `max_fault_delay_ns`; a burst whose `enter_ppm` or `leave_ppm` is 0
 // (a burst that never starts or never ends: that is `setPartition`); an
 // endpoint address outside 127/8, 0.0.0.0 included, or port 0; an
 // impairment with every field at its default (`clearImpairment` removes);
@@ -2099,11 +2143,29 @@ pub const Impairment = struct {
     /// Independent loss, per million datagrams.
     loss_ppm: u32 = 0,
     burst: ?Burst = null,
+    /// Added to `wire_latency_ns`.
+    delay_ns: u64 = 0,
+    /// Plus a uniform draw in 0..jitter_ns (both ends included), per copy.
+    jitter_ns: u64 = 0,
+    /// false: a copy never lands before a datagram of its flow that is
+    /// already on the wire (the order clamp). true: jitter and a change of
+    /// rule may reorder the flow.
+    reorder: bool = false,
+    /// A second copy, per million datagrams, with its own jitter.
+    dup_ppm: u32 = 0,
 };
+
+/// The most `delay_ns + jitter_ns` may be.
+pub const max_fault_delay_ns: u64 = 60 * std.time.ns_per_s;
 
 pub const RuleStats = struct {
     matched: u64 = 0,
     dropped: u64 = 0,
+    /// Second copies this rule made.
+    duplicated: u64 = 0,
+    /// Copies of datagrams it acted on that land later than
+    /// `wire_latency_ns` after their send, for any reason.
+    delayed: u64 = 0,
 };
 
 /// The run's faulted datagrams, by cause.
@@ -2114,6 +2176,14 @@ pub const NetFaultStats = struct {
     partitioned_in_flight: u64 = 0,
     silenced_at_send: u64 = 0,
     silenced_in_flight: u64 = 0,
+    /// Second copies made.
+    duplicated: u64 = 0,
+    /// Copies that land later than `wire_latency_ns` after their send: a
+    /// delay, jitter, or the order clamp behind a delayed datagram.
+    delayed: u64 = 0,
+    /// Copies scheduled to land before a datagram of their flow that was
+    /// already on the wire (only under a rule with `reorder`).
+    overtaking: u64 = 0,
 };
 
 pub const max_rules = 64;
@@ -2172,8 +2242,9 @@ pub fn netFaultDraws() u64 {
     return fault_draws;
 }
 
-/// The purposes of the draws for one datagram.
-const DrawPurpose = enum(u64) { burst = 1, loss = 2 };
+/// The purposes of the draws for one datagram: burst, loss, dup, then the
+/// jitter of the first and of the second copy.
+const DrawPurpose = enum(u64) { burst = 1, loss = 2, dup = 3, jitter0 = 4, jitter1 = 5 };
 
 /// SplitMix64's output function.
 fn mix64(x: u64) u64 {
@@ -2221,8 +2292,64 @@ fn dropRule(kind: RuleKind, from: Ip4, to: Ip4) ?*Rule {
     return null;
 }
 
-/// The fault rules at a datagram's send. Null: it goes on the wire.
-fn faultAtSend(send_no: u64, from: Ip4, to: Ip4) ?LandOutcome {
+/// What a datagram's send becomes: dropped, or one or two copies with their
+/// landing times.
+const SendFate = union(enum) {
+    dropped: LandOutcome,
+    sent: struct { copies: u8, due: [2]u64 },
+};
+
+/// The latest landing time of a datagram of this flow still on the wire.
+/// `wire` is in landing order, so the last one found from the end is it.
+fn flowLatest(from: Ip4, to: Ip4) ?u64 {
+    var i = wire.items.len;
+    while (i > 0) {
+        i -= 1;
+        const w = wire.items[i];
+        if (std.meta.eql(w.from, from) and std.meta.eql(w.to, to)) return w.due_at;
+    }
+    return null;
+}
+
+/// The fault rules at a datagram's send, in a run that has set a rule
+/// (the order clamp applies after every rule is cleared too: datagrams
+/// delayed by a rule may still be on the wire).
+fn faultAtSend(send_no: u64, from: Ip4, to: Ip4) SendFate {
+    if (faultDrop(send_no, from, to)) |outcome| return .{ .dropped = outcome };
+    const r = dropRule(.impairment, from, to);
+    const imp: Impairment = if (r) |x| x.imp else .{};
+    const base = clock_ns + wire_latency_ns;
+    var fate: SendFate = .{ .sent = .{ .copies = 1, .due = .{ base, base } } };
+    const s = &fate.sent;
+    if (happens(imp.dup_ppm, send_no, .dup)) {
+        s.copies = 2;
+        fault_stats.duplicated += 1;
+        r.?.stats.duplicated += 1;
+    }
+    // A copy already decided is on the wire before the next one.
+    var latest = flowLatest(from, to);
+    for (0..s.copies) |c| {
+        var at = base + imp.delay_ns;
+        if (imp.jitter_ns != 0) {
+            at += faultDraw(send_no, if (c == 0) .jitter0 else .jitter1) % (imp.jitter_ns + 1);
+        }
+        if (latest) |l| {
+            if (at < l) {
+                if (imp.reorder) fault_stats.overtaking += 1 else at = l;
+            }
+        }
+        if (at > base) {
+            fault_stats.delayed += 1;
+            if (r) |x| x.stats.delayed += 1;
+        }
+        s.due[c] = at;
+        latest = @max(latest orelse at, at);
+    }
+    return fate;
+}
+
+/// The drop decisions at a datagram's send. Null: it goes on the wire.
+fn faultDrop(send_no: u64, from: Ip4, to: Ip4) ?LandOutcome {
     for (rules[0..rules_len]) |*r| {
         if (r.key.matches(from, to)) countMatched(r);
     }
@@ -2340,6 +2467,10 @@ pub fn setImpairment(path: Path, imp: Impairment) void {
         if (b.enter_ppm == 0) panic("sim: setImpairment: a burst with enter_ppm 0 never starts", .{});
         if (b.leave_ppm == 0) panic("sim: setImpairment: a burst with leave_ppm 0 never ends (that is setPartition)", .{});
     }
+    checkPpm("setImpairment", "dup_ppm", imp.dup_ppm);
+    if (imp.delay_ns > max_fault_delay_ns or imp.jitter_ns > max_fault_delay_ns - imp.delay_ns) {
+        panic("sim: setImpairment: delay_ns {d} plus jitter_ns {d} is over {d} ns", .{ imp.delay_ns, imp.jitter_ns, max_fault_delay_ns });
+    }
     if (std.meta.eql(imp, Impairment{})) panic("sim: setImpairment with every field at its default: clearImpairment removes an impairment", .{});
     if (findRule(.{ .impairment = path })) |i| _ = removeRule(i);
     addRule("setImpairment", .{ .impairment = path }, imp);
@@ -2447,7 +2578,7 @@ fn digestFaults(h: *std.hash.Wyhash) void {
     var b: [8]u8 = undefined;
     for (rules[0..rules_len]) |r| {
         hashRuleKey(h, r.key);
-        var e: [30]u8 = @splat(0);
+        var e: [67]u8 = @splat(0);
         std.mem.writeInt(u32, e[0..4], r.imp.loss_ppm, .little);
         if (r.imp.burst) |bu| {
             e[4] = 1;
@@ -2457,6 +2588,12 @@ fn digestFaults(h: *std.hash.Wyhash) void {
         e[13] = @intFromBool(r.bad);
         std.mem.writeInt(u64, e[14..22], r.stats.matched, .little);
         std.mem.writeInt(u64, e[22..30], r.stats.dropped, .little);
+        std.mem.writeInt(u64, e[30..38], r.imp.delay_ns, .little);
+        std.mem.writeInt(u64, e[38..46], r.imp.jitter_ns, .little);
+        std.mem.writeInt(u32, e[46..50], r.imp.dup_ppm, .little);
+        e[50] = @intFromBool(r.imp.reorder);
+        std.mem.writeInt(u64, e[51..59], r.stats.duplicated, .little);
+        std.mem.writeInt(u64, e[59..67], r.stats.delayed, .little);
         h.update(&e);
     }
     for (rule_history[0..rule_history_len]) |hist| {
@@ -8354,4 +8491,297 @@ const nf_drop_order = struct {
 test "sim: net faults: a silence drops before a partition, and of two partitions the most recent drops; every matching rule counts the datagram" {
     if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
     try dg.run(1, nf_drop_order.body);
+}
+
+// ---- Phase 2, slice 2: delay, jitter, the order clamp, reorder, duplication ----
+
+/// A to B under one impairment with delay, jitter and duplication, one
+/// datagram every 400 us. The test's model (below) computes every copy's
+/// landing time from its own copy of the draw formula and the rules of
+/// design section 5, then the order B receives them in, the wire digest,
+/// and the counts.
+const nf_delay = struct {
+    const n: u32 = 300;
+    const gap_ns: u64 = 400_000;
+    var imp: Impairment = undefined;
+    var sent_at: [n]u64 = undefined;
+    var got: [2 * n]u32 = undefined;
+    var got_len: usize = 0;
+    var stats: RuleStats = undefined;
+    var wire_d: u64 = undefined;
+
+    fn body() !void {
+        const a = try nf.sock(1, 7000);
+        const b = try nf.sock(1, 7001);
+        setImpairment(.{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) }, imp);
+        for (0..n) |k| {
+            sent_at[k] = clockNs();
+            try nf.send(a, 1, 7001, @intCast(k));
+            try dg.rt_mod.sleep(.fromNanoseconds(gap_ns));
+        }
+        try dg.rt_mod.sleep(.fromMilliseconds(10));
+        got_len = try nf.drain(b, &got);
+        stats = clearImpairment(.{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) });
+        wire_d = wireDigest();
+    }
+
+    const Landing = struct { at: u64, order: usize, k: u32, copy: bool };
+
+    fn check(seed_value: u64, reorder: bool) !void {
+        imp = .{ .delay_ns = 2 * std.time.ns_per_ms, .jitter_ns = 3 * std.time.ns_per_ms, .dup_ppm = 250_000, .reorder = reorder };
+        try dg.run(seed_value, body);
+        nf_model.draws = 0;
+        var lands: [2 * n]Landing = undefined;
+        var len: usize = 0;
+        var dups: u64 = 0;
+        var overtaking: u64 = 0;
+        var clamped: u64 = 0;
+        for (0..n) |k| {
+            const t = sent_at[k];
+            const copies: usize = if (nf_model.hit(seed_value, imp.dup_ppm, k, 3)) 2 else 1;
+            if (copies == 2) dups += 1;
+            for (0..copies) |c| {
+                // The latest landing of the flow still on the wire at `t`.
+                var latest: ?u64 = null;
+                for (lands[0..len]) |l| {
+                    if (l.at > t) latest = @max(latest orelse l.at, l.at);
+                }
+                var at = t + wire_latency_ns + imp.delay_ns + nf_model.draw(seed_value, k, 4 + c) % (imp.jitter_ns + 1);
+                if (latest) |l| {
+                    if (at < l) {
+                        if (reorder) overtaking += 1 else {
+                            at = l;
+                            clamped += 1;
+                        }
+                    }
+                }
+                lands[len] = .{ .at = at, .order = len, .k = @intCast(k), .copy = c == 1 };
+                len += 1;
+            }
+        }
+        std.mem.sort(Landing, lands[0..len], {}, struct {
+            fn lt(_: void, x: Landing, y: Landing) bool {
+                return x.at < y.at or (x.at == y.at and x.order < y.order);
+            }
+        }.lt);
+        var h = std.hash.Wyhash.init(0);
+        for (lands[0..len], 0..) |l, i| {
+            if (i >= got_len or got[i] != l.k) {
+                std.debug.print("reorder={}: landing {d}: the model says datagram {d}, the receiver got {d}\n", .{ reorder, i, l.k, if (i < got_len) got[i] else 0 });
+                return error.ModelDiffers;
+            }
+            var r: [25]u8 = undefined;
+            std.mem.writeInt(u64, r[0..8], l.at, .little);
+            @memcpy(r[8..12], &[4]u8{ 127, 0, 0, 1 });
+            std.mem.writeInt(u16, r[12..14], 7000, .little);
+            @memcpy(r[14..18], &[4]u8{ 127, 0, 0, 1 });
+            std.mem.writeInt(u16, r[18..20], 7001, .little);
+            r[20] = if (l.copy) 0x80 else 0;
+            std.mem.writeInt(u32, r[21..25], 4, .little);
+            h.update(&r);
+            var p: [4]u8 = undefined;
+            std.mem.writeInt(u32, &p, l.k, .little);
+            h.update(&p);
+        }
+        try std.testing.expectEqual(len, got_len);
+        try std.testing.expectEqual(h.final(), wire_d);
+        const st = netFaultStats();
+        try std.testing.expectEqual(dups, st.duplicated);
+        try std.testing.expectEqual(@as(u64, len), st.delayed);
+        try std.testing.expectEqual(overtaking, st.overtaking);
+        try std.testing.expectEqual(RuleStats{ .matched = n, .dropped = 0, .duplicated = dups, .delayed = len }, stats);
+        try std.testing.expectEqual(nf_model.draws, netFaultDraws());
+        try nf.noOtherCause(st, &.{ "duplicated", "delayed", "overtaking" });
+        // The cases happened: copies, and overtaking (with reorder) or
+        // clamped copies (without).
+        try std.testing.expect(dups > 30);
+        try std.testing.expect(if (reorder) overtaking > 30 else clamped > 30);
+        std.debug.print("delay model, reorder={}: {d} sent, {d} copies, {d} overtaking, {d} clamped, {d} draws\n", .{ reorder, n, len, overtaking, clamped, nf_model.draws });
+    }
+};
+
+test "sim: net faults: delay, jitter and duplication with reorder land every copy when, and in the order, the test's own model says, and the wire digest records each copy" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try nf_delay.check(21, true);
+}
+
+test "sim: net faults: delay, jitter and duplication without reorder keep each flow in order, every copy clamped where the test's own model says" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try nf_delay.check(21, false);
+}
+
+const nf_route = struct {
+    fn body() !void {
+        const a = try nf.sock(1, 7000);
+        const b = try nf.sock(1, 7001);
+        const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
+        const ms = std.time.ns_per_ms;
+        var got: [8]u32 = undefined;
+        // A route change to a shorter delay, without reorder: the new
+        // datagram waits behind the old one.
+        setImpairment(ab, .{ .delay_ns = 10 * ms });
+        const t0 = clockNs();
+        try nf.send(a, 1, 7001, 0);
+        setImpairment(ab, .{ .delay_ns = 1 * ms });
+        try nf.send(a, 1, 7001, 1);
+        try dg.rt_mod.sleep(.fromNanoseconds(10 * ms + wire_latency_ns - 1));
+        try std.testing.expectEqual(@as(usize, 0), try nf.count(b));
+        try dg.rt_mod.sleep(.fromNanoseconds(1));
+        try std.testing.expectEqual(t0 + 10 * ms + wire_latency_ns, clockNs());
+        try std.testing.expectEqual(@as(usize, 2), try nf.drain(b, &got));
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, got[0..2]);
+        // With reorder, the new datagram overtakes.
+        setImpairment(ab, .{ .delay_ns = 10 * ms });
+        try nf.send(a, 1, 7001, 2);
+        setImpairment(ab, .{ .reorder = true });
+        try nf.send(a, 1, 7001, 3);
+        try dg.rt_mod.sleep(.fromMilliseconds(11));
+        try std.testing.expectEqual(@as(usize, 2), try nf.drain(b, &got));
+        try std.testing.expectEqualSlices(u32, &.{ 3, 2 }, got[0..2]);
+        // After the rule is cleared, the flow still keeps its order behind
+        // a datagram the rule delayed.
+        setImpairment(ab, .{ .delay_ns = 10 * ms });
+        try nf.send(a, 1, 7001, 4);
+        _ = clearImpairment(ab);
+        try nf.send(a, 1, 7001, 5);
+        try dg.rt_mod.sleep(.fromMilliseconds(11));
+        try std.testing.expectEqual(@as(usize, 2), try nf.drain(b, &got));
+        try std.testing.expectEqualSlices(u32, &.{ 4, 5 }, got[0..2]);
+        const st = netFaultStats();
+        // 0, 1 (clamped), 2, 4, 5 (clamped, no rule): five delayed; 3 overtook.
+        try std.testing.expectEqual(@as(u64, 5), st.delayed);
+        try std.testing.expectEqual(@as(u64, 1), st.overtaking);
+        try nf.noOtherCause(st, &.{ "delayed", "overtaking" });
+        // Delay alone, reorder alone: nothing to draw.
+        try std.testing.expectEqual(@as(u64, 0), netFaultDraws());
+    }
+};
+
+test "sim: net faults: after a route change to a shorter delay a flow keeps its order unless the new rule says reorder, and keeps it after the rule is cleared; delay alone draws nothing" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, nf_route.body);
+}
+
+/// Design section 16, point 1: a delay moves the landing, and a landing
+/// wakes its op at the time it lands, so `pushDueAt`'s check (a datagram op
+/// is due now) holds. These run with that check in place.
+const nf_wake = struct {
+    const delay: u64 = 30 * std.time.ns_per_ms;
+    var woke_at: u64 = 0;
+    var got_len: usize = 0;
+    var err: ?anyerror = null;
+    var fd: i32 = 0;
+
+    fn recvTask(rx: i32) void {
+        var buf: [16]u8 = undefined;
+        if (dg.evRecvFrom(rx, &buf)) |g| {
+            got_len = g.len;
+            err = null;
+        } else |e| err = e;
+        woke_at = clockNs();
+    }
+
+    fn pollTask(rx: i32) void {
+        if (dg.evPoll(rx, .recv)) |_| {
+            err = null;
+        } else |e| err = e;
+        woke_at = clockNs();
+    }
+
+    fn setup() !struct { a: i32, b: i32 } {
+        const a = try nf.sock(1, 7000);
+        const b = try nf.sock(1, 7001);
+        setImpairment(.{ .to = nf.ep(1, 7001) }, .{ .delay_ns = delay });
+        return .{ .a = a, .b = b };
+    }
+
+    fn recvBody() !void {
+        const s = try setup();
+        var h = try dg.runtime.spawn(recvTask, .{s.b});
+        try dg.rt_mod.sleep(.fromMilliseconds(1));
+        const t = clockNs();
+        try nf.send(s.a, 1, 7001, 7);
+        h.join();
+        try std.testing.expectEqual(@as(?anyerror, null), err);
+        try std.testing.expectEqual(@as(usize, 4), got_len);
+        try std.testing.expectEqual(t + wire_latency_ns + delay, woke_at);
+    }
+
+    fn pollBody() !void {
+        const s = try setup();
+        var h = try dg.runtime.spawn(pollTask, .{s.b});
+        try dg.rt_mod.sleep(.fromMilliseconds(1));
+        const t = clockNs();
+        try nf.send(s.a, 1, 7001, 7);
+        h.join();
+        try std.testing.expectEqual(@as(?anyerror, null), err);
+        try std.testing.expectEqual(t + wire_latency_ns + delay, woke_at);
+        try std.testing.expectEqual(@as(usize, 1), try nf.count(s.b));
+    }
+
+    /// The receiver's socket is closed while the datagram is in flight,
+    /// and a new socket takes its number and its address: the old receive
+    /// ends at the close, and the datagram lands in the new socket, whose
+    /// own receive it wakes.
+    fn reuseBody() !void {
+        const s = try setup();
+        var h = try dg.runtime.spawn(recvTask, .{s.b});
+        try dg.rt_mod.sleep(.fromMilliseconds(1));
+        const t = clockNs();
+        try nf.send(s.a, 1, 7001, 7);
+        dg.evClose(s.b);
+        h.join();
+        try std.testing.expectEqual(@as(?anyerror, error.FileDescriptorNotASocket), err);
+        try std.testing.expect(woke_at < t + delay);
+        const b2 = try nf.sock(1, 7001);
+        try std.testing.expectEqual(s.b, b2);
+        got_len = 0;
+        var h2 = try dg.runtime.spawn(recvTask, .{b2});
+        h2.join();
+        try std.testing.expectEqual(@as(?anyerror, null), err);
+        try std.testing.expectEqual(@as(usize, 4), got_len);
+        try std.testing.expectEqual(t + wire_latency_ns + delay, woke_at);
+    }
+};
+
+test "sim: net faults: an ev receive parked before a delayed datagram is sent wakes at its delayed landing, with its bytes" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, nf_wake.recvBody);
+}
+
+test "sim: net faults: an ev poll parked before a delayed datagram is sent wakes at its delayed landing" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, nf_wake.pollBody);
+}
+
+test "sim: net faults: a receive whose socket is closed and its number reused while a delayed datagram is in flight ends at the close, and the datagram wakes the new socket's receive" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, nf_wake.reuseBody);
+}
+
+test "sim: net faults refuse: dup_ppm over 1000000" {
+    try refusal("sim: net faults refuse: dup_ppm over 1000000", "sim: setImpairment: dup_ppm 1000001 is over 1000000", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            setImpairment(.{}, .{ .dup_ppm = 1_000_001 });
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: a delay over the limit" {
+    try refusal("sim: net faults refuse: a delay over the limit", "sim: setImpairment: delay_ns 60000000001 plus jitter_ns 0 is over 60000000000 ns", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            setImpairment(.{}, .{ .delay_ns = max_fault_delay_ns + 1 });
+        }
+    }.body);
+}
+
+test "sim: net faults refuse: a delay and a jitter each under the limit whose sum is over it" {
+    try refusal("sim: net faults refuse: a delay and a jitter each under the limit whose sum is over it", "sim: setImpairment: delay_ns 40000000000 plus jitter_ns 30000000000 is over 60000000000 ns", struct {
+        fn body() !void {
+            nf_misuse.inRun();
+            setImpairment(.{}, .{ .delay_ns = 40 * std.time.ns_per_s, .jitter_ns = 30 * std.time.ns_per_s });
+        }
+    }.body);
 }
