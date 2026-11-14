@@ -1779,6 +1779,7 @@ pub const Loop = struct {
         switch (c.op) {
             .net_recv => {
                 const op = c.cast(NetRecv);
+                refuseSimPipeFlags("receive", op.flags, op.handle, &.{"dontwait"});
                 var sl: [sim_max_iovecs][]u8 = undefined;
                 switch (sim.recvInto(op.handle, readSlices(op.buffers, &sl), c, op.flags.dontwait)) {
                     .due => |n| c.setResult(.net_recv, n),
@@ -1795,6 +1796,7 @@ pub const Loop = struct {
             },
             .net_send => {
                 const op = c.cast(NetSend);
+                refuseSimPipeFlags("send", op.flags, op.handle, &.{});
                 var sl: [sim_max_iovecs][]const u8 = undefined;
                 switch (sim.sendBytes(op.handle, writeSlices(op.buffer, &sl), c)) {
                     .due => |n| c.setResult(.net_send, n),
@@ -1825,6 +1827,27 @@ pub const Loop = struct {
                 }
             },
             else => sim.panic("sim: unsimulated I/O op {s}", .{@tagName(c.op)}),
+        }
+    }
+
+    /// Sim: a sim pipe models only a send with the default flags and a
+    /// receive's `dontwait`. Every other flag that differs from its default
+    /// refuses, by name; the list comes from the type, so a flag added later
+    /// refuses too. Why each is not modelled: a pipe send never raises
+    /// SIGPIPE (so `no_signal = false` would differ) and parks on a full
+    /// buffer (so `dontwait` would differ); `peek` would consume; `trunc`
+    /// discards on a Linux stream; `oob`, `eor`, `waitall` and the rest have
+    /// no meaning the sim gives them.
+    fn refuseSimPipeFlags(comptime what: []const u8, flags: anytype, fd: i32, comptime modelled: []const []const u8) void {
+        const T = @TypeOf(flags);
+        const defaults: T = .{};
+        inline for (comptime std.meta.fieldNames(T)) |name| {
+            const is_modelled = comptime for (modelled) |m| {
+                if (std.mem.eql(u8, m, name)) break true;
+            } else false;
+            if (!is_modelled and @field(flags, name) != @field(defaults, name)) {
+                sim.panic("sim: " ++ what ++ " flag " ++ name ++ " on sim pipe fd {d} is not simulated", .{fd});
+            }
         }
     }
 

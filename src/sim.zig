@@ -5879,6 +5879,90 @@ test {
 
 // ---- Phase 1: the native-exit refusals, one test per class of exit ----
 
+test "sim: pipe refuses: a send with MSG_OOB" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: pipe refuses: a send with MSG_OOB", "sim: send flag oob on sim pipe fd 100001 is not simulated", struct {
+        fn body() !void {
+            try r3.up();
+            const p = pipePair();
+            var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
+            var op = dg.ev.NetSend.init(p[1], .{ .iovecs = &iov }, .{ .oob = true });
+            try dg.io_common.waitForIo(&op.c);
+            _ = try op.getResult();
+        }
+    }.body);
+}
+
+test "sim: pipe refuses: a send with MSG_DONTWAIT" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: pipe refuses: a send with MSG_DONTWAIT", "sim: send flag dontwait on sim pipe fd 100001 is not simulated", struct {
+        fn body() !void {
+            try r3.up();
+            const p = pipePair();
+            var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
+            var op = dg.ev.NetSend.init(p[1], .{ .iovecs = &iov }, .{ .dontwait = true });
+            try dg.io_common.waitForIo(&op.c);
+            _ = try op.getResult();
+        }
+    }.body);
+}
+
+test "sim: pipe refuses: a send without MSG_NOSIGNAL" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: pipe refuses: a send without MSG_NOSIGNAL", "sim: send flag no_signal on sim pipe fd 100001 is not simulated", struct {
+        fn body() !void {
+            try r3.up();
+            const p = pipePair();
+            var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
+            var op = dg.ev.NetSend.init(p[1], .{ .iovecs = &iov }, .{ .no_signal = false });
+            try dg.io_common.waitForIo(&op.c);
+            _ = try op.getResult();
+        }
+    }.body);
+}
+
+test "sim: pipe refuses: a receive with MSG_PEEK" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: pipe refuses: a receive with MSG_PEEK", "sim: receive flag peek on sim pipe fd 100000 is not simulated", struct {
+        fn body() !void {
+            try r3.up();
+            const p = pipePair();
+            {
+                var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
+                var op = dg.ev.NetSend.init(p[1], .{ .iovecs = &iov }, .{});
+                try dg.io_common.waitForIo(&op.c);
+                _ = try op.getResult();
+            }
+            var buf: [4]u8 = undefined;
+            var riov: [1]dg.os_net.iovec = undefined;
+            var op = dg.ev.NetRecv.init(p[0], .fromSlice(&buf, &riov), .{ .peek = true });
+            try dg.io_common.waitForIo(&op.c);
+            std.debug.print("received {d} bytes\n", .{try op.getResult()});
+        }
+    }.body);
+}
+
+test "sim: pipe refuses: a receive with MSG_TRUNC" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: pipe refuses: a receive with MSG_TRUNC", "sim: receive flag trunc on sim pipe fd 100000 is not simulated", struct {
+        fn body() !void {
+            try r3.up();
+            const p = pipePair();
+            {
+                var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
+                var op = dg.ev.NetSend.init(p[1], .{ .iovecs = &iov }, .{});
+                try dg.io_common.waitForIo(&op.c);
+                _ = try op.getResult();
+            }
+            var buf: [4]u8 = undefined;
+            var riov: [1]dg.os_net.iovec = undefined;
+            var op = dg.ev.NetRecv.init(p[0], .fromSlice(&buf, &riov), .{ .trunc = true });
+            try dg.io_common.waitForIo(&op.c);
+            std.debug.print("received {d} bytes\n", .{try op.getResult()});
+        }
+    }.body);
+}
+
 test "sim: exits refuse: a read of a sim fd" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     try refusal("sim: exits refuse: a read of a sim fd", "sim: sim fd 100000 reached the native exit os/fs.zig read", struct {
