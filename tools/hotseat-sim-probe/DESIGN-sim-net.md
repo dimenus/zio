@@ -1,7 +1,8 @@
 # Design brief: a sim network for zio (t-4086, t-4087), revision 3
 
-Status: **phase 1 (section 12) is built, and its seven acceptance groups hold
-(section 15). The rest is for review.**
+Status: **phase 1 (section 12) is built but not accepted: an outside review
+of 158ebba found nine defects; two are fixed, seven are open (section 15).
+The rest is for review.**
 
 Revision 2 (dd55885) was reviewed by another vendor's model. This revision
 takes the decisions made after that review. Section 13 lists what changed
@@ -587,6 +588,52 @@ in the message of the commit that added it.
    the socket cannot use: `sim: enet bridge: a source address the socket
    cannot use: the sim's column in a sim run, the kernel's otherwise` (its
    `source_rows` table, a column per build).
+
+### The outside review of 158ebba (gpt-simnet3.md in the reports' folder)
+
+Each finding is taken in the review's order: a test from its sequence, run
+on the code before the fix (it must fail), then the fix and a mutant of it.
+Where the review offers "model it or refuse it loudly", refuse loudly unless
+ENet or a plain UDP program on loopback needs it. Finding 10 was about the
+select adapter, which 9ecfbc6 removed.
+
+- **1 (P1), fixed in 3727c95:** an empty datagram queued while the byte ring
+  emptied moved the ring head; two later payloads shared bytes. Tests: `sim:
+  dgram: an empty datagram queued while the ring empties does not make two
+  later payloads share bytes`, and the model test `sim: dgram: the receive
+  queue matches a list of byte strings under random sends, receives,
+  truncation and SO_RCVBUF changes` (it fails on the old line at seed 2).
+- **2 (P1), fixed in 1b2d7ce:** an op woken by close ran against the socket
+  that reused its fd number. Test: `sim: dgram ev: a receive parked on a
+  socket that is closed and whose number is reused at once ends
+  FileDescriptorNotASocket and leaves the new socket's datagram`. Pipe ends
+  are never reused within a run, so pipes do not have this.
+- **Open, for the next seat, in this order:**
+  - 3: `stateDigest` leaves out in-flight endpoints. Hash each pending
+    entry's endpoints, sequence and length, and the queues in logical order.
+    Hashes of runs with datagrams in flight change on purpose; pipe-only
+    pinned hashes and starh2's must not (show both).
+  - 4: native exits the structural test misses: the public `fs.ioctl`
+    alias (`ioctlPosix`), `epoll_fd` (linux.zig), `fromfd`/`tofd`
+    (darwin.zig). Guard them, and make an integer parameter the test cannot
+    classify fail instead of passing as "other" (an explicit list of known
+    non-fd names; the default is failure). Show the new rule finds those
+    three on the old code.
+  - 5: `poll` reports a closed socket and a sim pipe as writable; `NetPoll
+    (.send)` does not check the socket is open.
+  - 6: a send before bind binds 127.0.0.1, not the wildcard. Model what the
+    kernels do (wildcard, source chosen per send); check macOS and Linux
+    with a real-socket test first; add the case to the parity table.
+  - 7: send flags are dropped under sim (`sendto`, `sendmsg`,
+    `sendDatagram`); refuse unsupported ones loudly.
+  - 8: `recvmsg` with no control buffer after `enableDestinationAddress`
+    gives no `MSG_CTRUNC`; report it or refuse.
+  - 9: `max_due` (32) and the harvest buffer can overflow below the socket
+    and live-op limits. Size them from the real bound; test 64 sockets
+    woken at one virtual time (the sender can be one of them: there are 64
+    datagram slots).
+  - The same class as the P1s: zero lengths, wraps and fd reuse in pipes
+    (zero-length pipe sends were not checked).
 
 ### Next
 
