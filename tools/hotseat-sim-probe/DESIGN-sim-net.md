@@ -412,6 +412,8 @@ reorder by default.
 
 Updated at the end of each sitting. Reports are written outside the repo, at
 `/private/tmp/claude-501/-Users-rsaunderson-Source-mine-hotseat/e4460054-682f-47b6-b854-5c24f700217b/scratchpad/zio-sim-report-N.md`.
+The scripts the gates below use are beside them, in `zio-sim6-tools/` there
+(set `WORK` to a scratch directory, or they work in their own folder).
 
 ### Done
 
@@ -419,54 +421,81 @@ Updated at the end of each sitting. Reports are written outside the repo, at
   `refuseDuringRun`, with the rule and its coverage in their doc comments
   (`src/sim.zig`). The enumeration tables are the appendices of 8498d89 and
   7ab5299.
-- **Phase 1, slice 1 (7dbc10b, pushed in round 5):**
-  - the fd-namespace proof at `sim.begin`/`end`, re-checked in `pipePair`;
-  - `randomSecure` and off-executor `random` refused during a run.
-- **t-4092 (cdba949):** each task carries its sim id (`AnyTask.sim_id`, set at first
-  sighting by `sim.taskId(&task.sim_id)`). There is no address table any
-  more.
+- **The fd-namespace proof and the entropy refusals (7dbc10b).** Its tests
+  run under `zig build test` since 18ec7c8 (a test child moves the sim fd base
+  under the build runner's hard limit; `testMoveFdBase`).
+- **t-4092 (cdba949):** each task carries its sim id (`AnyTask.sim_id`).
+- **`AddressUnavailable` in `SendError` (696d880):** the one normal-build
+  change; its commit shows the two functions whose machine code changed.
+- **Datagram sockets through the socket layer (1dab14f):** the table, the
+  wire, landing, per-flow order with a seeded interleave across flows, the
+  default byte and packet limits with drop counters, `sendDatagram`,
+  `recvDatagram`, `enableDestinationAddress`, `setNonBlocking`,
+  `isNonBlocking`. Protocol: the block comment above `pub const Ip4` in
+  `src/sim.zig`.
+- **Poll and the ev ops (da0b4e1):** `poll` and `pollInterruptible` on sim
+  fds; every ev op on a datagram socket goes through the same layer calls, and
+  parks on the socket where a backend would wait; a real fd in a sim op
+  refuses.
 
 ### Next (phase 1, in this order)
 
-1. The socket table and the layer's sim branch: send, receive, boundaries,
-   truncation.
-2. Poll and the ev ops.
-3. Limits and flow order.
-4. Trace and `wireDigest`.
-5. The native-exit refusals, with their enumeration over `src/os/`.
-6. The C-bridge tests in both builds, and the seven acceptance groups.
+1. **Limits and options (section 6, 8).** `setsockopt`/`getsockopt` on a sim
+   fd refuse today. Build the three option classes; `SO_RCVBUF`
+   re-provisions the queue (`error.SystemResources` on failure, the old limit
+   kept); test the packet limit isolated from the byte budget, growth after
+   open, and one socket's overflow not touching another's. zio's error for an
+   unsupported option is the existing `OptionNotSupported`, not the
+   `OptionUnsupported` the design names. Per-flow order is already done.
+2. **Trace and `wireDigest` (section 7).** `dgram` trace events, digest
+   entries only when a run used a datagram socket (so old digests keep), the
+   one-byte sensitivity case, two fresh processes with the same transcript.
+3. **The native-exit refusals (section 3),** with the script that lists every
+   fd-taking function in `src/os/` and a verdict per caller. Known gap: the
+   layer's `close` on a sim **pipe** fd still reaches the kernel (EBADF is
+   `unreachable` there).
+4. **The C-bridge tests in both builds, and the seven acceptance groups.**
 
-`AddressUnavailable` changes the normal build on purpose: say so in its
-commit, and show the normal build's diff is that and nothing else.
+### An open design point (needs a decision before group 7)
+
+A send from a source address the socket cannot use: the sim answers
+`AddressUnavailable` (section 3.1). Measured: macOS answers EADDRNOTAVAIL too;
+**Linux 6.8 answers ENETUNREACH** for an address the host does not have, and
+**sends from any local address**, even one the socket is not bound to. Group 7
+(the same bridge, the same return values, in both builds) cannot hold on Linux
+as the design stands. See report 6.
 
 ### How to run things
 
 - **zig:** `$(mise where zig@0.17.0)/zig`. Never `zig` by name;
   `~/.zvm/bin/zig` is 0.16.
 - **The sim tests:**
-  `zig build test -Dsim=true -Dscheduling=pinned -Dtest-filter="sim: "`.
-  Count them with `TEST_VERBOSE=true` and
-  `grep -c "^sim.test.sim:.* .. OK ("`.
+  `zig build test -Dsim=true -Dscheduling=pinned -Dtest-filter="sim: "`. With
+  `TEST_VERBOSE=true`, strip the colour codes first
+  (`sed 's/\x1b\[[0-9;]*[mK]//g'`); then `grep -c "^sim.test.sim:"` counts
+  them, and one of them prints its own text before its "OK".
 - **The normal suite:** `PATH="$(mise where zig@0.17.0):$PATH" ./check.sh --ci`.
-- **Unchanged without sim:** archive HEAD to a scratch directory, and build
-  `zig build examples -Doptimize=ReleaseFast` there. Copy this tree's `src/`
-  over the archive and build again at **the same path**. Compare
-  `otool -s __TEXT __text <bin>` for sleep, tcp-echo-server,
-  udp-echo-server, mutex-demo, producer-consumer, signal-demo, http-server and
-  ntp-client. Whole-file hashes differ between builds, so they are useless.
-  A control change (the mutex's `locked` from 1 to 3) proves the compare can
-  see a change.
-- **starh2's three sim steps:**
-  1. `git -C ~/Source/mine/starh2 archive 429b2b3 | tar -x -C <new dir>`;
-  2. point both zio pins (`build.zig.zon`, `tools/zio-dst/build.zig.zon`) at
-     this tree with `.path`;
-  3. `./zb build dst-transport`, `dst-zio`, `dst-conn`, in a Rex tab.
-
-  Since t-4092 (cdba949), `dst-zio`'s reference is **this branch at cdba949,
-  not the pin**. Every fixture whose pin run reused a task address changed
-  (cdba949's commit message lists them, with old and new values). All 23
-  fixtures now give one value in 20 of 20 fresh processes. Compare **sets
-  over 10 or more runs** wherever a value might vary.
+  It runs host tests only.
+- **Linux and Windows:** `check.sh` never compiles a Linux or Windows branch.
+  Build `zig build test -Dtarget=aarch64-linux -Demit-test-bin=true --prefix
+  <dir>` (with and without `-Dsim=true -Dscheduling=pinned`) and run it in
+  colima as the memory note `linux-io-uring-tests-on-mac` says
+  (`TEST_FILTER=<one substring>`). `-Dtarget=x86_64-windows` compiles the
+  Windows test binary.
+- **Unchanged without sim:** `textcmp.sh <base commit> <src dir> <label>`
+  builds the eight examples ReleaseFast from the base and from the src dir at
+  one path, and compares `__TEXT,__text`. When they differ,
+  `fndiff.py <a> <b>` lists the functions that differ, with only moved code
+  and data normalized away. Control: the mutex's `locked` from 1 to 3.
+- **Mutants:** `mut/run.py <list.json> <out>`. A mutant counts only if it
+  compiled and its named test is listed failed, or the test process crashed in
+  it. Check the reason line of each kill, not just the verdict.
+- **starh2's three sim steps:** `starh2-setup.sh <zio commit> <label>` makes a
+  `git archive` of starh2 429b2b3 whose two zio pins point at a `git archive`
+  of that zio commit (never the live tree). `starh2-gate.sh <label> 10`, in a
+  Rex tab, runs the three steps once and `dst-zio` 9 more times;
+  `dstzio-cmp.py <ref> <new>` compares the value sets per line. The reference
+  is 0b71a9c (`dstzio-ref.txt`, 10 runs, every line one value).
 
 ### Traps already hit (each cost a round)
 
@@ -481,10 +510,15 @@ commit, and show the normal build's diff is that and nothing else.
   must see exactly one, naming it.
 - **Mutants that fail to compile do not count.** Remove a line with
   `and false`, not by deleting what a variable needs.
-- **Under `zig build test` on macOS the child's hard fd limit is 10240,** so
-  the fd-namespace tests skip there. Run their binary from a shell
-  (`zig build test -Demit-test-bin -p <dir>`, then `TEST_FILTER=... <dir>/bin/test`).
+- **A mutant that changes the line count moves every later line number** in
+  its failure trace: read the reason, not the line.
+- **An error from inside a task stops its trace at `join`.** The test line
+  (`"<test>" - <ErrorName>`) still names the error.
 - **Never claim from one run of something that varies.** Round 3 did, and
   was wrong.
-- **Don't edit `src/` while a starh2 copy or a mutant run is building from
-  this tree.**
+- **Zig's build runner lowers its own hard RLIMIT_NOFILE to 10240 on Darwin**
+  (`std.process.raiseFileDescriptorLimit`), and every test binary inherits it.
+- **On Linux, raw `fcntl` returns `usize`;** a negative `c_int` mask does not
+  fit it.
+- **macOS has only 127.0.0.1 on loopback.** A test that needs a second local
+  address runs on Linux only.
