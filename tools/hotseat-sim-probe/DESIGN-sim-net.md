@@ -667,6 +667,14 @@ select adapter, which 9ecfbc6 removed.
   full buffer` (5 seeds x 1000 steps; six mutants killed). No defect found.
   The pipe buffer is not a ring (`drainBuf` moves the rest to the front),
   so it has no wrap. Pipe ends are never reused within a run.
+- **The owner's case after finding 2, checked in 2990bc2:** an op woken by
+  a landing, with its socket closed and its number reused near that time.
+  It cannot run against the new socket: a landing wakes an op only inside
+  `takeDue`, which harvests it in the same call, before any task runs.
+  `pushDueAt` panics if a datagram op is ever made due later than now, and
+  `sim: dgram ev: an op woken by a landing, with its socket closed and its
+  number reused near that time, ...` runs the sequence (180 runs). No socket
+  generation was added; see "Next".
 - **Open, not done:** t-4096, a zero-length receive on an empty sim pipe
   parks; check what the kernels do first.
 
@@ -676,6 +684,10 @@ select adapter, which 9ecfbc6 removed.
   the same as would-block, so ENet's receive loop stops there for that
   service call. Later datagrams wait for the next call.
 - **Phase 2** (section 12): faults, counters, validation, promises 2 and 3.
+  If a fault delays the wake of an op that a landing makes due, the check
+  in `pushDueAt` fires. Then each parked and due op must carry its
+  socket's generation, checked at the harvest, so the harvest no longer
+  trusts the fd number.
 
 ### Decided by the design's owner (2026-11-14, after reports 6-8)
 
