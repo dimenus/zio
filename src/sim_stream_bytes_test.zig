@@ -1334,6 +1334,308 @@ test "sim: stream bytes: under .macos shutdown(.both) discards the unread bytes,
     try run(1, .macos, release.body);
 }
 
+// ---- The outside review of slice 2's code (gpt-simnet13.md, of 6656a88) ----
+
+/// P2 [LOGIC]: `.both` reserved a wire entry for a window release credit
+/// that was already owed, and so departs later, not now. At the entry limit
+/// that was a false refusal. A's receiver has sent its FIN (so `.both` sends
+/// none) and owes a credit; B fills the wire to exactly `max_tcp_entries`.
+const both_at_limit = struct {
+    fn body() !void {
+        const l0 = try t1.listen(lo, 0, .{});
+        const ca = try t1.connect(lo, t1.portOf(l0), .none);
+        const sa = try l0.accept(.{});
+        const cb = try t1.connect(lo, t1.portOf(l0), .none);
+        const sb = try l0.accept(.{});
+        try sa.shutdown(.send);
+        sim.setStreamChunking(ca.socket.handle, .off);
+        try expectEqual(@as(usize, 4), try ca.write("abcd", .none));
+        try rt_mod.sleep(.fromMicroseconds(L / us));
+        var b: [1]u8 = undefined;
+        // The first read's credit leaves now; the second's is owed.
+        try expectEqual(@as(usize, 1), try sa.read(&b, .none));
+        try expectEqual(@as(usize, 1), try sa.read(&b, .none));
+        try expect((try dir(true)).owed);
+        sim.setStreamChunking(cb.socket.handle, .{ .fixed = 1 });
+        try expectEqual(@as(usize, 65535), try cb.write(prow.big[0..65535], .none));
+        // On the wire: A's credit and B's 65535 chunks; and A's owed credit.
+        try expectEqual(@as(usize, sim.max_tcp_entries + 1), sim.streamEntriesInFlight());
+        // Nothing leaves now: no FIN, and the release joins the owed credit.
+        try sa.shutdown(.both);
+        try expectEqual(@as(usize, sim.max_tcp_entries + 1), sim.streamEntriesInFlight());
+        const d = try dir(true);
+        try expectEqual(@as(u64, 2), d.reclaimed);
+        try expect(d.owed);
+        try checkConserved();
+        // Let B's first chunks land (one L after they left), so the closes
+        // have room to send.
+        try rt_mod.sleep(.fromMicroseconds(L / us + 10));
+        for ([_]zio_net.Stream{ ca, sa, cb, sb }) |x| x.close();
+        l0.close();
+        try drain();
+    }
+};
+
+test "sim: stream bytes: under .macos, shutdown(.both) whose window release joins a credit already owed puts nothing on a wire full to max_tcp_entries (outside review of slice 2, P2)" {
+    if (comptime skip) return error.SkipZigTest;
+    try run(1, .macos, both_at_limit.body);
+}
+
+/// P2 [PREMISE]: a credit owed when its receiver closes still departs, and a
+/// sender that is alive and parked takes the room it opens, before the RST
+/// that its next bytes draw. The window is 2. The receiver reads twice, 10
+/// µs apart: the first credit leaves at once, the second is owed for one L
+/// later, and the receiver closes with nothing unread (a FIN).
+const owed_to_live_sender = struct {
+    var res: [3]anyerror!usize = undefined;
+    var at: [3]u64 = undefined;
+
+    fn writer(c: zio_net.Stream) void {
+        for ([_][]const u8{ "c", "d", "e" }, 0..) |x, i| {
+            res[i] = c.write(x, .none);
+            at[i] = sim.clockNs();
+        }
+    }
+
+    fn body() !void {
+        const srv, const c, const s = try pair();
+        sim.setStreamChunking(c.socket.handle, .off);
+        sim.setStreamWindow(s.socket.handle, 2);
+        try expectEqual(@as(usize, 2), try c.write("ab", .none));
+        try rt_mod.sleep(.fromMicroseconds(L / us));
+        var h = try rt_mod.spawn(writer, .{c});
+        var b: [1]u8 = undefined;
+        const t1_ = sim.clockNs();
+        try expectEqual(@as(usize, 1), try s.read(&b, .none));
+        try rt_mod.sleep(.fromMicroseconds(10));
+        try expectEqual(@as(usize, 1), try s.read(&b, .none));
+        try expect((try dir(true)).owed);
+        s.close();
+        h.join();
+        // "c" takes the room of the first credit, at t1 + L.
+        try expectEqual(@as(usize, 1), try res[0]);
+        try expectEqual(t1_ + L, at[0]);
+        // The owed credit departs at t1 + L, though its receiver is dead,
+        // and lands at t1 + 2L: "d" takes its room. "c" lands at the dead
+        // receiver in the same instant, and its RST leaves then.
+        try expectEqual(@as(usize, 1), try res[1]);
+        try expectEqual(t1_ + 2 * L, at[1]);
+        // That RST lands at t1 + 3L. A FIN landed first: BrokenPipe on
+        // both kernels, so no profile.
+        try expectError(error.BrokenPipe, res[2]);
+        try expectEqual(t1_ + 3 * L, at[2]);
+        try t1.closeAll2(srv, c);
+    }
+};
+
+test "sim: stream bytes: a credit owed when its receiver closes departs, and a sender still parked takes its room before the RST its bytes draw (outside review of slice 2, P2)" {
+    if (comptime skip) return error.SkipZigTest;
+    try run(1, null, owed_to_live_sender.body);
+}
+
+/// P2 [PREMISE]: the window's changes. A grow wakes a parked send in the
+/// same instant; a shrink below the bytes in use discards nothing and keeps
+/// the send parked until the reads bring the use under the new window.
+const window_changes = struct {
+    var res: [2]anyerror!usize = .{ 0, 0 };
+    var at: [2]u64 = .{ 0, 0 };
+    var done: [2]bool = .{ false, false };
+
+    fn writer(c: zio_net.Stream, i: usize, x: []const u8) void {
+        res[i] = c.write(x, .none);
+        at[i] = sim.clockNs();
+        done[i] = true;
+    }
+
+    fn body() !void {
+        done = .{ false, false };
+        const srv, const c, const s = try pair();
+        sim.setStreamChunking(c.socket.handle, .off);
+        sim.setStreamWindow(s.socket.handle, 2);
+        try expectEqual(@as(usize, 2), try c.write("ab", .none));
+        // Grow: the parked send wakes and admits 2 at the same instant.
+        var h0 = try rt_mod.spawn(writer, .{ c, 0, "cdef" });
+        try rt_mod.sleep(.fromMicroseconds(10));
+        if (done[0]) return error.SendDidNotParkOnAFullWindow;
+        const t_grow = sim.clockNs();
+        sim.setStreamWindow(s.socket.handle, 4);
+        h0.join();
+        try expectEqual(@as(usize, 2), try res[0]);
+        try expectEqual(t_grow, at[0]);
+        try rt_mod.sleep(.fromMicroseconds(L / us));
+        try expectEqual(@as(usize, 4), sim.testStreamEnd(s.socket.handle).unread);
+        // Shrink to 1 with 4 in use: nothing is discarded, and room is 0.
+        sim.setStreamWindow(s.socket.handle, 1);
+        const d = try dir(true);
+        try expectEqual(@as(u32, 1), d.window);
+        try expectEqual(@as(u64, 0), d.discardedTotal());
+        try expectEqual(@as(u64, 4), d.unread);
+        try checkConserved();
+        var h1 = try rt_mod.spawn(writer, .{ c, 1, "ef" });
+        var b: [2]u8 = undefined;
+        // A read of 2: its credit lands one L later, and 2 in use is still
+        // more than the window, so the send stays parked.
+        try expectEqual(@as(usize, 2), try s.read(&b, .none));
+        const t_read = sim.clockNs();
+        try rt_mod.sleep(.fromMicroseconds(L / us + 10));
+        try expectEqual(@as(u64, 2), (try dir(true)).credited);
+        if (done[1]) return error.SendAdmittedPastTheShrunkWindow;
+        // The last 2: their credit brings the use to 0, and the send admits 1.
+        try expectEqual(@as(usize, 2), try s.read(&b, .none));
+        const t_read2 = sim.clockNs();
+        try expect(t_read2 >= t_read + L);
+        h1.join();
+        try expectEqual(@as(usize, 1), try res[1]);
+        try expectEqual(t_read2 + L, at[1]);
+        try checkConserved();
+        try t1.closeAll3(srv, c, s);
+    }
+};
+
+test "sim: stream bytes: a window grow wakes a parked send in the same instant, and a shrink below the bytes in use discards nothing and keeps the send parked until reads bring the use under it (outside review of slice 2, P2)" {
+    if (comptime skip) return error.SkipZigTest;
+    try run(1, null, window_changes.body);
+}
+
+/// P2 [PREMISE]: `setStreamWindow` while the peer's send is woken and not
+/// yet harvested refuses. Two connections, each with a window of 2, full,
+/// and a send parked on it; each receiver reads 1 byte, so the credits land
+/// in one instant and wake both sends in one harvest batch with 1 byte of
+/// room. The first callback harvested shrinks the other's window to 1, which
+/// would leave that woken send no room at its harvest.
+const window_while_woken = struct {
+    var ops: [2]ev.NetSend = undefined;
+    var st: [2][1]os_net.iovec_const = undefined;
+    var recv_fd: [2]i32 = undefined;
+    var first: ?usize = null;
+
+    fn onDone(_: *ev.Loop, comp: *ev.Completion) void {
+        if (first != null) return;
+        const i: usize = if (comp == &ops[0].c) 0 else 1;
+        first = i;
+        sim.setStreamWindow(recv_fd[1 - i], 1);
+    }
+
+    fn reader(s: zio_net.Stream) !void {
+        var b: [1]u8 = undefined;
+        _ = try s.read(&b, .none);
+    }
+
+    fn body() !void {
+        first = null;
+        const l0 = try t1.listen(lo, 0, .{});
+        const c0 = try t1.connect(lo, t1.portOf(l0), .none);
+        const s0 = try l0.accept(.{});
+        const c1 = try t1.connect(lo, t1.portOf(l0), .none);
+        const s1 = try l0.accept(.{});
+        recv_fd = .{ s0.socket.handle, s1.socket.handle };
+        const loop = &rt_mod.getCurrentExecutor().loop;
+        for ([_]zio_net.Stream{ s0, s1 }) |s| sim.setStreamWindow(s.socket.handle, 2);
+        for ([_]zio_net.Stream{ c0, c1 }) |c| sim.setStreamChunking(c.socket.handle, .off);
+        _ = try c0.write("xx", .none);
+        _ = try c1.write("xx", .none);
+        for ([_]zio_net.Stream{ c0, c1 }, 0..) |c, i| {
+            ops[i] = ev.NetSend.init(c.socket.handle, .fromSlices(&.{"y"}, &st[i]), .{});
+            ops[i].c.callback = onDone;
+            ops[i].c.flags.defer_callback = false;
+            loop.add(&ops[i].c);
+        }
+        var h0 = try rt_mod.spawn(reader, .{s0});
+        var h1 = try rt_mod.spawn(reader, .{s1});
+        try h0.join();
+        try h1.join();
+        try rt_mod.sleep(.fromMicroseconds(2 * L / us));
+    }
+};
+
+test "sim: stream refuses: setStreamWindow while the peer's send is woken and not yet harvested (outside review of slice 2, P2)" {
+    try refusal("sim: stream refuses: setStreamWindow while the peer's send is woken", "sim: setStreamWindow on sim fd 100036 while its peer's send is woken and not yet harvested: refused", null, window_while_woken.body);
+}
+
+/// P2 [PREMISE]: one endpoint's parked send and parked receive share one
+/// reset. The endpoint's window toward its peer is full, so its send parks;
+/// its receive parks too; the peer closes with SO_LINGER {1, 0}. The RST
+/// wakes both in one instant, and the harvest order (a function of the
+/// seed) decides which op meets the reset first.
+const shared_reset = struct {
+    var sop: ev.NetSend = undefined;
+    var rop: ev.NetRecv = undefined;
+    var sst: [1]os_net.iovec_const = undefined;
+    var rst: [1]os_net.iovec = undefined;
+    var rbuf: [8]u8 = undefined;
+    var order: [2]u8 = undefined;
+    var n: usize = 0;
+    /// [profile][first harvested: 0 send, 1 receive]
+    var seen: [2][2]u32 = .{ .{ 0, 0 }, .{ 0, 0 } };
+    var profile: sim.StreamProfile = .linux;
+
+    fn onDone(_: *ev.Loop, comp: *ev.Completion) void {
+        order[n] = if (comp == &sop.c) 's' else 'r';
+        n += 1;
+    }
+
+    /// What each op must give, by profile and by which was harvested first.
+    fn want(send_first: bool) struct { send: anyerror!usize, recv: anyerror!usize } {
+        return switch (profile) {
+            // One pending error, reported once by the first op that meets
+            // it; then a send gives BrokenPipe and a receive 0.
+            .linux => if (send_first)
+                .{ .send = error.ConnectionResetByPeer, .recv = 0 }
+            else
+                .{ .send = error.BrokenPipe, .recv = error.ConnectionResetByPeer },
+            // A send never reports the reset; the first read does.
+            .macos => .{ .send = error.BrokenPipe, .recv = error.ConnectionResetByPeer },
+        };
+    }
+
+    fn body() !void {
+        n = 0;
+        const srv, const c, const s = try pair();
+        const loop = &rt_mod.getCurrentExecutor().loop;
+        sim.setStreamWindow(s.socket.handle, 1);
+        _ = try c.write("x", .none);
+        sop = ev.NetSend.init(c.socket.handle, .fromSlices(&.{"y"}, &sst), .{});
+        rop = ev.NetRecv.init(c.socket.handle, .fromSlices(&.{&rbuf}, &rst), .{});
+        for ([_]*ev.Completion{ &sop.c, &rop.c }) |comp| {
+            comp.callback = onDone;
+            comp.flags.defer_callback = false;
+            loop.add(comp);
+        }
+        try rt_mod.sleep(.fromMicroseconds(10));
+        try prow.linger0(s);
+        s.close();
+        try rt_mod.sleep(.fromMicroseconds(L / us));
+        try expectEqual(@as(usize, 2), n);
+        const send_first = order[0] == 's';
+        seen[@backingInt(profile) - 1][if (send_first) 0 else 1] += 1;
+        const w = want(send_first);
+        if (w.send) |v| try expectEqual(v, try sop.getResult()) else |e| try expectError(e, sop.getResult());
+        if (w.recv) |v| try expectEqual(v, try rop.getResult()) else |e| try expectError(e, rop.getResult());
+        // The reset is reported once: a later read gives 0 and a later
+        // send BrokenPipe, under either profile and either order.
+        const e = sim.testStreamEnd(c.socket.handle);
+        try expect(e.reset_received);
+        try expect(e.reset_reported);
+        try expectEqual(@as(usize, 0), try evRecv(c.socket.handle, &rbuf));
+        try expectError(error.BrokenPipe, evSend(c.socket.handle, "z"));
+        try checkConserved();
+        try t1.closeAll2(srv, c);
+    }
+};
+
+test "sim: stream bytes: one endpoint's parked send and parked receive share one RST: the first harvested meets it, it is reported once, in both harvest orders and both profiles (outside review of slice 2, P2)" {
+    if (comptime skip) return error.SkipZigTest;
+    shared_reset.seen = .{ .{ 0, 0 }, .{ 0, 0 } };
+    for ([_]sim.StreamProfile{ .linux, .macos }) |p| {
+        shared_reset.profile = p;
+        for (1..17) |seed| try run(seed, p, shared_reset.body);
+    }
+    for (shared_reset.seen, 0..) |row, p| {
+        std.debug.print("shared reset: profile {d}: send first {d}, receive first {d} of 16 seeds\n", .{ p + 1, row[0], row[1] });
+        if (row[0] == 0 or row[1] == 0) return error.OneHarvestOrderNeverHappened;
+    }
+}
+
 // ---- Refusals and the no-profile points (design 17.4, 17.7, 17.8) ----
 
 const refuse2 = struct {

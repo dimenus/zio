@@ -3204,14 +3204,36 @@ fn admit(ci: u16, side: Side, bufs: anytype, n: usize) void {
 /// carrying the count at that moment (design 17.7).
 fn creditOwed(ci: u16, data: Side) void {
     const d = &conns[ci].dirs[@backingInt(data)];
-    if (d.owed_at != null) return;
-    if (d.last_credit_at) |t| {
-        if (clock_ns < t +| wire_latency_ns) {
-            d.owed_at = t +| wire_latency_ns;
-            return;
-        }
+    switch (creditPlan(ci, data)) {
+        .joins_owed => {},
+        .owe => d.owed_at = d.last_credit_at.? +| wire_latency_ns,
+        .departs, .stale => departCredit(ci, data),
     }
-    departCredit(ci, data);
+}
+
+/// What a read or a release of data direction `data` does with its credit
+/// now (design 17.7). Only `.departs` puts an entry on the wire now, so a
+/// caller that reserves wire room before it changes state reserves for that
+/// alone (outside review of slice 2, P2: `.both` reserved for a credit that
+/// was already owed).
+const CreditPlan = enum {
+    /// A credit is already owed: it departs at its time with the newer count.
+    joins_owed,
+    /// One departed less than L ago: this one is owed for L after it.
+    owe,
+    /// It leaves now.
+    departs,
+    /// The direction is terminal: nothing leaves (`stale_credit`).
+    stale,
+};
+
+fn creditPlan(ci: u16, data: Side) CreditPlan {
+    const d = conns[ci].dirs[@backingInt(data)];
+    if (d.owed_at != null) return .joins_owed;
+    if (d.last_credit_at) |t| {
+        if (clock_ns < t +| wire_latency_ns) return .owe;
+    }
+    return if (dirTerminal(&conns[ci], data)) .stale else .departs;
 }
 
 /// A credit for data direction `data` leaves its receiver now, unless the
@@ -3316,7 +3338,10 @@ pub fn streamShutdown(fd: i32, how: ShutdownHow) error{SocketUnconnected}!void {
     // Before anything moves: the profile, and room on the wire.
     const p: ?StreamProfile = if (discards) needProfile("row 17, shutdown(.both) with unread bytes") else stream_profile;
     const releases = discards and p == .macos;
-    reserveTcp(@as(usize, @intFromBool(!e.fin_out)) + @intFromBool(releases));
+    // Only what leaves now: the FIN, and the release's credit if it
+    // departs now rather than joining one already owed or paced.
+    const leaving = @as(usize, @intFromBool(!e.fin_out)) + @intFromBool(releases and creditPlan(ci, otherSide(s.side)) == .departs);
+    if (leaving > 0) reserveTcp(leaving);
     if (!e.fin_out) {
         e.fin_out = true;
         sendTcp(ci, s.side, .fin, e.peer);
