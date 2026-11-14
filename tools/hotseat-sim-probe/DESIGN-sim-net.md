@@ -440,17 +440,23 @@ The scripts the gates below use are beside them, in `zio-sim6-tools/` there
 - **Options and limits (ec6ec37):** three option classes
   (`dgramSetOption`'s doc comment); `SO_RCVBUF` re-provisions the queue; the
   sim's allocator can fail in a test (`testSetNetAllocator`).
+- **Trace and `wireDigest` (31783f6):** a `dgram` trace event per landing;
+  `wireDigest()`; the datagram table in `stateDigest` only for a run that
+  opened a socket. Two pipe-only probes' hashes are pinned, so promise 1 is a
+  test now, not only starh2's gate.
 
 ### Next (phase 1, in this order)
 
-1. **Trace and `wireDigest` (section 7).** `dgram` trace events, digest
-   entries only when a run used a datagram socket (so old digests keep), the
-   one-byte sensitivity case, two fresh processes with the same transcript.
-2. **The native-exit refusals (section 3),** with the script that lists every
+1. **The native-exit refusals (section 3),** with the script that lists every
    fd-taking function in `src/os/` and a verdict per caller. Known gap: the
    layer's `close` on a sim **pipe** fd still reaches the kernel (EBADF is
-   `unreachable` there).
-3. **The C-bridge tests in both builds, and the seven acceptance groups.**
+   `unreachable` there). A proposal, not yet decided: put the refusal in each
+   fd-taking function of `src/os/` itself (behind `comptime sim.compiled_in`,
+   so a build without sim is unchanged), which makes every caller safe at
+   once, and replace the one-off script with a test that reads `src/os/*.zig`
+   through `@embedFile` and fails when a `pub fn` that takes an fd has neither
+   the refusal nor a sim branch. Then a new exit cannot be added without it.
+2. **The C-bridge tests in both builds, and the seven acceptance groups.**
 
 ### Open design points (each needs a decision)
 
