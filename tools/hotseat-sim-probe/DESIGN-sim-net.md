@@ -976,13 +976,12 @@ the mutants in its commits.
   holes; flows sharing a landing instant are still kept out of it).
 - Open and filed: t-4096 (zero-length receive on an empty sim pipe), t-4098
   (the op model's holes above).
-- **Next: the stream track (section 17).** Revision 1 was 6e854fc
-  (sitting 23); the outside review of it is `gpt-simnet9.md`. Slice 0
-  (measurements) and revision 2 were done in sitting 24, not pushed until
-  the grader says. Next: the grader's decision on 17.17 (the local half of
-  `.both`), an outside review of revision 2, then slice 1. Filed for the users: t-4110 (hotseat's
-  test host makes its TLS identity with `randomSecure`), t-4111 (starh2's
-  raw `getpeername`, `TCP_NODELAY` and `FIONREAD` on accepted fds).
+- **Next: the stream track (section 17).** Revision 1 was 6e854fc,
+  revision 2 2d987f7 (with slice 0), revision 3 sitting 25 (the second
+  outside review, `gpt-simnet10.md`, and the profile ruling). None pushed
+  past 6e854fc until the grader says; the upstream merge (fabfbf1 on
+  `dimenus/hotseat/upstream-sync`) is taken by merge when the grader says.
+  Next: the grader's and an outside review of revision 3, then slice 1.
 - **For hotseat, not zio:** ENet's receive returns 0 for an empty datagram,
   the same as would-block, so ENet's receive loop stops there for that
   service call. Later datagrams wait for the next call.
@@ -1146,52 +1145,38 @@ the mutants in its commits.
   work: let the mutant runner restore it. In zsh, a word that starts with
   `=` (`echo ====`) is a command lookup and fails; quote it.
 
-## 17. The stream track: simulated TCP on loopback (design check, revision 2)
+## 17. The stream track: simulated TCP on loopback (design check, revision 3)
 
 Status: **design only. Nothing in this section is built.** Revision 1 was
-6e854fc (sitting 23). Revision 2 (sitting 24) answers the outside review
-`gpt-simnet9.md` and the grader's rulings on report 23. Each claim says how
-it is known: **(read)** from the code at the file and line named, **(ran)**
-from the probes kept beside report 24, or **(not measured)**.
+6e854fc, revision 2 was 2d987f7, and revision 3 is sitting 25. It answers
+the second outside review, `gpt-simnet10.md`, and the grader's rulings on
+report 24. Each claim says how it is known: **(read)** from the code at
+the file and line named, **(ran)** from the probes kept beside the
+sitting's report, or **(not measured)**.
 
-**What changed from revision 1, and why:**
+**What changed from revision 2, in short:**
 
-- **A connection has its own identity and lifetime**, apart from its
-  descriptor slot. Every wire entry carries it, so a late entry can never
-  reach a replacement connection (review 2; ruling 1). 17.5.
-- **The handshake has the final ACK**: a connection is in the accept queue
-  only when the ACK lands. A state table covers connecting, provisional,
-  cancel, timeout and every close (review 2; requirement B). 17.6.
-- **Accepted bytes are delivered in chunks** with distinct landing times,
-  sized by a hash, on by default. One entry per send hid framing bugs
-  (review 3; requirement A). 17.7.
-- **Room returns by a credit entry on the reverse wire**, at most one in
-  flight per direction, so a reverse partition stalls the sender. Revision
-  1 returned room at the read (ruling 10). 17.7.
-- **Every way a parked op ends is listed**, with its error and its time; a
-  sender learns of a close or reset when the control entry lands
-  (requirement C). 17.8.
-- **"Held, not lost" is defined in full**, and a test can kill a
-  connection at a virtual time (`failStream`) (review 4; rulings 7, 8).
-  17.9.
-- **TCP flows carry protocol and connection identity**; UDP's send numbers
-  and draws are unchanged; the RNG claim is stated exactly, and TCP
-  landings never draw (review 1, 5; ruling 9; requirement D). 17.10.
-- **Slice 0 measured 20 more rows on both kernels** (17.13, rows 16 to
-  35). They settle the reset, `shutdown(.both)`, listener close,
-  `SO_REUSEADDR` and `SO_ERROR` rows, and change four answers: `.both`'s
-  local half follows Linux where unread or late bytes exist (17.8, where I
-  disagree with ruling 4's "later reads give 0"); rebind needs
-  `SO_REUSEADDR` on both sockets and returns `AddressInUse`, not a panic;
-  `SO_ERROR` is refused; the client's source for 127.0.0.2 is 127.0.0.1.
-- **Corrected claims:** the layer's `connect`, `send` and `recv` are called
-  by the native backends, so they are "not reached by the sim dispatch",
-  not "called by nobody"; `NetPoll` has TCP callers in zio's ev tests;
-  default send flags are `no_signal = true`; `NetSendFile` is refused by
-  name; `local_address` is refused in the public adapter (review 1).
-- **Slice 1 makes both users' public listen, connect and accept work end
-  to end**, with the lifetime protection, and its table test is derived
-  from the op enum and the std.Io vtable (review 7; requirement E).
+- **Profiles, not mixed traces.** Where the kernels differ, the sim
+  follows one declared profile, `.linux` or `.macos`, for the whole
+  sequence. A differing row reached with no profile panics (17.8).
+- **An endpoint's death is apart from the connection's retirement.** An
+  unaccepted server endpoint has its own lifetime (17.5).
+- **The op rules are decision lists, total by construction.** They cover
+  one unresolved send and one unresolved receive, ops that are woken but
+  not yet harvested, and every close, landing, credit, window change,
+  rule change and `failStream` (17.6, 17.8).
+- **Byte conservation is an invariant.** Reset is two facts, received and
+  reported, each set once. Credits are frozen and paced, so they never
+  travel faster than the wire. `failStream` is defined in both
+  directions (17.7 to 17.9).
+- **Every kind of entry has a draw key.** The data-send counter is per
+  direction. The chunk bounds are corrected, and the limits are checked
+  before admission (17.7, 17.10).
+- **The digest lists every setting that changes the future.** The
+  teardown check is separate from TIME_WAIT. Each slice's gate is scoped,
+  with pending rows (17.11, 17.15, 17.16).
+- **The probe is repaired** with synchronized state. Rows 16 to 35 are
+  unchanged, and rows 26b and 36 to 38 are new (17.13).
 
 ### 17.1 Why, and for whom
 
@@ -1273,10 +1258,10 @@ name (section 9), unless the row gives an error.
 | `NetListen(backlog)` | modelled; capacity in 17.6 | both |
 | `NetAccept` | modelled; writes the peer address | both |
 | `NetConnect` on an unbound socket, with or without a timeout | modelled (17.6) | both |
-| `NetConnect` on a socket the program bound itself | refused: neither user does it | nobody |
+| `NetConnect` on a socket the program bound itself | refused at submit, before a SYN (17.6): neither user does it | nobody |
 | `IpAddress.connect` with `local_address` | refused **in the public adapter**, before any side effect (in `src/net.zig`; on Linux it would otherwise first set `IP_BIND_ADDRESS_NO_PORT`) | nobody |
 | `NetSend` with default flags (`no_signal = true`), up to IOV_MAX buffers; `writeSplatHeader` | modelled | both |
-| `NetRecv` with default flags | modelled | both |
+| `NetRecv` with default flags | modelled; a total buffer length of 0 is refused (t-4096's ruling) | both |
 | any other send or receive flag | refused by name, derived from the flags type, as for pipes (`refuseSimPipeFlags`) | nobody |
 | `NetShutdown(.send)` | modelled: half-close | starh2 |
 | `NetShutdown(.both)` | modelled (17.8) | starh2 |
@@ -1287,7 +1272,7 @@ name (section 9), unless the row gives an error.
 | `NetPoll` on a stream fd | refused. No supported stream API path calls it; zio's own ev tests do (`src/ev/test/poll_server.zig:569`), on real sockets | nobody under sim |
 | the layer's `connect`, `send`, `recv`, `poll` on a stream fd | refused: not reached by the sim dispatch (the native backends call them, 17.2) | nobody under sim |
 | `getsockname` | modelled | both, through `NetBind` |
-| `getpeername` | a **new** layer function, modelled; after a reset, `SocketUnconnected` (ruling 6) | starh2 |
+| `getpeername` | a **new** layer function, modelled; it maps `ENOTCONN` and `EINVAL` (macOS after a reset, row 9) to `SocketUnconnected` in every build (ruling 6) | starh2 |
 | `FIONREAD` | a **new** layer function (`bytesReadable`): landed, unread bytes | starh2 |
 | `TCP_NODELAY = 1` | modelled: stored, read back as 1, inherited by accepted sockets; no effect | both, through zio |
 | `TCP_NODELAY = 0` | unsupported, advisory (section 8) | nobody |
@@ -1310,532 +1295,770 @@ do.
 
 - **The socket table is shared** with datagram sockets: one fd range, one
   slot allocator, one generation per slot, recorded by each ev op at
-  submit (`dgramOpOnItsSocket`). A slot has a kind: datagram, stream
-  unbound, listener, or stream endpoint. The datagram serializer in
-  `stateDigest` keeps hashing slots 0 to 63 exactly as today
-  (`digestNet`, `src/sim.zig:574`); stream state is hashed in its own
-  part (17.11). A run with no stream socket therefore keeps its digests,
-  and the promise 1 pins prove it.
-- **A connection is its own object**, in a fixed table (`max_conns`, 256),
-  with a number given in creation order (`conn_id`, from 1, never reused
-  in a run). It holds two directions and two endpoint references. An
-  endpoint reference is (slot, generation), or "closed" once its
-  descriptor is gone.
-- **Every TCP wire entry carries `conn_id`, a direction and a per-direction
-  sequence number.** At landing the sim looks up the connection by
-  `conn_id`, never by fd or port. A retired connection takes no entry:
-  the entry is dropped and counted (`stream_dropped_retired`). So a
-  delayed RST or data entry cannot reach a new connection on a reused fd
-  or port.
-- **A SYN is addressed.** It carries the client's `conn_id` and the
-  destination address. At landing it looks up the listener bound to that
-  address *then*. It never names a listener fd.
-- **Retirement.** A connection is retired when both endpoints are closed
-  and no entry of it is on the wire or held, or at once when it is
-  aborted (17.8) and its remaining entries are discarded. Its port
-  reservations follow 17.5's TIME_WAIT rule, not the connection.
-- **Ports.** TCP has its own table and its own counter from 49152, apart
-  from UDP. Port 0 takes the next free port; the counter wraps from 65535
-  to 49152 and skips ports in use or reserved; a full range is
-  `AddressInUse` (no kernel has 16384 sockets in a test). A connect from
-  an unbound socket binds 127.0.0.1 and the next port, also for a
-  destination of 127.0.0.2 (row 30: Linux uses 127.0.0.1 as the source).
-- **TIME_WAIT, as a reservation for the rest of the run.** The endpoint
-  that sent its FIN first (the active closer) leaves its local port
-  reserved, with that socket's `SO_REUSEADDR` flag. A later bind to that
-  port succeeds only if **both** the reserved socket and the new socket
-  set `SO_REUSEADDR`; otherwise `AddressInUse` (row 31: macOS needs only
-  the new socket's flag, Linux needs both; the sim takes Linux's answer,
-  the stricter). A client-side active close leaves the listener's port
-  free (row 32, both kernels). The reservation never expires within a
-  run: a fidelity limit, since TIME_WAIT lasts 60 s on Linux.
-- **Two listeners on 127.0.0.1:P and 0.0.0.0:P:** `AddressInUse` even
-  with `SO_REUSEADDR` (row 12: macOS allows it, Linux refuses).
+  submit (`dgramOpOnItsSocket`). A slot's kind is datagram, stream open
+  (not connected), listener, or stream endpoint. The datagram serializer
+  in `stateDigest` keeps hashing slots 0 to 63 exactly as today
+  (`digestNet`, `src/sim.zig:574`), so a run with no stream socket keeps
+  its digests (the promise 1 pins prove it).
+- **A connection** is an object in a fixed table (`max_conns` = 256). Its
+  `conn_id` is assigned when `NetConnect` is submitted, in program order,
+  from 1, and is never reused in a run. A connection has two
+  **endpoints** and two **directions**.
+- **An endpoint** has a phase: `C-open`, `C-syn`, `C-failed` (client);
+  `S-prov`, `S-queued` (server, unaccepted); `est` (owned by a
+  descriptor); `dead`. An unaccepted server endpoint has **no
+  descriptor**. It is owned by its listener's queue, and lives until it
+  is accepted (it becomes `est` with a new slot), or until it dies.
+- **An endpoint dies** when its descriptor is closed, when its listener
+  closes before it is accepted, or when an RST lands on it in `S-prov`.
+  `failStream` does not kill an endpoint: it marks it failed, and the
+  descriptor still owns it until close. A dead endpoint keeps the few
+  flags it needs to answer late entries (17.8): whether it sent an RST,
+  and whether it failed.
+- **A connection retires** only when all of these hold:
+  - both endpoints are dead;
+  - no entry of it is on the wire or held;
+  - no credit departure is owed (17.7).
 
-### 17.6 The handshake and the endpoint states (requirement B)
+  Until then, every entry lands at its endpoint, alive or dead, and is
+  handled by 17.8's landing rules. After retirement, nothing of it
+  remains. The `conn_id` check at landing is a guard that cannot fire by
+  construction, and the op model requires its count to be 0. Revision 2
+  retired an aborted connection at once; that lost the queue's reference
+  and the listener's RST (review 2, findings 1 and 2).
+- **Every TCP entry carries** `conn_id`, its direction, and a
+  per-direction sequence number. A SYN is addressed: it also carries the
+  destination, and it looks up the listener bound there when it lands.
+- **Ports.** TCP has its own table and its own counter from 49152. Port 0
+  takes the next free port, wraps from 65535 to 49152, and skips ports in
+  use or reserved; a full range is `AddressInUse`. A connect from an
+  unbound socket binds 127.0.0.1 and the next port, also for a
+  destination of 127.0.0.2 (row 30, Linux).
+- **TIME_WAIT is a reservation for the rest of the run.** An endpoint that
+  sends its FIN before a FIN has landed on it is the active closer. Its
+  local port is reserved with that socket's `SO_REUSEADDR` flag. A later
+  bind to the port follows the profile (row 31):
+  - `.linux`: allowed only when both the reserved socket and the new one
+    set the flag;
+  - `.macos`: allowed when the new socket sets it.
+  - Without a profile, a bind whose answer would differ (the reserved
+    socket without the flag, the new one with it) panics and names row
+    31.
 
-**Timeline with no fault** (L = 100 µs, `wire_latency_ns`): at t a connect
-puts a SYN on the wire. At t+L the SYN lands at a listener with room; the
-server side becomes **provisional** and a SYN-ACK goes back. At t+2L the
-SYN-ACK lands; the client is **established**, its `NetConnect` completes,
-and an ACK goes out; the client may send at once (its data follows the ACK
-in the same direction). At t+3L the ACK lands; the server side is
-**queued** and a parked accept wakes with it.
+  A client-side active close leaves the listener's port free (row 32,
+  both kernels). The teardown check counts reservations apart from leaks
+  (17.15).
 
-**Capacity.** A listener holds at most `backlog` connections, provisional
-and queued together, with `backlog` clamped to 1 to 4096. A SYN that
-lands when the listener is full **panics**: "accept queue full: backlog
-overflow is not simulated" (ruling 3). Neither kernel refuses such a
-connect, and they disagree on how many fit (row 4). This is a fidelity
-limit: backlog saturation cannot be tested under this model.
+### 17.6 The handshake and listeners (requirement B)
 
-**Client endpoint states:** `C-open` (opened, not connecting), `C-syn`
-(SYN on the wire or held), `C-est` (established), `C-failed` (the connect
-returned an error), closed.
-**Server side of a connection:** `S-prov` (SYN landed, SYN-ACK out),
-`S-queued` (ACK landed, in the accept queue), `S-acc` (accepted, has an
-fd).
-**Listener:** open, or closed.
+**Timeline with no fault** (L = 100 µs):
+- t: `NetConnect` is submitted; a SYN goes out.
+- t+L: the SYN lands. The listener makes an `S-prov` endpoint and sends a
+  SYN-ACK.
+- t+2L: the SYN-ACK lands. The client is `est`, `NetConnect` completes,
+  and an ACK goes out. The client may send at once, and its data follows
+  the ACK.
+- t+3L: the ACK lands. The endpoint becomes `S-queued`, and a parked
+  accept wakes.
 
-Each cell: new state; what the op gets; wire entries. "—" means nothing
-changes. Times are "at the call" (due now, harvested before the clock
-moves) or "at landing" (in the harvest of the poll that reaches the
-landing time).
+The client may close between t+2L and t+3L, and the connection is still
+accepted (rows 26 and 27): queue ownership does not depend on the client.
 
-| state | event | result |
-|---|---|---|
-| C-open | `NetConnect` | C-syn; the op parks; a SYN out |
-| C-syn | SYN lands, listener open with room | server S-prov; a SYN-ACK out |
-| C-syn | SYN lands, no listener at the address, or listener closed | an RST out to the client; no server state |
-| C-syn | SYN lands, listener full | panic (capacity, above) |
-| C-syn | SYN-ACK lands | C-est; `NetConnect` completes ok, at landing; an ACK out |
-| C-syn | RST lands (the answer to its SYN) | C-failed; `NetConnect` fails `ConnectionRefused`, at landing |
-| C-syn | the connect op is canceled, or its deadline passes | the op ends `Canceled` (zio maps a deadline to `Timeout`), at the call; the socket **stays C-syn**: canceling a wait does not abort a connect. Both zio wrappers then close the socket (next rows) |
-| C-syn | close, SYN not yet landed (on the wire or held) | the connection is retired; its SYN is dropped at landing, or discarded if held (`stream_dropped_retired`); it never makes server state |
-| C-syn | close, SYN landed (server S-prov, SYN-ACK in flight) | the client endpoint is closed; when the SYN-ACK lands at a closed endpoint, an RST goes back; when that lands, the server side is removed (it was never queued) |
-| C-syn | a second `NetConnect` | refused: neither user does it |
-| C-syn | `NetSend` or `NetRecv` | refused: a kernel answers `ENOTCONN` or waits; neither user does it |
-| C-syn | `failStream` (17.9) | C-failed; the parked connect ends with the given error, at the call; the connection is retired |
-| C-est | close or shutdown | as for any established endpoint (17.8) |
-| C-failed | any op but close | refused: neither user reuses a failed socket |
-| C-failed | close | the slot is freed; nothing on the wire |
-| S-prov | ACK lands | S-queued, appended to the accept queue; a parked accept wakes with the queue head, at landing |
-| S-prov | RST lands (client closed during the handshake) | removed; nothing reaches accept |
-| S-prov | listener closed | removed; an RST out to the client (a client in C-est then sees the reset, as row 28) |
-| S-queued | `NetAccept` | S-acc with a new slot; completes at the call (zio's inline path takes it, upstream #872) |
-| S-queued | client data, FIN or RST lands | kept on the connection; accept still returns it. Rows 26 and 27: a client that reset before accept gives `ConnectionResetByPeer` at the first read, then 0; one that sent and closed gives its bytes, then 0 |
-| S-queued | listener closed | the connection is aborted: an RST out to the client (row 28: the client reads `ECONNRESET`, then 0; its send fails `EPIPE`); the server side is retired |
-| S-acc | listener closed | — (row 29: an accepted connection survives) |
-| listener open | `NetAccept` with an empty queue | parks; one unresolved accept per listener |
-| listener open | parked accept canceled | `Canceled`; queued connections stay |
-| listener open | close | a parked accept ends `FileDescriptorNotASocket` at the next harvest (the generation); provisional and queued connections are aborted, as above |
-| listener closed | a SYN lands at its address | an RST out (refused), as for no listener |
+**Capacity.** A listener holds at most `backlog` unaccepted endpoints
+(`S-prov` and `S-queued` together), with `backlog` clamped to 1 to 4096. A
+SYN that lands at a full listener panics: "accept queue full: backlog
+overflow is not simulated". It is a fidelity limit, because neither
+kernel refuses such a connect, and they disagree on how many fit (row 4).
 
-**Equal times.** Entries landing at the same instant are processed in
-(landing time, `conn_id`, direction, sequence) order (17.10). So two SYNs
-at one instant reach the listener in `conn_id` order, which is the order
-of their connects; the accept queue is in ACK landing order; a parked
-accept takes the queue head.
+**Decision lists.** Each event below has an ordered list. The first line
+that matches decides; the last line covers every remaining state. A list
+is therefore total by construction: it is the compressed form of a full
+(state, event) table, in which the cells that do not depend on the state
+share a line. "At the call" means due now, harvested before the clock
+moves. "At landing" means in the harvest of the poll that reaches the
+landing time.
 
-**"No answer" has no producer in slice 1.** With `setConnectOutcome`
-dropped, a connect that is never answered needs a held SYN (17.9) or
-`failStream`. Its check moves to slice 3.
+**`NetConnect(fd)`:**
+1. The fd is not a stream socket in `C-open`, or it was bound by the
+   program: refused, as is `local_address` in the public adapter, before
+   any side effect.
+2. Otherwise: assign the `conn_id`; the endpoint becomes `C-syn`; a SYN
+   goes out; the op parks.
 
-### 17.7 Bytes: chunks, the window and credit
+**A SYN lands at address A:**
+1. A listener is open at A and has room: a new `S-prov` endpoint; a
+   SYN-ACK goes out.
+2. A listener is open at A and full: panic (capacity).
+3. Otherwise (no listener, or it closed): an RST goes out to the client.
+   No server endpoint is made.
 
-**Chunks (requirement A).** A send admits `min(len, room)` bytes and
-returns that count. The admitted bytes go on the wire as one or more
-**chunks**, each its own entry with its own landing time:
+**A SYN-ACK lands at the client endpoint:**
+1. The endpoint failed (`failStream` in `C-syn`): dropped, no answer. The
+   server's `S-prov` endpoint then stays until its listener closes, as a
+   kernel's SYN_RECV stays until its timer (a fidelity limit).
+2. The endpoint is dead (closed in `C-syn`): an RST goes back. When it
+   lands, the `S-prov` endpoint dies (it is never queued).
+3. `C-syn`: becomes `est`; the connect completes ok, at landing; an ACK
+   goes out.
 
-- Chunk sizes come from `h = hash(seed, tcp_send_number, chunk_index,
-  "chunk")`, a keyed hash (SipHash over the four values). With h's low
-  two bits 0, the chunk is `1 + (h >> 2) % 16` bytes; otherwise `512 +
-  (h >> 2) % 3585` bytes (512 to 4096). The last chunk takes the rest.
-  About one chunk in four is tiny, so a 5-byte TLS header or an HTTP/2
-  frame header is often split. `tcp_send_number` counts TCP sends in the
-  run, from 1; it is separate from UDP's send numbers.
-- Chunk k of a send lands at `T0 + k × 1 µs`, where T0 is the first
-  chunk's landing time. Each chunk therefore lands in its own poll, and
-  a reader sees a prefix before the rest.
-- **On by default.** No stream run exists yet, so nothing changes. A test
-  can set a fixed chunk size, or turn chunking off (one chunk per send),
-  with `sim.setStreamChunking(.{ .fixed = n } | .off | .hashed)`.
-- **Never** from the run's RNG, and UDP's formula is not touched.
-- **The wire and the due list.** Chunks add wire entries, not due-list
-  entries: the due list holds ops (at most `max_live`), and the wire is a
-  growable list. A full 256 KiB window is about 128 entries on average,
-  and at most 16384 entries if every chunk were tiny. The sim declares a
-  hard limit of 65536 TCP entries on the wire and held together, and
-  panics above it, naming the limit. A test that sends many 1-byte
-  writes sets a smaller window.
+**An ACK lands at the server endpoint:**
+1. The endpoint is dead (its listener closed): dropped. Its RST is
+   already on the way.
+2. `S-prov`: becomes `S-queued` and is appended to the queue; a parked
+   accept is woken with the queue head.
 
-**The window.** One number per direction: the bytes the sender has
-admitted and not yet seen credited. A send with no room parks; it wakes
-when room appears (a credit landing, a window grow) or when the
-connection ends (17.8).
+**An RST lands at a client in `C-syn`:** `C-failed`; the connect fails
+`ConnectionRefused`, at landing. (Later RSTs: 17.8.)
 
-**Credit (ruling 10).** When the receiver's program reads n bytes, a
-**credit** entry goes on the reverse wire with the cumulative count read.
-At most one credit is in flight per direction: a second read while one is
-in flight updates that entry's count instead of adding one (coalesced),
-and keeps its landing time. When the credit lands, the sender's used count
-drops to `admitted - credited`, and a parked send with room wakes. A
-partition or silence of the reverse direction holds the credit, so the
-sender stalls, as in real TCP. Cost: at most one extra entry per
-direction in flight. Data is not ACKed separately; credit is the only
-reverse traffic.
+**Cancel, or the deadline, of a parked `NetConnect`:** `Canceled` (zio
+maps a deadline to `Timeout`), at the call. The endpoint stays `C-syn`:
+canceling a wait does not abort a connect. A later SYN-ACK makes it
+`est` with no op waiting. Both zio wrappers close the socket on failure.
+
+**Close of a client socket:**
+1. `C-open` or `C-failed`: the slot is freed; nothing goes on the wire.
+2. `C-syn` with its SYN not yet landed (on the wire or held): the
+   endpoint is dead. The SYN is dropped at landing, or discarded if
+   held (`stream_dropped_dead`), and it never makes server state.
+3. `C-syn` with its SYN landed: the endpoint is dead. The SYN-ACK
+   answers with an RST when it lands (above).
+4. `est`: 17.8.
+
+**`NetAccept(listener)`:**
+1. An unresolved accept exists on this listener (parked, or woken and
+   not harvested): refused.
+2. The queue is not empty: the head becomes `est` with a new slot, and
+   the call completes at once. zio's inline path takes it (upstream
+   #872).
+3. Otherwise: it parks. It is woken by an ACK landing; a cancel ends it
+   `Canceled`. Close: below.
+
+**Close of a listener:**
+1. Every `S-prov` and `S-queued` endpoint dies. Their unread bytes are
+   discarded (cause `listener_closed`). Each sends an RST to its client,
+   unless it already has an RST from that client. Row 28: the client
+   reads `ECONNRESET` and then 0, and its send fails `EPIPE`.
+2. Accepted connections are not affected (row 29).
+3. A parked or woken accept ends `FileDescriptorNotASocket` at the next
+   harvest (the generation).
+
+**A queued endpoint keeps what lands on it** (bytes, FIN, RST) until it is
+accepted or dies. So accept returns a connection whose client already
+closed or reset, as rows 26, 26b and 27 measure. The first call on it
+follows 17.8:
+- after an orderly close, a read returns the queued bytes, then 0, and a
+  send succeeds (row 27);
+- after a reset, the first read or send follows the profile (rows 26 and
+  26b).
+
+**Equal times.** Entries landing at one instant are processed in
+(landing time, `conn_id`, direction, sequence) order, with no draw (17.10).
+Two SYNs at one instant therefore reach the listener in `conn_id` order,
+which is the program order of their `NetConnect` submissions. The op
+model tests both creation orders.
+
+### 17.7 Bytes: chunks, the window, credit, conservation
+
+**Admission.** A `NetSend` admits `min(len, room)` bytes, where room is
+`window - used`, and returns that count. The admitted bytes go on the wire
+as chunks, each its own entry. Before anything is admitted, the send
+works out its chunk plan. If the plan would take the TCP entries (on the
+wire and held, all connections) past the limit of 65536, the send panics
+and names the limit; nothing is admitted.
+
+**Chunk sizes** come from
+`hash(seed, conn_id, direction, data_send_index, chunk_index, "chunk")`
+(SipHash):
+- if the hash's low two bits are 0, the chunk is `1 + (h >> 2) % 16`
+  bytes;
+- otherwise it is `512 + (h >> 2) % 3585` bytes;
+- the last chunk takes the rest.
+
+`data_send_index` is **per direction**. It moves by one each time a send
+admits at least one byte, at admission, never at submission or at a
+retry. So no other connection, and no UDP traffic, can shift it. Chunk k
+lands at `T0 + k × 1 µs`, so each chunk lands in its own poll, and a
+reader sees a prefix first.
+
+**Chunk modes**, set with `sim.setStreamChunking(fd, mode)`, and for
+connections made later with `setStreamChunkingDefault(mode)`:
+- `.hashed`, the default;
+- `.{ .fixed = n }`, with n from 1 to 65536 (0 panics);
+- `.off`, one chunk per send.
+
+**Bounds, corrected.** The worst case is one entry per admitted byte, so
+a full 256 KiB window can need 262144 entries. That is over the limit,
+and the admission check panics first. `.fixed = 1` therefore needs a
+window small enough that the windows of all live connections stay under
+65536 entries. The hashed mode averages about 150 entries for a full
+window. The due list is not affected: it holds ops (at most `max_live`),
+and chunks are wire entries. A FIN is sequenced after the last chunk of
+the last admitted send.
+
+**The window.** It is one number per direction: the bytes the receiver
+will accept beyond what it has read. The sender's `used` is `admitted -
+credited`. A send with no room parks.
+
+**Credit (rulings 10 and D).** Credit is the only reverse traffic: data is
+not ACKed separately.
+- A read of n bytes adds n to the receiver's `read` count for that
+  direction.
+- A credit entry carries the `read` count at its departure. The count is
+  frozen once the entry has left.
+- At most one credit departs per direction per L (100 µs) of virtual
+  time. A read inside that interval does not send a credit; it sets
+  "owed", and the owed credit departs at `last departure + L` with the
+  count at that moment. It never travels faster than the wire.
+- When a credit lands, `credited = max(credited, count)`, which is
+  idempotent. If room appears, a parked send is woken.
+- Held credits of one direction coalesce to the newest. That is
+  equivalent: both are cumulative, and they would land in order.
+- A partition of the reverse direction holds the credits, so the sender
+  stalls.
+- Entries: at most one departure per L per direction. With fixed latency,
+  that is 1 in flight. Under a delay rule it is `delay / L`, bounded by
+  the entry limit.
 
 **`sim.setStreamWindow(fd, bytes)`** sets the window of the direction
-toward `fd` (what `fd` may receive); `sim.setStreamWindowDefault(bytes)`
-sets it for connections made later. Default 256 KiB. Bounds: 1 byte to 16
-MiB; 0 and anything above 16 MiB panic. The window is a declared bound on
-admitted payload, not on the sim's memory. Shrinking below the bytes in
-use discards nothing; room is 0 until use falls below the new window.
-Growing wakes a parked send at once if room appears (due now). A change
-takes effect at the sender at once, with no wire entry: a stated
-simplification.
+toward `fd`, and `setStreamWindowDefault(bytes)` sets it for later
+connections. The default is 256 KiB; the bounds are 1 byte to 16 MiB,
+and 0 or more panics. The list:
+1. `fd` is not an `est` endpoint, or the sender's send is woken and not
+   harvested: refused.
+2. Otherwise the window is set at once, at the sender, with no wire entry
+   (a stated simplification). Shrinking below `used` discards nothing;
+   room is 0 until `used` falls below the window. Growing wakes a parked
+   send if room appears.
 
-### 17.8 How a parked op ends, the pending error, and shutdown (requirement C)
+**Conservation (requirement B).** For each direction, at every step:
 
-A sender or receiver learns of the peer only when an entry lands: FIN,
-RST or credit. Never by counting sends.
+`admitted = in_flight + held + unread + read + Σ discarded[cause]`
 
-**What an RST landing does to the endpoint it reaches** (rows 7, 20, 22,
-23):
-- unread bytes stay, and are read first, on both kernels (rows 20, 22);
-- a **pending reset** is set: the next `NetRecv` after the unread bytes
-  ends `ConnectionResetByPeer`, once; later receives give 0 (rows 7, 20;
-  ruling 5);
-- a send parked at that moment ends `ConnectionResetByPeer` (Linux, rows
-  23 and 25; macOS gives `EPIPE`);
-- a send started after it ends `BrokenPipe` (rows 17, 18, 20, 22, both
-  kernels);
-- a send does not consume the receive's pending reset. This combination
-  is what macOS does for the receive side and Linux does for a parked
-  send: each error is one a kernel gives, and a program must handle both.
-  Linux alone would give 0 at the read in row 22 (ruling 5 chose the
-  error).
+The causes are named:
+- `abort`: the sender's held data, at its RST;
+- `failed_sender`: held data when `failStream` hits the sender;
+- `failed_receiver`: data that lands at a failed endpoint, plus its
+  unread bytes;
+- `closed_receiver`: data that lands at a closed endpoint;
+- `unread_at_close`: unread bytes when a close sends an RST;
+- `shut_receiver`: data that lands after `.both`;
+- `both_discard`: unread bytes at `.both`, under `.macos`;
+- `after_reset`: data that lands after a reset was received;
+- `listener_closed`.
 
-**An entry that lands at an endpoint whose descriptor is closed, or whose
-receive half is shut** answers with an RST (rows 8, 17, 18, 22: the
-sender's next send fails on both kernels). FIN and credit entries never
-draw an RST.
+Credit is applied exactly once per landing, by `max`. Once a direction is
+**terminal** (its sender is dead or failed, or its sender has received an
+RST), its window accounting ends: no more admission is possible, and a
+credit that lands later is dropped and counted (`stale_credit`). It
+never wakes a send, and it never touches another connection. The op model
+checks the equation after every step, and checks `credited <= read`.
 
-**Every way a parked op ends:**
+### 17.8 Endpoint rules, reset, shutdown, and the profiles (requirements A, C)
 
-| op | event | result | when |
-|---|---|---|---|
-| receive | a data chunk lands | the bytes | at landing |
-| receive | a FIN lands, nothing unread | 0 | at landing |
-| receive | an RST lands | `ConnectionResetByPeer` | at landing |
-| receive | own `shutdown(.both)` | 0 | at the call (row 16, both kernels) |
-| receive | own `shutdown(.send)` | stays parked | (row 19, both kernels) |
-| receive | own close | `FileDescriptorNotASocket` (generation) | next harvest |
-| receive | cancel, deadline | `Canceled` / `Timeout` | at the call |
-| receive | `failStream(.reset / .timed_out)` | `ConnectionResetByPeer` / `ConnectionTimedOut` | at the call |
-| send | a credit lands and room appears | the admitted count | at landing |
-| send | the window grows and room appears | the admitted count | at the call |
-| send | an RST lands | `ConnectionResetByPeer` | at landing |
-| send | own `shutdown(.send / .both)` | `BrokenPipe` | at the call (row 24, both kernels) |
-| send | own close; cancel; deadline; `failStream` | as for a receive | as for a receive |
-| send | a FIN lands | stays parked: the peer may still read (half-close, row 5) | — |
-| accept, connect | see 17.6 | | |
+**Two facts for reset (requirement C).** An endpoint has `reset_received`
+(an RST landed) and `reset_reported` (an op returned the reset error).
+Each is set once and never cleared. A second RST that lands is dropped
+and counted, and it never re-arms a reported error. An endpoint sends at
+most one RST in its life (`rst_sent`). So reads go reset, then EOF, and
+never reset again.
 
-Each wake happens once: the op is ended through the existing live check
-(`isLive`, `endOp`), and a credit is applied once, at its landing.
+**The profiles.** `sim.setStreamProfile(.linux | .macos)` is called before
+the run's first stream socket opens, and is set once per run; a change
+later panics. It is in the state digest. Each profile follows one
+kernel's measured joint trace on every row where the kernels differ:
 
-**FIN.** `shutdown(.send)` and close put a FIN behind the bytes already
-admitted, never behind bytes a parked send has not had admitted. The FIN
-needs no window room. A send that is parked when its own side shuts
-down ends `BrokenPipe` (above), so no admitted byte follows a FIN. Both
-sides may shut down at once; each reads the other's bytes, then 0 (row
-35). A connection stays alive until both directions are resolved: a FIN
-or RST landed, or the connection retired.
+- **`.linux`: one pending error, reported once by the first call that
+  meets it.** An RST that lands sets the pending error to
+  `ConnectionResetByPeer` if no FIN has landed on the endpoint. If a FIN
+  has landed, it sets the error to `pipe`: a read does not report `pipe`
+  and gives 0, and a send reports it as `BrokenPipe`. The first send or
+  read that reports the error consumes it. After that, reads give 0 and
+  sends give `BrokenPipe`. Rows 7, 17, 18, 20, 22, 23, 25, 26, 26b and 36.
+- **`.macos`: after an RST lands, every send gives `BrokenPipe`.** This
+  includes a send parked at that moment. A send never consumes anything.
+  The first read after the unread bytes gives `ConnectionResetByPeer`
+  once, whether or not a FIN landed; later reads give 0. Rows 7, 17, 18,
+  20, 22, 23, 25, 26, 26b and 36.
 
-**Close.** With nothing unread: a FIN. With unread bytes: an RST instead
-(row 7). With `SO_LINGER` {1, 0}: an RST (row 9). A closed descriptor
-cannot read, so its connection keeps only what is needed to deliver its
-FIN and answer late entries with an RST.
+**Reaching a differing row with no profile panics and names the row.**
+Rows where the kernels agree need no profile, so an ordinary test that
+never meets one of these points needs none. The points are:
+- a send that meets a received reset (rows 23, 25, 26b, 36);
+- a read that meets a reset after a FIN had landed (row 22);
+- `.both` with unread bytes, or a byte that lands after `.both` (rows 17
+  and 18);
+- a rebind in the differing combination (row 31);
+- two listeners on one port with different addresses (row 12);
+- a connect to 127/8 other than 127.0.0.1 (rows 15 and 30).
 
-**`shutdown(.both)`, measured (rows 16 to 18, 3 runs on each kernel):**
+**Rows that are not profiled, and why:**
 
-| case | macOS | Linux |
+| row | why one answer, or a refusal |
+|---|---|
+| 1 (poll results) | `NetPoll` on a stream fd is refused, and through `NetConnect` both kernels give `ConnectionRefused` |
+| 4 (how many fit the backlog) | needs real timing: overflow panics (17.6) |
+| 9 (`getpeername` after a reset) | the new layer function maps `ENOTCONN` and `EINVAL` to `SocketUnconnected` in every build, so zio's callers see one answer (ruling 6) |
+| 10 (buffer sizes) | the window is declared (17.7) |
+| 6, 13 (`SHUT_RD` alone, shutdown of a listener) | refused: nobody calls them |
+| 12 under `.macos` | refused: which listener gets the SYN was not measured. `.linux` gives `AddressInUse` |
+| 15, 30 under `.macos` | refused: macOS's answer (no answer) depends on lo0's aliases, not on TCP. `.linux` connects from 127.0.0.1 |
+
+**The cost of profiles.** It is 6 decision points in the sim:
+- what an RST landing sets;
+- a send that meets a reset;
+- a read that meets a reset;
+- `.both` and unread bytes;
+- `.both` and late data;
+- the rebind rule.
+
+Add 2 refusals under `.macos`, about 80 lines by my estimate, and a
+parity column per profile, each run on its own host. What it gives:
+starh2 gets Linux's whole trace, hotseat on a Mac gets macOS's, and no run
+mixes two kernels. I think it is worth it.
+
+**`NetRecv(fd)`**, at the call, and again at harvest for a woken receive
+(then step 2 is skipped):
+1. The fd is not an endpoint in `est`, or the total buffer length is 0
+   (t-4096's ruling): refused.
+2. A receive is unresolved (parked, or woken and not harvested): refused.
+3. The endpoint failed and has not reported it: the failure's error
+   (`ConnectionResetByPeer` or `ConnectionTimedOut`); it is now reported.
+4. The endpoint failed and has reported it: 0.
+5. There are unread bytes: they are returned (up to the buffers), and a
+   credit is owed.
+6. A pending error that a read reports (`.linux`: reset; `.macos`: reset,
+   not yet reported): the error; it is now reported.
+7. A FIN landed, the endpoint did `.both`, or a reset was received: 0.
+8. Otherwise: it parks. At harvest this line is an invariant panic: a
+   woken receive always has a result, because only the receive itself
+   consumes bytes.
+
+**`NetSend(fd)`**, at the call, and again at harvest for a woken send:
+1. The fd is not an endpoint in `est`: refused. A length of 0 returns 0.
+2. A send is unresolved: refused.
+3. The endpoint failed and has not reported it: the failure's error; it
+   is now reported.
+4. The endpoint failed, or its own FIN went out: `BrokenPipe`.
+5. A reset was received: by profile. `.linux` reports the pending error
+   if it has not been consumed, else `BrokenPipe`. `.macos` gives
+   `BrokenPipe`.
+6. There is room: admit (17.7), and return the count.
+7. Otherwise: it parks. At harvest, room 0 here is an invariant panic,
+   because a window change while a send is woken is refused (17.7).
+
+**What wakes a parked op.** It is then evaluated by the list above at
+harvest.
+
+| op | woken by | when |
 |---|---|---|
-| a read blocked in another thread | wakes with 0 | wakes with 0 |
-| 6 unread bytes, then read | 0 (discarded) | the 6 bytes |
-| then the peer sends 5 | accepted | accepted |
-| then read | 0 | `ECONNRESET` |
-| the peer's next send | `EPIPE` | `EPIPE` |
-| the peer then reads | `ECONNRESET`, then 0 | 0, then 0 |
+| receive | data, FIN or RST landing; own `.both`; `failStream` | at landing / at the call |
+| send | a credit that makes room; a window grow; an RST landing; own `shutdown(.send / .both)`; `failStream` | at landing / at the call |
+| either | cancel or deadline: `Canceled` / `Timeout`, and the op is removed | at the call |
+| either | own close: `FileDescriptorNotASocket` (the generation) | next harvest |
+| receive | own `shutdown(.send)`: **not** woken (row 19) | — |
+| send | a FIN landing: **not** woken (half-close, row 5) | — |
 
-The **peer-facing half is the same on both kernels**: bytes that land after
-`.both` draw an RST, and the peer's next send fails. So the sim sends the
-RST, and the peer follows the RST rules above. This gives the peer no
-error Linux never gives: Linux's peer send fails `EPIPE` too. The only
-difference is that the peer's read gives `ConnectionResetByPeer`, where
-Linux gives 0, which is ruling 5's choice.
+Each op ends once, through the existing `isLive` and `endOp`.
 
-**The local half: I disagree with "later reads give 0" for two cases, on
-this evidence.** Ruling 4 is right for the wake and for a quiet
-connection: a parked receive completes with 0, and with nothing unread and
-nothing arriving, every later read gives 0, on both kernels. But on Linux,
-where starh2 runs:
-- unread bytes are still delivered after `.both` (row 17: "the 6 bytes");
-- a byte that lands after `.both` makes the next read fail `ECONNRESET`
-  once (rows 17, 18).
+**`shutdown(fd, .send)`:**
+1. The fd is not an endpoint in `est`: refused.
+2. A reset was received, or the endpoint failed: `SocketUnconnected`.
+   This does not consume the pending error (rows 37 and 38, both
+   kernels).
+3. Its FIN already went out: ok, nothing more.
+4. Otherwise: a FIN goes out behind the admitted bytes, and needs no
+   room; a parked send is woken (`BrokenPipe`, row 24). If no FIN has
+   landed on it, its port is reserved (TIME_WAIT).
 
-starh2's read pump takes a different branch on that error: any read error
-other than `EndOfStream` sets `read_failed` (read: starh2
-`src/edge/wire_pump.zig:228-229`). "Later reads give 0" is macOS's answer,
-and under it the sim would never show starh2 the branch Linux takes.
-**Recommended:** Linux's local half. Unread bytes are delivered; a late
-landing sets the pending reset (one `ConnectionResetByPeer`, then 0).
-Alternative: ruling 4 as written (macOS). It is simpler, and it hides the
-Linux branch. The grader decides; slice 2 builds whichever is chosen.
+**`shutdown(fd, .both)`:** as `.send`, then the receive side is shut.
+- A parked receive is woken, and gives 0 (row 16, both kernels).
+- Unread bytes: `.linux` keeps them for reading (row 17). `.macos`
+  discards them (`both_discard`). With no profile and unread bytes, it
+  panics (row 17).
+- A byte that lands later: see the data landing rules.
 
-### 17.9 Faults on streams (rulings 7 and 8)
+**`close(fd)`** of an `est` endpoint (other phases: 17.6):
+1. The endpoint failed, or a reset was received: the descriptor is
+   released; nothing goes on the wire.
+2. There are unread bytes, or `SO_LINGER` {1, 0} is set: an RST goes out
+   and `rst_sent` is set. Unread bytes are discarded
+   (`unread_at_close`), and the endpoint's held outbound data and FIN are
+   discarded (`abort`). Its data already on the wire still lands before
+   the RST, in order.
+3. Otherwise: a FIN goes out, unless one already did. Its port is
+   reserved if it is the active closer.
+
+In every case the endpoint is dead. Unresolved ops end
+`FileDescriptorNotASocket` at the next harvest.
+
+**A data chunk lands at endpoint X:**
+1. X failed: dropped (`failed_receiver`); no answer.
+2. A reset was received on X: dropped (`after_reset`); no answer.
+3. X is dead (closed): dropped (`closed_receiver`). If X has not sent an
+   RST, one goes back.
+4. X did `.both`: dropped (`shut_receiver`). If X has not sent an RST,
+   one goes back (rows 17 and 18, both kernels). Under `.linux`, if X has
+   no pending error, it gets `ConnectionResetByPeer` (row 18: the next
+   read fails). With no profile, it panics (row 18).
+5. Otherwise (`S-queued` or `est`): the bytes join the unread bytes, and
+   a parked receive is woken. (`S-prov` cannot be reached here: the
+   client's data follows its ACK in order.)
+
+**A FIN lands at X:**
+1. X failed, is dead, or received a reset: dropped.
+2. Otherwise: the FIN is recorded, and a parked receive is woken.
+
+**An RST lands at X:**
+1. X failed, or a reset was already received: dropped and counted.
+2. X is dead: dropped; an `S-prov` endpoint that was still in its
+   listener's count is removed from it.
+3. X is `C-syn`: 17.6.
+4. Otherwise (`S-queued` or `est`):
+   - set `reset_received`, and the pending error by profile (above);
+   - unread bytes stay, and are read first (rows 20 and 22);
+   - X's held outbound data and FIN are discarded (`abort`);
+   - X's sending direction is terminal;
+   - a parked receive and a parked send are woken.
+
+**A credit lands at X:**
+1. X's sending direction is terminal, or X is dead or failed: dropped
+   (`stale_credit`).
+2. Otherwise: `credited` is raised, and a parked send is woken if room
+   appears.
+
+**Entries are handled at their landing, never by counting sends**
+(requirement C). The first send after a peer closed succeeds, because
+nothing has landed yet (rows 8 and 22). The sender learns only when the
+RST lands.
+
+### 17.9 Faults on streams, and failStream (rulings 7 and 8)
 
 A rule gets a protocol: `.udp` (the default, so every phase 2 run is
-unchanged) or `.tcp`. A `.tcp` rule matches a connection's entries by the
-same endpoint fields as today. Delay and jitter are modelled; partition
-and silence **hold** entries; loss, burst, duplication and reorder are
-refused at `setRule`, because TCP hides them.
+unchanged) or `.tcp`.
+- **Delay and jitter** are modelled.
+- **Partition and silence** hold entries.
+- **Loss, burst, duplication and reorder** are refused at `setRule`.
 
-**Delay and jitter.** Drawn once per entry, at its send, from the fault
-draw (never the run's RNG), keyed by `tcp_send_number` and the chunk index.
-Within one direction, landing times never go backward: the clamp is always
-on for TCP, and each entry lands at least 1 ns after the one before it.
+The protocol is part of each rule's record in the fault digest.
+
+**Delay and jitter** are drawn once per entry, at its send, with the key
+`(seed, conn_id, direction, sequence, purpose)`, where the purpose is
+"delay" or "jitter" (17.10). Within a direction, landing times only go
+forward: the clamp is always on, and each entry lands at least 1 ns after
+the one before it.
 
 **Held, defined:**
-1. **When.** An entry is held if a matching partition or silence is in
-   force at its send, or at its landing. A rule set while an entry is in
-   flight therefore holds it at landing.
-2. **Order.** Once a direction has a held entry, every later entry of that
-   direction is held behind it, matching or not. Held entries keep their
-   sequence order.
-3. **Credit.** Held payload stays charged to the window: the sender cannot
-   admit more because of it. A held credit stalls the sender (17.7).
-4. **Release.** When a rule is cleared, each held direction whose entries
-   no longer match any rule is released. Release only when every blocker
-   is gone. Directions are released in (`conn_id`, direction) order.
-5. **Release time.** Each entry keeps the delay it was given at its send
-   (its planned landing minus its send time); it is not redrawn. It lands
-   at `release time + that delay`, clamped behind the entry before it.
-6. **The same instant.** A landing at T takes the rule state at the moment
-   `landDue` processes it. A rule cleared by a task later in the same
-   instant does not undo that landing; a rule set by a task that ran
-   before the harvest at T does hold it. This is the order UDP uses.
+1. **When.** An entry is held if a matching **partition or silence** is
+   in force at its send or at its landing. Delay and jitter rules are
+   never blockers.
+2. **Order.** Once a direction has a held entry, every later entry of
+   that direction is held behind it, matching or not, in sequence order.
+3. **Window.** Held payload stays charged to the window. A held credit
+   stalls the sender. Held credits coalesce to the newest (17.7).
+4. **Release.** When a rule is cleared, each held direction with no
+   matching partition or silence left is released. Directions are
+   released in (`conn_id`, direction) order. A delay rule that still
+   matches does not prevent release. Its values were drawn at the send
+   and are kept. (Test: a partition and a delay over one entry; clear the
+   partition.)
+5. **Release time.** Each entry lands at `release time + the delay drawn
+   at its send`, clamped behind the entry before it. Nothing is redrawn.
+6. **The same instant.** A landing at T takes the rule state at the
+   moment `landDue` processes it. A rule that a task clears later in the
+   same instant does not undo it. A rule set by a task that ran before
+   the harvest at T holds it. This is UDP's order.
 7. **RST against held data.** An endpoint that aborts (close with unread
-   bytes, linger 0, `failStream`) discards its own direction's held data
-   and FIN at once, and releases their credit. Its data already on the
-   wire still lands, ahead of the RST. The RST obeys a partition: it is
-   held like any entry, so the peer learns only at release.
-8. **Retired connections.** A held entry of a retired connection is
-   discarded when the connection retires; a release can never revive an
-   aborted connection or create server state. A SYN held past the
-   connect's deadline is discarded when the program closes the socket
-   (17.6); if the program keeps the socket, the release delivers it.
+   bytes, linger 0, or an RST landing on it) discards its own held
+   outbound data and FIN at once. Their bytes count as `abort`. Its data
+   already on the wire lands before its RST. An RST obeys a partition
+   like any entry.
+8. **Dead endpoints.** Held entries that are inbound to a dead endpoint
+   stay held. When they are released, 17.8's landing rules apply: data is
+   dropped, and an RST goes back at most once. A connection cannot retire
+   while it has held entries (17.5), so a release never meets a retired
+   connection.
 9. **Time.** Held entries are not on the wire, so they never make the
-   clock stop "due now"; a connect deadline is reached normally.
-10. **Bounds.** Held entries count toward the 65536-entry limit (17.7).
-    Connections count toward `max_conns`. Both panic when exceeded,
-    naming the limit. At `sim.end`, every connection, held entry and
-    reservation is freed, and a run that ends with any still present
-    fails the end check (17.15).
+   clock stop. A connect's deadline is reached normally. A SYN held past
+   the deadline is discarded when the wrapper closes the socket (17.6).
+10. **Bounds.** Held entries count toward the 65536-entry limit, and
+    connections toward `max_conns`. Both panic and name the limit.
 
-**`sim.failStream(fd, .reset | .timed_out)` (ruling 8).** A local
-transport death of `fd`'s endpoint, at the virtual time of the call. A
-controller task calls it, as it sets fault rules. It puts nothing on the
-wire: a host that dies sends nothing. The endpoint's parked ops end with
-`ConnectionResetByPeer` or `ConnectionTimedOut` at the call; its later
-receives give 0 and later sends `BrokenPipe`; its unread bytes and held
-entries are discarded; entries of the connection that land at it later
-are dropped and counted. The peer learns nothing unless the test also
-acts on the peer. hotseat's case, "the host dies in the middle of the RTSP
-exchange", is `failStream(client_fd, .timed_out)` plus a partition, or
-`.reset`. Both errors exist in `RecvError` and `SendError` today (read:
-`src/os/net.zig:1148-1151, 1272-1278`).
+**`sim.failStream(fd, .reset | .timed_out)`**: a local transport death at
+the virtual time of the call. It puts nothing on the wire.
 
-### 17.10 One wire, flows, and the RNG (ruling 9; requirement D)
+| when | what happens |
+|---|---|
+| X in `C-syn` | the parked connect fails, at the call, with `ConnectionResetByPeer` or **`Timeout`** (`ConnectError` has no `ConnectionTimedOut`; read: `src/os/net.zig:648-650`); X becomes `C-failed` and failed; a later SYN-ACK is dropped (17.6) |
+| X in `est` | X is failed. A parked or woken receive or send ends with `ConnectionResetByPeer` or `ConnectionTimedOut` at the call. If none is parked, the next receive or send gets it once (17.8 step 3). |
+| X's outbound data | **held** data and FIN are discarded (`failed_sender`); data **already on the wire** still lands at the peer. Owed and held credits from X are discarded. |
+| X's inbound data | unread bytes are discarded (`failed_receiver`). Entries that land later are dropped, and nothing answers (17.8). |
+| the peer B | B is not touched. Its parked ops stay parked until something happens to B itself: data, a FIN or an RST that lands, a cancel, a deadline, a close, or `failStream` on B. B's sends are admitted while it has room. When its window fills, the send parks, because a failed X sends no credit. |
+| later close of X | the descriptor is released, and nothing goes on the wire (17.8 close, step 1) |
+| X in any other phase | refused |
+
+hotseat's case, "the host dies in the middle of the RTSP exchange", is
+`failStream(client_fd, .timed_out)`. A test that also wants the host side
+quiet partitions it, or closes the host's socket.
+
+### 17.10 One wire, flows, draw keys and the RNG (ruling 9; requirements D, E)
 
 - **One wire.** TCP entries go on the existing wire list, in landing
   order. `nextDueIoRemaining` and the poll's clock see them unchanged.
-- **Flows carry the protocol.** `sameFlow` (`src/sim.zig:2033`) compares
-  only addresses and ports today. It gains the protocol, and for TCP the
-  `conn_id` and direction. So a delayed TCP entry never clamps a UDP
-  datagram with the same address pair, and two connections never clamp
-  each other.
-- **UDP's numbering and draws are unchanged.** TCP sends do not take UDP
-  send numbers, and the UDP fault formula is not touched.
+  Owed credit departures are sim-internal times that
+  `nextDueIoRemaining` also sees.
+- **Flows carry the protocol.** `sameFlow` (`src/sim.zig:2033`) gains the
+  protocol, and for TCP also the `conn_id` and direction. So TCP never
+  clamps UDP, and two connections never clamp each other.
+- **Draw keys.** Every TCP entry kind (SYN, SYN-ACK, ACK, data chunk, FIN,
+  RST, credit) has its own per-direction sequence number. All of its
+  values come from a keyed hash of `(seed, conn_id, direction, sequence,
+  purpose)`, with the purposes "delay", "jitter" and, for chunk sizes,
+  `(…, data_send_index, chunk_index, "chunk")`. TCP fault draws are
+  counted in their own counter, so UDP's `netFaultDraws()` is unchanged.
+  UDP's send numbers and formula are untouched.
 - **TCP landings never draw.** `landDue` lands UDP entries exactly as
   today, with its seeded choice among UDP flow heads due at one instant
   (`src/sim.zig:2058`). TCP entries due by then land in a second pass, in
-  (landing time, `conn_id`, direction, sequence) order, with no draw.
-- **The precise RNG claim.** In a run with stream sockets:
-  - stream code never draws from the run's RNG: not for chunks, delays,
-    credit, the handshake or ordering;
-  - TCP completions take part in the harvest shuffle of ops due together
-    (`takeDue`, `src/sim.zig:1205-1214`), which draws from the run's RNG
-    as it does for every op today;
-  - the scheduler's own draws (task pick, preemption) are unchanged;
+  (landing time, `conn_id`, direction, sequence) order.
+- **The RNG claim.** In a run with stream sockets:
+  - stream code never draws from the run's RNG;
+  - TCP completions take part in the harvest shuffle (`takeDue`,
+    `src/sim.zig:1205`), which draws from the run's RNG, as every op does
+    today;
+  - the scheduler's draws are unchanged;
   - pipes keep their `ioDelayNs` draws.
-- **What a mixed run guarantees.** With TCP and UDP in one run: UDP fault
-  outcomes are a function of UDP sends alone, and TCP never clamps UDP.
-  But TCP changes task scheduling and the harvest shuffle, so UDP sends
-  can happen at other times, and a mixed run's UDP outcomes are **not**
-  equal to the same UDP workload without TCP. The wire digest of a mixed
-  run includes TCP records. A run with no stream socket is unchanged in
-  every respect (promise 1).
+- **A mixed run.** UDP fault outcomes are a function of UDP sends alone,
+  and TCP never clamps UDP. But TCP changes scheduling and the harvest
+  shuffle, so UDP sends can happen at other times, and UDP's outcomes are
+  not those of the same UDP workload without TCP. A run with no stream
+  socket is unchanged in every respect.
 
-### 17.11 Determinism: trace and digests
+### 17.11 Determinism: trace and digests (requirement F)
 
-- **Trace:** a `stream` event at each TCP landing: kind (SYN, SYN-ACK, ACK,
-  data, FIN, RST, credit), `conn_id`, direction, length. Only a run that
-  opens a stream socket emits one.
-- **Wire digest:** TCP records go into the same running hash, with a kind
-  byte, `conn_id`, direction, sequence, landing time **and the payload
-  bytes**, so one changed byte gives another digest. UDP records keep
+- **Trace:** a `stream` event at each TCP landing: kind, `conn_id`,
+  direction, sequence, length.
+- **Wire digest:** TCP records include kind, `conn_id`, direction,
+  sequence, landing time and **the payload bytes**. UDP records keep
   their encoding.
-- **State digest**, a stream part only for a run that opened a stream
-  socket, in stable order (by `conn_id`, then slot): every connection's
-  state, windows, admitted and credited counts, pending reset, FIN and RST
-  flags, unread bytes; every TCP entry on the wire or held; provisional
-  and queued connections per listener; the TCP port table, counter and
-  TIME_WAIT reservations; the next `conn_id` and `tcp_send_number`;
-  parked op ids and generations. Two runs whose futures differ cannot
-  share a digest.
-- **The datagram serializer is unchanged** (17.5), and empty extra slots
-  are not hashed in it, so no-stream digests do not move.
+- **State digest**, a stream part for a run that opened a stream socket,
+  in stable order (by `conn_id`, then slot). It covers every setting and
+  state that can change the future:
+  - the profile;
+  - the chunking default and each connection's mode;
+  - the window default and each direction's window;
+  - each socket's options (`TCP_NODELAY`, `SO_REUSEADDR`, `SO_LINGER`);
+  - each listener's capacity, queue and provisional endpoints;
+  - each endpoint's phase, flags (FIN in and out, `.both`, reset
+    received and reported, RST sent, failed and its kind), pending
+    error, and unread bytes;
+  - each direction's admitted, credited, read and discarded counts, its
+    sequence and `data_send_index`, its credit pacing (last departure,
+    owed);
+  - every TCP entry on the wire or held;
+  - the TCP port table, counter and reservations;
+  - the next `conn_id`, the parked op ids and the generations.
+- **Fault digest:** each rule's protocol is added.
+- **Sensitivity tests:** two snapshots equal except for one setting
+  (chunking `.off` against `.fixed = 1`, another default window, another
+  profile, another backlog) give different digests.
+- The datagram serializer is unchanged (17.5).
 
 ### 17.12 What a consumer must do (not zio's work)
 
 - **hotseat (t-4110):** `TestHost` makes its TLS identity with
-  `io.randomSecure` (read: hotseat `src/identity.zig:33, 374`), which the
-  sim refuses. The sim's real clock starts at 2023-11-14 22:13:20 UTC
-  (`src/sim.zig:405`), so an identity made inside the run is valid inside
-  it, and one made outside with today's date is not yet valid inside it.
+  `io.randomSecure`, which the sim refuses (read: hotseat
+  `src/identity.zig:33, 374`). The sim's real clock starts at 2023-11-14
+  (`src/sim.zig:405`). hotseat's sim tests on a Mac declare `.macos`; on
+  Linux, `.linux`.
 - **starh2 (t-4111):** move `getpeername`, `TCP_NODELAY` and `FIONREAD` to
-  zio's layer. Until then they fail silently on a sim fd.
+  zio's layer. Its sim steps declare `.linux`.
 - Both users' AF_UNIX sockets, hotseat's DNS connect and starh2's `::1`
   tests stay outside sim runs.
 
 ### 17.13 Kernel rows (ran)
 
-Two C probes, 3 runs on macOS 25.6.0 arm64 and 3 on Linux 6.8.0 aarch64
-(colima): `tcpprobe.c` (rows 1 to 15, sitting 23) and `tcpprobe2.c` (rows
-16 to 35, slice 0, sitting 24), raw outputs beside report 24. Every row
-was the same in 3 of 3 runs on each kernel, except row 10 on macOS
-(varies by run) and the random port in row 14 on Linux. In rows 23 to 25,
-the probe checks that the send was blocked before the event.
+The probes ran 3 times on macOS 25.6.0 arm64 and 3 times on Linux 6.8.0
+aarch64 (colima):
+- `tcpprobe.c`: rows 1 to 15 (sitting 23);
+- `tcpprobe3.c`: rows 16 to 38 (sitting 25).
+
+The raw outputs are beside reports 23 and 25. Each kernel's three outputs
+are identical, except row 10 on macOS and the random port of row 14 on
+Linux.
+
+`tcpprobe3.c` (sitting 25) replaced sitting 24's `tcpprobe2.c`. Its
+blocked-call state is atomic. The worker records that it entered the
+call and whether the event had started when it returned. A call that was
+not inside the call at the event, or that returned before it, is
+reported `REJECTED`; no run printed that. Rows 16 to 35 are byte-identical
+to sitting 24's outputs on both kernels, so the repair changed no answer.
 
 | row | case | macOS | Linux | sim |
 |---|---|---|---|---|
-| 1 | non-blocking connect, no listener | poll `HUP`; `ECONNREFUSED` | poll `OUT/ERR/HUP`; `ECONNREFUSED` | `ConnectionRefused` |
+| 1 | non-blocking connect, no listener | poll `HUP`; `ECONNREFUSED` | poll `OUT/ERR/HUP`; `ECONNREFUSED` | `ConnectionRefused` (not profiled) |
 | 2 | blocking connect, no listener | `ECONNREFUSED` | `ECONNREFUSED` | the same |
-| 3 | non-blocking connect to a listener | in progress, then writable | the same | completes after a round trip |
-| 4 | listen(1), 6 connects, none accepted | 1 made | 2 made | panic at capacity |
+| 3 | non-blocking connect to a listener | in progress, then writable | the same | after a round trip |
+| 4 | listen(1), 6 connects | 1 made | 2 made | panic at capacity |
 | 5 | half-close | peer reads 0, sends back; own send `EPIPE` | the same | the same |
-| 6 | `SHUT_RD`, 6 queued, peer sends | 0, 0; peer's 2nd send `EPIPE` | 6, 5; peer fine | `.receive` refused |
-| 7 | close with unread bytes | peer: `ECONNRESET`, then 0 | the same | the same |
-| 8 | send to a closed peer, twice, then read | ok; `EPIPE`; `ECONNRESET` | ok; `EPIPE`; 0 | ok; `BrokenPipe`; `ConnectionResetByPeer` |
+| 6 | `SHUT_RD` alone | 0, 0; peer's 2nd send `EPIPE` | 6, 5; peer fine | refused |
+| 7 | close with unread bytes | peer: `ECONNRESET`, 0 | the same | the same |
+| 8 | send to a closed peer, twice, then read | ok; `EPIPE`; `ECONNRESET` | ok; `EPIPE`; 0 | profile |
 | 9 | linger 0; `getpeername` after | `ECONNRESET`; `EINVAL` | `ECONNRESET`; `ENOTCONN` | reset; `SocketUnconnected` |
-| 10 | bytes before `EAGAIN`, peer not reading | 319,020 or 548,188 | 2,612,608 | the window |
-| 11 | rebind after server close, old without reuse | see row 31 | see row 31 | row 31 |
-| 12 | 127.0.0.1:P and 0.0.0.0:P, both reuse | allowed | `EADDRINUSE` | `AddressInUse` |
+| 10 | bytes before `EAGAIN` | 319,020 or 548,188 | 2,612,608 | the window |
+| 12 | 127.0.0.1:P and 0.0.0.0:P, both reuse | allowed | `EADDRINUSE` | `.linux`: `AddressInUse`; `.macos`: refused |
 | 13 | shutdown of a listener | `ENOTCONN` | ok; accept `EINVAL` | refused |
 | 14 | client's local address | 127.0.0.1 | 127.0.0.1 | 127.0.0.1 |
-| 15 | connect to 127.0.0.2 | no answer in 1 s | connects | connects |
-| 16 | `SHUT_RDWR`, read blocked in another thread | wakes, 0; later 0 | the same | the same |
-| 17 | `SHUT_RDWR` with 6 unread, peer sends twice | read 0; 0; peer `EPIPE`; peer reads `ECONNRESET`, 0 | read 6; `ECONNRESET`; peer `EPIPE`; peer reads 0, 0 | 17.8 |
-| 18 | `SHUT_RDWR`, nothing unread, peer sends twice | 0; peer `EPIPE`; peer `ECONNRESET` | `ECONNRESET`; peer `EPIPE`; peer 0 | 17.8 |
-| 19 | `SHUT_WR`, read blocked in another thread | stays blocked; wakes on data | the same | the same |
-| 20 | RST behind 6 landed unread bytes | 6 bytes; `ECONNRESET`; 0; send `EPIPE` | the same | the same |
-| 21 | FIN behind 6 landed unread bytes | 6 bytes; 0; 0 | the same | the same |
-| 22 | peer sent 5 and closed; own send meets it; reads | send ok; 5 bytes; `ECONNRESET`; 0; send `EPIPE` | send ok; 5 bytes; 0; 0; send `EPIPE` | macOS's (ruling 5) |
-| 23 | send blocked on a full window, peer resets | `EPIPE`; reads `ECONNRESET`, 0 | `ECONNRESET`; reads 0, 0 | `ConnectionResetByPeer`; reads: the pending reset, then 0 |
+| 15 | connect to 127.0.0.2 | no answer in 1 s | connects | `.linux`: connects; `.macos`: refused |
+| 16 | `SHUT_RDWR`, read blocked in a thread | wakes, 0; later 0 | the same | the same |
+| 17 | `SHUT_RDWR` with 6 unread, peer sends twice | read 0; 0; peer `EPIPE`; peer reads `ECONNRESET`, 0 | read 6; `ECONNRESET`; peer `EPIPE`; peer reads 0, 0 | profile |
+| 18 | `SHUT_RDWR`, nothing unread, peer sends twice | 0; peer `EPIPE`; peer `ECONNRESET` | `ECONNRESET`; peer `EPIPE`; peer 0 | profile |
+| 19 | `SHUT_WR`, read blocked in a thread | stays blocked; wakes on data | the same | the same |
+| 20 | RST behind 6 unread bytes | 6; `ECONNRESET`; 0; send `EPIPE` | the same | the same |
+| 21 | FIN behind 6 unread bytes | 6; 0; 0 | the same | the same |
+| 22 | peer sent 5 and closed; own send; reads | ok; 5; `ECONNRESET`; 0; send `EPIPE` | ok; 5; 0; 0; send `EPIPE` | profile |
+| 23 | send blocked, peer resets; then reads | `EPIPE`; `ECONNRESET`, 0 | `ECONNRESET`; 0, 0 | profile |
 | 24 | send blocked, own `SHUT_WR` | `EPIPE` | `EPIPE` | `BrokenPipe` |
-| 25 | send blocked, peer closes with unread bytes | `EPIPE` | `ECONNRESET` | `ConnectionResetByPeer` |
-| 26 | client resets before accept | accept ok; `ECONNRESET`; 0 | the same | the same |
-| 27 | client sends 1 and closes before accept | accept ok; 1 byte; 0; send ok | the same | the same |
-| 28 | listener closes, a connection queued | client: `ECONNRESET`; 0; send `EPIPE` | the same | the same |
-| 29 | accepted connection after listener close | works | works | works |
-| 30 | connect to 127.0.0.2: source | no answer | client 127.0.0.1; server sees 127.0.0.1 | 127.0.0.1 |
-| 31 | rebind after server close: old/new reuse 0/0, 0/1, 1/0, 1/1 | in use, ok, in use, ok | in use, in use, in use, ok | Linux's |
-| 32 | rebind after client close (old reuse 1): new 0, 1 | ok, ok | ok, ok | ok |
-| 33 | `SO_ERROR` after a peer reset, twice; read | `ECONNRESET`, 0; read 0 | the same | refused |
-| 34 | `SO_ERROR` after a refused connect, twice | `ECONNREFUSED`, 0 | the same | refused |
-| 35 | both shut their send side | each reads 1 byte, then 0 | the same | the same |
+| 25 | send blocked, peer closes with unread | `EPIPE` | `ECONNRESET` | profile |
+| 26 | client resets before accept; read first | accept ok; `ECONNRESET`; 0 | the same | the same |
+| 26b | the same; send first | send `EPIPE`, `EPIPE`; reads `ECONNRESET`, 0 | send `ECONNRESET`, `EPIPE`; reads 0, 0 | profile |
+| 27 | client sends 1 and closes before accept | accept ok; 1; 0; send ok | the same | the same |
+| 28 | listener closes, a connection queued | client `ECONNRESET`; 0; send `EPIPE` | the same | the same |
+| 29 | accepted connection, listener closes | works | works | works |
+| 30 | connect to 127.0.0.2: source | no answer | 127.0.0.1 | as row 15 |
+| 31 | rebind after server close, reuse old/new 0/0, 0/1, 1/0, 1/1 | in use, ok, in use, ok | in use, in use, in use, ok | profile |
+| 32 | rebind after client close, new 0, 1 | ok, ok | ok, ok | ok |
+| 33 | `SO_ERROR` after a reset, twice; read | `ECONNRESET`, 0; read 0 | the same | refused |
+| 34 | `SO_ERROR` after a refused connect | `ECONNREFUSED`, 0 | the same | refused |
+| 35 | both shut their send side | 1 byte, 0 each | the same | the same |
+| 36 | peer resets; send first, twice; reads | `EPIPE`, `EPIPE`; `ECONNRESET`, 0 | `ECONNRESET`, `EPIPE`; 0, 0 | profile |
+| 37 | peer resets; `SHUT_WR`, `SHUT_RDWR` before reading; read | `ENOTCONN`, `ENOTCONN`; `ECONNRESET` | the same | `SocketUnconnected`; the reset still pending |
+| 38 | peer resets; read, then `SHUT_RDWR` | `ECONNRESET`; `ENOTCONN` | the same | the same |
 
-**Every row becomes a parity test** (17.15, item 4), through zio's public
-API in both builds. Where the kernels differ, the test has a column per
-host, so a kernel change is seen.
-
-**Not measured:** a listener closed while a SYN or SYN-ACK is in flight
-(loopback is too fast to catch it; the sim's rule is 17.6's).
+**Not measured:** a listener closed while a SYN or SYN-ACK is in flight.
+Loopback is too fast to catch it; the sim's rule is 17.6's.
 
 ### 17.14 Fidelity limits added to section 10
 
-Backlog overflow (panic); TIME_WAIT never expires in a run; the window is
-declared, and changes take effect at once; no retransmission timing (a
-partition holds, it does not lose); no Nagle or delayed ACK; data is not
-ACKed apart from credit; chunk sizes are a declared pattern, not an MSS;
-`shutdown(.receive)` and `SO_ERROR` refused.
+- Backlog overflow panics.
+- TIME_WAIT never expires in a run.
+- The window is declared, and a change to it takes effect at once.
+- There is no retransmission timing: a partition holds entries, it does
+  not lose them.
+- A failed client leaves its `S-prov` server endpoint in place until the
+  listener closes.
+- There is no Nagle and no delayed ACK.
+- Credit is paced at one departure per L.
+- Chunk sizes follow a declared pattern, not an MSS.
+- `shutdown(.receive)` and `SO_ERROR` are refused.
 
 ### 17.15 Test plan
 
-1. **The surface table, by reflection.** For every tag of the ev op union
-   and every `net*` field of zio's std.Io vtable (both read with
-   `@typeInfo`, so a new op or field fails the test until it gets a row),
-   and every socket state (datagram; stream open, bound, listener,
-   connecting, provisional, queued, established, half-closed, reset,
-   failed, closed; pipe end): the call gives its row's modelled result or
-   its named refusal. The rows come from 17.4 and 17.6.
-2. **An op model for streams**, in the shape of `sim_op_model_test.zig`:
-   random connects (to a listener, to none, under a partition), accepts,
-   sends and receives with scatter and gather, every chunking mode,
-   shutdowns, closes with and without unread bytes, linger 0,
-   `failStream`, window changes, cancels and deadlines, closes and
-   reopens inside a harvest, `.tcp` rules set and cleared, and UDP
-   traffic on the same address pairs. The model holds a byte list and a
-   credit count per direction, every connection's state, and the landing
-   time of every entry. It checks every result and byte, every wake
-   against 17.8's table, every landing time, the poll's clock (366ac57's
-   rule), and at the end: each waiting op's registration alone, no
-   connection, held entry or reservation left, and every window's used
-   count equal to admitted minus credited. **Required cases, each with a
-   count that must be non-zero:** two connects at one instant; a SYN
-   held past its deadline, then released; a delayed RST after the fd and
-   port were reused; a reset with bytes held; a reverse partition that
-   stalls a sender; a send parked when an RST lands; `.both` with a
-   receive parked, with unread bytes, and with late data; a cancel at
-   each handshake state; a UDP flow and a TCP connection on one address
-   pair.
-3. **Replay.** Ten fresh processes with the heap moved give one
-   transcript per direction, wire digest, trace and state digest; one
-   changed byte gives another wire digest. The no-stream invariants are
-   checked directly: a no-stream run's RNG position, trace and digests at
-   the end equal those of the same run built without the stream code.
-4. **Parity, both builds.** Rows 2, 3, 5, 7, 9, 12, 14, 16 to 35 as a Zig
-   table test through zio's public API (and std.Io where the users use
-   it), on real loopback without sim and in a sim run with it. Without
-   sim it runs on macOS (kqueue) and on Linux with the readiness backend
-   and with io_uring, because they reach errors by different paths.
-5. **Mutants** in each slice's commit; a survivor is killed by a new check
-   or explained.
-6. **The users.** starh2's three sim steps keep their hashes; a new
-   `dst-conn` step runs the accept loop and admission through `connect`.
-   hotseat (after t-4110): a `TestHost` HTTPS request and an RTSP
-   exchange with the default chunking, a failure after a delivered prefix
-   (`failStream` mid-reply), an accept canceled, and starh2's `.both`
-   waking a blocked pump. Each checks the ev error and the error the
-   adapter shows: std.Io maps `BrokenPipe` to `SocketUnconnected`, and a
-   buffered reader keeps the cause in its `err` field.
+1. **The surface table, by reflection.** The rows cover every tag of the
+   ev op union and every `net*` field of zio's std.Io vtable, both read
+   with `@typeInfo`, so a new tag or field fails the test until it gets a
+   row. They also cover every endpoint phase and flag combination named in
+   17.6 and 17.8. Each row carries the slice that builds it. A row of a
+   later slice is **pending**: it is counted and printed, and never
+   counted as passed. Each slice's gate checks that the pending rows are
+   exactly the rows of later slices, and the last slice requires none.
+2. **An op model for streams**, in the shape of `sim_op_model_test.zig`,
+   run once per profile, plus a run with no profile that must panic at
+   exactly the points 17.8 names.
+   - **It holds:** per direction a byte list and every conservation
+     term; each endpoint's phase and flags; the landing time of every
+     entry.
+   - **It checks:**
+     - after every step: conservation, `credited <= read`, every result
+       and byte, and every wake against 17.8's lists;
+     - every landing time;
+     - the poll's clock (366ac57);
+     - that the dead-`conn_id` guard never fires.
+   - **Required cases**, each with a count that must not be 0:
+     - two connects at one instant, in both creation orders;
+     - a SYN held past its deadline, then released;
+     - a delayed RST after the fd and port were reused;
+     - a reset with held data;
+     - a client reset while queued, then accepted, then read first and
+       send first;
+     - a listener closed with provisional and queued endpoints;
+     - a reverse partition that stalls a sender;
+     - a send parked when an RST lands;
+     - two RSTs that land at one endpoint;
+     - `.both` with a parked receive, with unread bytes, and with late
+       data;
+     - `failStream` with entries in flight both ways;
+     - a credit that lands after its direction is terminal;
+     - a partition and a delay on one entry;
+     - a cancel at each handshake phase;
+     - a UDP flow and a TCP connection on one address pair;
+     - each chunk mode, with `.fixed = 1` at the entry limit.
+3. **Teardown, apart from TIME_WAIT (finding 14).** At `sim.end`,
+   **before** cleanup, the check fails, listing what remains, if any of
+   these is left:
+   - an unresolved op;
+   - an unretired connection: an endpoint not dead, an entry on the
+     wire or held, or a credit owed.
 
-### 17.16 Build order
+   A test must close its sockets and clear its rules first.
+   **Reservations are expected.** They are counted and printed, then
+   freed, and the check asserts that they are gone.
+4. **Replay.** Ten fresh processes with the heap moved give one transcript
+   per direction, wire digest, trace and state digest. One changed byte
+   gives another wire digest. The sensitivity tests of 17.11 also run.
+   The no-stream invariants are checked directly: in a run with no stream
+   socket, the RNG position, trace and digests at the end equal those of
+   the same run built without the stream code.
+5. **Parity.** Every row of 17.13 that the sim models is in a Zig table
+   test through zio's public API, with std.Io where the users use it.
+   It runs in a sim run with a profile, and on real sockets without
+   sim:
+   - the `.macos` column runs on macOS (kqueue);
+   - the `.linux` column runs on Linux, once with the readiness backend
+     and once with io_uring.
 
-Each slice ends at a commit with every gate of section 15 and its own
-check.
+   Rows where the kernels agree run on both hosts. A kernel change is
+   then seen.
+6. **Mutants** go in each slice's commit. A survivor is killed by a new
+   check, or explained.
+7. **The users.** starh2's three sim steps keep their hashes. A new
+   `dst-conn` step (`.linux`) runs the accept loop. For hotseat (after
+   t-4110):
+   - a `TestHost` HTTPS request and an RTSP exchange, with chunking on;
+   - a failure after a delivered prefix;
+   - an accept canceled;
+   - `.both` waking a blocked pump.
 
-| slice | builds | its own check |
+   Each checks the ev error and the adapter's error.
+
+### 17.16 Build order (requirement G)
+
+Each slice ends at a commit with the gates of section 15. **Its own gate
+covers only what it builds.** Every other row of the surface table is
+pending.
+
+| slice | builds | its own gate |
 |---|---|---|
-| 0 | the measurements (done in sitting 24: rows 16 to 35) | 17.13 |
-| 1 | the shared table with stream kinds; connections and `conn_id` on every entry; generations; TCP ports, TIME_WAIT reservations; `NetOpen`, `NetBind` with `getsockname`, `NetListen`, `NetConnect` with the full handshake, `NetAccept`, `NetClose`; every row of 17.6 except held SYNs; `TCP_NODELAY`, `SO_REUSEADDR`, advisory `SO_REUSEPORT`; the `local_address` refusal; every refusal of 17.4 | the reflection table (17.15 item 1); both users' public calls end to end (`zio.net` listen, connect, accept; std.Io listen with `reuse_address`, connect, accept); parity rows 2, 12, 14, 29, 31, 32; promise 1 pins; mutants |
-| 2 | bytes: `NetSend`, `NetRecv`, `writeSplatHeader`; chunks; window and credit; FIN, half-close, RST, linger 0, the pending reset; `.both`; every row of 17.8; `getpeername`, `bytesReadable`; `setStreamWindow`, `setStreamChunking` | the stream op model without faults; parity rows 3, 5, 7, 9, 16 to 28, 33 to 35; mutants |
-| 3 | `.tcp` rules: delay, jitter, partition and silence with holding; the refusals; `failStream`; the "no answer" connect | the op model with faults; replay (17.15 item 3) |
-| 4 | the users: starh2's `dst-conn` accept step; hotseat's tests of 17.15 item 6 | starh2's gate; hotseat's tests; an outside review |
+| 0 | measurements (sittings 24 and 25) | 17.13 |
+| 1 | the shared table, connections, `conn_id`, endpoint phases and lifetimes, retirement; ports and reservations; the profile setting; `NetOpen`, `NetBind` with `getsockname`, `NetListen`, `NetConnect` with the handshake, `NetAccept`, `NetClose` with no bytes ever sent; the listener rules of 17.6; `TCP_NODELAY`, `SO_REUSEADDR`, advisory `SO_REUSEPORT`; the `local_address` and self-bound refusals; every refusal of 17.4 | the slice 1 rows of the surface table; both users' public listen, connect and accept end to end (`zio.net`; std.Io with `reuse_address`); parity rows 2, 12, 14, 31, 32; the teardown check; promise 1 pins; mutants |
+| 2 | bytes, chunks, window, credit and conservation; FIN, RST, the two reset facts, the profiles' send and receive rules; `.both`; linger 0; `getpeername`, `bytesReadable`; window and chunking settings | the op model without faults (both profiles, and the panic run with no profile); parity rows 3, 5, 7 to 9, 16 to 29, 33 to 38; mutants |
+| 3 | `.tcp` rules with holding, `failStream`, the "no answer" connect | the op model with faults; replay; sensitivity |
+| 4 | the users: starh2's `dst-conn` accept step; hotseat's tests | starh2's gate; hotseat's tests; an outside review |
 
-### 17.17 Where this revision does not follow the review or a ruling
+### 17.17 Where this revision does not follow the review
 
-- **Ruling 4, the local half of `.both`:** I recommend Linux's answer for
-  unread and late bytes (17.8), with rows 17 and 18 and starh2's pump as
-  the evidence. The grader decides.
-- **Review 2, "keep transport state alive until its outstanding entries
-  are resolved":** followed, with one exception. An aborted connection is
-  retired at once, and its later entries are dropped by `conn_id` (17.5).
-  Keeping it alive only to drop its entries would add a state for nothing.
-- **Review 4, a "dedicated" seeded choice for equal-time TCP order:**
-  not used. TCP order at one instant is fixed by `conn_id`, direction and
-  sequence, with no draw. Every equal-time case then has one answer, so a
-  replay needs no extra RNG stream. The cost: equal-time TCP order is not
-  explored by seeds. The harvest shuffle still varies the order in which
-  their completions run.
+- **Review finding 2 asked to "keep queued receive state and any required
+  reset delivery alive".** Followed through endpoint lifetimes (17.5).
+  One difference: an RST that lands on an `S-prov` endpoint kills it at
+  once, because nothing can be queued for an endpoint that never reached
+  the queue.
+- **Review finding 9 offered "send another cumulative update when the
+  outstanding entry lands".** Not used. The receiver cannot see that
+  landing without a wire entry of its own. Credit is paced on the
+  receiver's own clock instead (one departure per L), so its timing has a
+  cause that the receiver can see.
+- **The total table is written as ordered decision lists, one per event,
+  not as a grid.** A grid of endpoint phases, flags and events is several
+  hundred cells, most of them repeating "dropped" or "refused". A list
+  covers every state by its last line, and each line names the state it
+  matches. The surface table test (17.15 item 1) enumerates the grid in
+  code, from the lists.
