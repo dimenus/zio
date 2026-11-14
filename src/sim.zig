@@ -129,12 +129,9 @@ pub const DueKind = enum(u8) {
     close = 3,
     shutdown = 4,
     /// Any ev op on a sim datagram socket (`dgramOpDone`, a landing or a
-    /// close that wakes a parked op).
+    /// close that wakes a parked op). An op without a result is checked
+    /// against its socket's generation at the harvest (`dgramOpOnItsSocket`).
     dgram = 5,
-    /// A close woke an ev op parked on a sim datagram socket. The op ends
-    /// `FileDescriptorNotASocket` whatever the fd number holds when it is
-    /// harvested: by then a new open may have reused the number.
-    dgram_closed = 6,
 };
 
 const Due = struct {
@@ -147,8 +144,6 @@ const Due = struct {
 pub const TakenDue = struct {
     c: *anyopaque,
     id: u32,
-    /// The op was woken by a close of its socket (`DueKind.dgram_closed`).
-    closed: bool,
 };
 
 var due: [max_due]Due = undefined;
@@ -158,6 +153,9 @@ var next_io_id: u32 = 0;
 const LiveOp = struct {
     c: *anyopaque,
     id: u32,
+    /// For an ev op on a sim datagram socket: the socket slot's generation
+    /// when the op was submitted (`dgramOpStart`). 0 for every other op.
+    sock_gen: u32 = 0,
 };
 
 var live: [max_live]LiveOp = undefined;
@@ -705,10 +703,11 @@ fn pushDueKind(c: *anyopaque, kind: DueKind, id: u32) void {
 fn pushDueAt(c: *anyopaque, kind: DueKind, id: u32, at: u64) void {
     if (due_len >= max_due) panic("sim: I/O due list full", .{});
     if (due_len >= live_len) panic("sim: {d} ops due but only {d} live: an op is due twice, or due without an id", .{ due_len + 1, live_len });
-    // A datagram op due later than now would wait in the list while tasks
-    // run, and one of them could close its socket and reuse the number
-    // before the harvest. See `wakeParked`.
-    if ((kind == .dgram or kind == .dgram_closed) and at != clock_ns) panic("sim: a datagram op made due at {d} ns, not now ({d} ns)", .{ at, clock_ns });
+    // A datagram op is due now, never later, so it is harvested before the
+    // clock moves. The socket generation (`dgramOpOnItsSocket`) is what keeps
+    // a closed and reopened number from reaching it; this is a second guard
+    // that keeps the window to one batch. See `wakeParked`.
+    if (kind == .dgram and at != clock_ns) panic("sim: a datagram op made due at {d} ns, not now ({d} ns)", .{ at, clock_ns });
     due[due_len] = .{
         .c = c,
         .due_at = at,
@@ -1093,7 +1092,7 @@ pub fn takeDue(out: []TakenDue) usize {
     while (i < due_len) : (i += 1) {
         if (due[i].due_at <= clock_ns) {
             if (n >= out.len) panic("sim: takeDue buffer too small", .{});
-            out[n] = .{ .c = due[i].c, .id = due[i].id, .closed = due[i].kind == .dgram_closed };
+            out[n] = .{ .c = due[i].c, .id = due[i].id };
             n += 1;
         } else {
             due[w] = due[i];
@@ -1227,6 +1226,10 @@ fn testSetNetAllocator(a: std.mem.Allocator) void {
 }
 
 var dgrams: [max_dgram]Dgram = @splat(.{});
+/// Each slot's generation: how many times it was opened in this run. An ev
+/// op records it at submit (`dgramOpStart`); a slot closed or opened again
+/// since has another, or none open.
+var dgram_gen: [max_dgram]u32 = @splat(0);
 var next_port: u16 = first_ephemeral_port;
 var dropped_no_socket: u64 = 0;
 /// Whether this run opened a datagram socket. Only then does
@@ -1247,6 +1250,7 @@ fn resetNet() void {
     }
     if (wire.items.len != 0) panic("sim: datagrams on the wire outlived the last run", .{});
     next_port = first_ephemeral_port;
+    dgram_gen = @splat(0);
     dropped_no_socket = 0;
     wire_seq = 0;
     net_used = false;
@@ -1356,6 +1360,7 @@ pub fn dgramOpen(nonblocking: bool) error{SystemResources}!i32 {
     errdefer net_alloc.free(ring);
     const meta = net_alloc.alloc(Queued, rcv_packet_limit) catch return error.SystemResources;
     dgrams[j] = .{ .used = true, .nonblocking = nonblocking, .ring = ring, .meta = meta };
+    dgram_gen[j] += 1;
     net_used = true;
     return fd_base + max_ends + @as(i32, @intCast(j));
 }
@@ -1519,9 +1524,11 @@ pub fn dgramClose(fd: i32) void {
     const d = dgramSlot("close", fd);
     // A real backend leaves such an op waiting for ever; the sim ends it, so
     // a test of close does not hang. It completes FileDescriptorNotASocket.
+    // The op's generation no longer matches the slot's, so its harvest
+    // ends it whatever the fd number holds by then.
     if (d.parked) |p| {
         d.parked = null;
-        pushDueAt(p.c, .dgram_closed, p.id, clock_ns);
+        pushDueAt(p.c, .dgram, p.id, clock_ns);
     }
     freeQueue(d);
     d.* = .{};
@@ -1541,8 +1548,41 @@ pub fn datagramsDroppedNoSocket() u64 {
 // at submit. One that has its result at once is due now, with no seeded
 // delay; one that must wait for a datagram parks on the socket.
 
-pub fn dgramOpStart(c: *anyopaque) u32 {
-    return allocOpId(c);
+/// Starts an ev op; for one on an open datagram socket (`fd`), records the
+/// socket slot's generation in the op's live entry.
+pub fn dgramOpStart(c: *anyopaque, fd: ?i32) u32 {
+    const id = allocOpId(c);
+    if (fd) |f| {
+        if (dgramIsOpen(f)) live[live_len - 1].sock_gen = dgram_gen[dgramIndex(f)];
+    }
+    return id;
+}
+
+fn dgramIndex(fd: i32) usize {
+    return @intCast(fd - fd_base - max_ends);
+}
+
+/// Whether the live op (`c`, `id`) still has the socket it was submitted on:
+/// the fd's slot is open and has the generation the op recorded. False after
+/// a close, also when a new open has reused the number since. The harvest
+/// asks this before it retries, completes or parks again an op that has no
+/// result yet; false ends the op FileDescriptorNotASocket.
+///
+/// Why a generation and not "is the number open now": a callback run inside
+/// the harvest, earlier in the same batch, can close the socket and open a
+/// new one that gets the same number (round 3 of the outside review, P1).
+/// Also a task that such a callback runs (`Executor.simCoopYield` from a
+/// CompletionQueue's owner callback). Tests: `sim: dgram ev: a receive woken
+/// by a landing whose socket a callback earlier in the same harvest ...` and
+/// `sim: dgram ev: a task that a CompletionQueue callback runs inside the
+/// harvest ...`.
+pub fn dgramOpOnItsSocket(c: *anyopaque, id: u32, fd: i32) bool {
+    for (live[0..live_len]) |l| {
+        if (l.c == c and l.id == id) {
+            return dgramIsOpen(fd) and l.sock_gen != 0 and dgram_gen[dgramIndex(fd)] == l.sock_gen;
+        }
+    }
+    panic("sim: op {d} on sim fd {d} is not live at its harvest", .{ id, fd });
 }
 
 pub fn dgramOpDone(c: *anyopaque, id: u32) void {
@@ -1755,15 +1795,14 @@ fn land(w: WireDatagram) void {
     wakeParked(d);
 }
 
-/// A landing makes the op parked on its socket due now. Landings happen only
-/// in `landDue`, at the start of `takeDue`, and that same call takes every
-/// op due by now, so the harvest runs this op before any task can close the
-/// socket or reuse its number: the op only ever sees the socket it parked
-/// on. A close that comes first wakes it as `dgram_closed` instead. So a due
-/// datagram op is never in the future (`pushDueAt` checks it), and no sim
-/// path needs a socket generation. Test: `sim: dgram ev: an op woken by a
-/// landing, with its socket closed and its number reused near that time,
-/// ...`.
+/// A landing makes the op parked on its socket due now; `takeDue` takes it in
+/// the same call. Between that and the op's own harvest, earlier entries of
+/// the batch run their callbacks, and one of them (or a task it runs) can
+/// close the socket and reuse its number. So the harvest checks the op's
+/// socket generation (`dgramOpOnItsSocket`), not the fd number. `pushDueAt`
+/// still refuses a datagram op due later than now: a wait across a clock
+/// step would widen that window to every task, and the generation check is
+/// the guard, that refusal only a second one.
 fn wakeParked(d: *Dgram) void {
     const p = d.parked orelse return;
     d.parked = null;
@@ -5130,7 +5169,9 @@ test "sim: dgram ev: 64 sockets, each with a parked receive, all woken at one vi
 /// A's number, and maybe sends that one a datagram, all near the landing's
 /// virtual time. The old op must end with A's datagram, or
 /// FileDescriptorNotASocket, soon; never with the new socket's datagram, and
-/// never by waiting on the new socket.
+/// never by waiting on the new socket. (A task here runs only between polls.
+/// Inside a harvest it takes a callback or a CompletionQueue's coop yield:
+/// the `dg_batch_close` and `dg_coop_close` tests.)
 const dg_land_close = struct {
     const Kind = enum { recv, poll };
     const Outcome = enum { got_old, not_a_socket };
@@ -5242,6 +5283,327 @@ test "sim: dgram ev: an op woken by a landing, with its socket closed and its nu
 /// in one harvest, each finishing without deferral. The first one's group
 /// callback cancels the second, which then completes through the cancel; the
 /// harvest must not complete it again from its batch.
+/// Round 3 of the outside review, P1, the callback route: two receives woken
+/// by landings at one virtual time are in one harvest batch. The first one's
+/// callback (not deferred, so it runs inside the harvest) closes the other's
+/// socket, opens a socket that gets the same fd number, binds it to the same
+/// port and sends "new" to it. The second receive must end
+/// FileDescriptorNotASocket: its socket is gone, whatever the number holds.
+/// With `use_poll`, both ops are polls for reading instead of receives.
+const dg_batch_close = struct {
+    var use_poll = false;
+    var polls: [2]dg.ev.NetPoll = undefined;
+    var fds: [2]i32 = undefined;
+    var ports: [2]u16 = undefined;
+    var ops: [2]dg.ev.NetRecvFrom = undefined;
+    var bufs: [2][8]u8 = undefined;
+    var iovs: [2][1]dg.os_net.iovec = undefined;
+    var froms: [2]dg.os_net.sockaddr.in = undefined;
+    var from_lens: [2]dg.os_net.socklen_t = undefined;
+    var calls: [2]u32 = .{ 0, 0 };
+    var first: ?usize = null;
+    var reopened: i32 = -1;
+    var tx: i32 = -1;
+
+    fn onRecv(_: *dg.ev.Loop, c: *dg.ev.Completion) void {
+        const k: usize = @intFromPtr(c.userdata.?) - 1;
+        calls[k] += 1;
+        if (first != null) return;
+        first = k;
+        // Close the other receive's socket and take its number and port.
+        const other = 1 - k;
+        dg.os_net.close(fds[other]);
+        reopened = dg.open() catch @panic("open");
+        dg.bindTo(reopened, dg.addr(127, 0, 0, 1, ports[other])) catch @panic("bind");
+        _ = dg.sendFrom(tx, dg.addr(127, 0, 0, 1, ports[other]), null, "new") catch @panic("send");
+    }
+
+    fn body() !void {
+        calls = .{ 0, 0 };
+        first = null;
+        reopened = -1;
+        tx = try dg.open();
+        const loop = &dg.rt_mod.getCurrentExecutor().loop;
+        for (0..2) |k| {
+            fds[k] = try dg.open();
+            try dg.bindTo(fds[k], dg.addr(127, 0, 0, 1, 0));
+            ports[k] = (try dg.local(fds[k])).port;
+            from_lens[k] = @sizeOf(dg.os_net.sockaddr.in);
+            ops[k] = dg.ev.NetRecvFrom.init(fds[k], .fromSlice(&bufs[k], &iovs[k]), .{}, @ptrCast(&froms[k]), &from_lens[k]);
+            polls[k] = dg.ev.NetPoll.init(fds[k], .recv);
+            const c = if (use_poll) &polls[k].c else &ops[k].c;
+            c.flags.defer_callback = false;
+            c.callback = onRecv;
+            c.userdata = @ptrFromInt(k + 1);
+            // Parks at once: the queue is empty.
+            loop.add(c);
+        }
+        // Both datagrams land at one virtual time; both receives wake.
+        for (0..2) |k| _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, ports[k]), null, "x");
+        // Long enough for "new" to land too.
+        try dg.rt_mod.sleep(.fromMilliseconds(1));
+        try std.testing.expectEqual([2]u32{ 1, 1 }, calls);
+        const k = first.?;
+        const other = 1 - k;
+        try std.testing.expectEqual(fds[other], reopened);
+        if (use_poll) {
+            try polls[k].getResult();
+            try std.testing.expectError(error.FileDescriptorNotASocket, polls[other].getResult());
+            // The replacement still holds both its datagrams: the old
+            // socket's never landed there, "new" did.
+            var buf: [8]u8 = undefined;
+            try std.testing.expectEqualStrings("new", buf[0..(try dg.recvInto(reopened, &.{&buf})).info.len]);
+            try std.testing.expectError(error.WouldBlock, dg.recvInto(reopened, &.{&buf}));
+            for ([_]i32{ reopened, fds[k], tx }) |fd| dg.os_net.close(fd);
+            return;
+        }
+        try std.testing.expectEqual(@as(usize, 1), try ops[k].getResult());
+        _ = ops[other].getResult() catch |err| {
+            try std.testing.expectEqual(error.FileDescriptorNotASocket, err);
+            // The replacement still holds its own datagram.
+            var buf: [8]u8 = undefined;
+            try std.testing.expectEqualStrings("new", buf[0..(try dg.recvInto(reopened, &.{&buf})).info.len]);
+            dg.os_net.close(reopened);
+            dg.os_net.close(fds[k]);
+            dg.os_net.close(tx);
+            return;
+        };
+        std.debug.print("seed {d}: the receive whose socket was closed in the batch got {d} bytes: \"{s}\"\n", .{ seed(), try ops[other].getResult(), bufs[other][0..try ops[other].getResult()] });
+        return error.ReceiveReachedTheReplacementSocket;
+    }
+};
+
+test "sim: dgram ev: a receive woken by a landing whose socket a callback earlier in the same harvest closes and reopens ends FileDescriptorNotASocket" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    dg_batch_close.use_poll = false;
+    for (1..17) |s| try dg.run(s, dg_batch_close.body);
+}
+
+test "sim: dgram ev: a poll woken by a landing whose socket a callback earlier in the same harvest closes and reopens ends FileDescriptorNotASocket" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    dg_batch_close.use_poll = true;
+    defer dg_batch_close.use_poll = false;
+    for (1..17) |s| try dg.run(s, dg_batch_close.body);
+}
+
+/// Round 3 of the outside review, P1, the task route: a CompletionQueue's
+/// owner callback calls `simCoopYield` when no driver waits on the queue
+/// (src/completion_queue.zig `ownerCallback`), and that runs a ready task of
+/// another executor inside the harvest. Receive A is in the queue and does
+/// not defer its finish; receive B is a task's wait on another socket; both
+/// are woken by landings at one virtual time; B is an op of this test's own
+/// on executor 0's loop, so its state can be read. Task X waits on an Event.
+/// Receive C, woken by a landing at the same time, sets that Event from its
+/// callback (not deferred). When the batch harvests C, then A, then B, C's
+/// callback makes X ready and A's owner callback runs it, inside the harvest.
+/// (A task's own I/O wait cannot be the trigger: its wake is delivered after
+/// the poll, through the loop's dispatched list.) X then closes B's socket, opens one that gets the same
+/// number and port, and sends "new" to it. B must end FileDescriptorNotASocket or with its own
+/// datagram, never with "new". `reached` counts the runs in which X ran
+/// while A was complete and B was not: inside the batch.
+const dg_coop_close = struct {
+    const CompletionQueue = @import("completion_queue.zig").CompletionQueue;
+    var sa: i32 = -1;
+    var sb: i32 = -1;
+    var sc: i32 = -1;
+    var port_b: u16 = 0;
+    var tx: i32 = -1;
+    var a: dg.ev.NetRecvFrom = undefined;
+    var a_buf: [8]u8 = undefined;
+    var a_iov: [1]dg.os_net.iovec = undefined;
+    var b: dg.ev.NetRecvFrom = undefined;
+    var b_buf: [8]u8 = undefined;
+    var b_iov: [1]dg.os_net.iovec = undefined;
+    var b_calls: u32 = 0;
+    var x_closed: bool = false;
+    var go: @import("sync/Event.zig") = .init;
+    var c_op: dg.ev.NetRecvFrom = undefined;
+    var c_buf: [8]u8 = undefined;
+    var c_iov: [1]dg.os_net.iovec = undefined;
+    var reached: usize = 0;
+    var reopened: i32 = -1;
+
+    fn onB(_: *dg.ev.Loop, _: *dg.ev.Completion) void {
+        b_calls += 1;
+    }
+
+    fn onC(_: *dg.ev.Loop, _: *dg.ev.Completion) void {
+        go.set();
+    }
+
+    fn closer() void {
+        go.wait() catch return;
+        if (b.c.has_result) return;
+        if (a.c.has_result) reached += 1;
+        x_closed = true;
+        dg.os_net.close(sb);
+        reopened = dg.open() catch @panic("open");
+        dg.bindTo(reopened, dg.addr(127, 0, 0, 1, port_b)) catch @panic("bind");
+        _ = dg.sendFrom(tx, dg.addr(127, 0, 0, 1, port_b), null, "new") catch @panic("send");
+    }
+
+    fn driver(x_exec: u6) !void {
+        b_calls = 0;
+        x_closed = false;
+        reopened = -1;
+        sa = try dg.open();
+        sb = try dg.open();
+        sc = try dg.open();
+        tx = try dg.open();
+        try dg.bindTo(sa, dg.addr(127, 0, 0, 1, 0));
+        try dg.bindTo(sb, dg.addr(127, 0, 0, 1, 0));
+        try dg.bindTo(sc, dg.addr(127, 0, 0, 1, 0));
+        port_b = (try dg.local(sb)).port;
+        var cq = CompletionQueue.init();
+        a = dg.ev.NetRecvFrom.init(sa, .fromSlice(&a_buf, &a_iov), .{}, null, null);
+        a.c.flags.defer_callback = false;
+        try cq.submit(&a.c);
+        b = dg.ev.NetRecvFrom.init(sb, .fromSlice(&b_buf, &b_iov), .{}, null, null);
+        b.c.callback = onB;
+        // Parks at once: the queue is empty.
+        dg.rt_mod.getCurrentExecutor().loop.add(&b.c);
+        go = .init;
+        c_op = dg.ev.NetRecvFrom.init(sc, .fromSlice(&c_buf, &c_iov), .{}, null, null);
+        c_op.c.flags.defer_callback = false;
+        c_op.c.callback = onC;
+        dg.rt_mod.getCurrentExecutor().loop.add(&c_op.c);
+        var x = try dg.runtime.spawnInto(.{ .executor = x_exec }, closer, .{});
+        // Let X park on the Event.
+        try dg.rt_mod.sleep(.fromNanoseconds(1));
+        _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, (try dg.local(sc)).port), null, "c");
+        _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, (try dg.local(sa)).port), null, "a");
+        _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, port_b), null, "b");
+        try dg.rt_mod.sleep(.fromMilliseconds(1));
+        x.join();
+        try std.testing.expectEqual(@as(u32, 1), b_calls);
+        try std.testing.expectEqual(&a.c, try cq.wait());
+        try std.testing.expectEqual(@as(usize, 1), try a.getResult());
+        if (b.getResult()) |n| {
+            if (!std.mem.eql(u8, b_buf[0..n], "b")) {
+                std.debug.print("seed {d}: receive B got \"{s}\" after its socket was closed and its number reused\n", .{ seed(), b_buf[0..n] });
+                return error.ReceiveReachedTheReplacementSocket;
+            }
+        } else |err| {
+            if (!x_closed) return err;
+            try std.testing.expectEqual(error.FileDescriptorNotASocket, err);
+        }
+        dg.os_net.close(sa);
+        dg.os_net.close(sc);
+        dg.os_net.close(if (x_closed) reopened else sb);
+        dg.os_net.close(tx);
+    }
+
+    fn run(seed_value: u64, x_exec: u6) !void {
+        begin(seed_value);
+        defer end();
+        var o: dg.rt_mod.RuntimeOptions = .{ .executors = .exact(2), .thread_pool = .{ .max_threads = 0 } };
+        o.stack_pool.shrink_interval = .zero;
+        const rt = try dg.rt_mod.Runtime.init(std.heap.page_allocator, o);
+        defer rt.deinit();
+        dg.runtime = rt;
+        var h = try rt.spawnInto(.{ .executor = 0 }, driver, .{x_exec});
+        try h.join();
+    }
+};
+
+test "sim: dgram ev: a task that a CompletionQueue callback runs inside the harvest closes and reopens the socket of a receive later in the batch, which ends FileDescriptorNotASocket" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    dg_coop_close.reached = 0;
+    for (1..65) |s| {
+        for ([_]u6{ 0, 1 }) |x_exec| {
+            dg_coop_close.run(s, x_exec) catch |err| {
+                std.debug.print("seed {d}, closer on executor {d}: {t}\n", .{ s, x_exec, err });
+                return err;
+            };
+        }
+    }
+    std.debug.print("128 runs; the closer ran inside the harvest batch in {d}\n", .{dg_coop_close.reached});
+    try std.testing.expect(dg_coop_close.reached > 0);
+}
+
+/// Round 3, P1, the pipe side: pipe ends are never reused within a run, so
+/// no replacement can take an op's number; but a callback earlier in a batch
+/// can close the end of an op later in it. Receive R parks on end 0. Send S on
+/// end 1 copies "data" into end 0 and wakes R; both are due after the seeded
+/// delay, and when the delays are equal they share a batch. S's callback (not
+/// deferred) closes end `close_end` with an ev close. R must then get the
+/// bytes it was woken for, as a kernel reader blocked when another thread
+/// closes the descriptor does: the bytes are in the buffer, and the close is
+/// end of stream only after them.
+const pipe_batch_close = struct {
+    var fds: [2]i32 = undefined;
+    var close_end: usize = 0;
+    var r: dg.ev.NetRecv = undefined;
+    var r_buf: [16]u8 = undefined;
+    var r_iov: [1]dg.os_net.iovec = undefined;
+    var s_op: dg.ev.NetSend = undefined;
+    var s_iov: [1]dg.os_net.iovec_const = undefined;
+    var cl: dg.ev.NetClose = undefined;
+    var r_calls: u32 = 0;
+    var reached: usize = 0;
+    var r_clock: u64 = 0;
+    var s_clock: u64 = 0;
+    var r_after_s: bool = false;
+
+    fn onR(_: *dg.ev.Loop, _: *dg.ev.Completion) void {
+        r_calls += 1;
+        r_clock = clockNs();
+    }
+
+    fn onClose(_: *dg.ev.Loop, _: *dg.ev.Completion) void {}
+
+    fn onS(loop: *dg.ev.Loop, _: *dg.ev.Completion) void {
+        // R is later in this batch when it has no result yet here and
+        // completes at this same virtual time (checked in `body`).
+        r_after_s = !r.c.has_result;
+        s_clock = clockNs();
+        cl = dg.ev.NetClose.init(fds[close_end]);
+        // A completion with no callback is a task wake (the loop's
+        // dispatched list); this one belongs to no task.
+        cl.c.callback = onClose;
+        loop.add(&cl.c);
+    }
+
+    fn body() !void {
+        fds = pipePair();
+        r_calls = 0;
+        const loop = &dg.rt_mod.getCurrentExecutor().loop;
+        r = dg.ev.NetRecv.init(fds[0], .fromSlice(&r_buf, &r_iov), .{});
+        r.c.flags.defer_callback = false;
+        r.c.callback = onR;
+        loop.add(&r.c);
+        s_op = dg.ev.NetSend.init(fds[1], .fromSlice("data", &s_iov), .{});
+        s_op.c.flags.defer_callback = false;
+        s_op.c.callback = onS;
+        loop.add(&s_op.c);
+        try dg.rt_mod.sleep(.fromMilliseconds(20));
+        try std.testing.expectEqual(@as(u32, 1), r_calls);
+        if (r_after_s and r_clock == s_clock) reached += 1;
+        try std.testing.expectEqual(@as(usize, 4), try s_op.getResult());
+        try std.testing.expectEqualStrings("data", r_buf[0..try r.getResult()]);
+        try cl.getResult();
+        var other = dg.ev.NetClose.init(fds[1 - close_end]);
+        try dg.io_common.waitForIo(&other.c);
+        try other.getResult();
+    }
+};
+
+test "sim: pipe: a receive later in a batch whose end, or whose peer's end, a callback earlier in it closes gets the bytes it was woken for" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    pipe_batch_close.reached = 0;
+    for ([_]usize{ 0, 1 }) |e| {
+        pipe_batch_close.close_end = e;
+        for (1..33) |s| {
+            dg.run(s, pipe_batch_close.body) catch |err| {
+                std.debug.print("seed {d}, closing end {d}: {t}\n", .{ s, e, err });
+                return err;
+            };
+        }
+    }
+    std.debug.print("64 runs; the close came before the receive's harvest in the same batch in {d}\n", .{pipe_batch_close.reached});
+    try std.testing.expect(pipe_batch_close.reached > 0);
+}
+
 const dg_race = struct {
     var calls: [2]u32 = .{ 0, 0 };
 

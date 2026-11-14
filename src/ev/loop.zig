@@ -1866,7 +1866,7 @@ pub const Loop = struct {
     /// (`sim.land`). A result is due at once, with no seeded delay: unlike a
     /// pipe, a datagram's timing is the wire's (`sim.wire_latency_ns`).
     fn submitSimDgram(c: *Completion) void {
-        const id = sim.dgramOpStart(c);
+        const id = sim.dgramOpStart(c, simOpHandle(c));
         if (tryDgramOp(c)) {
             sim.dgramOpDone(c, id);
         } else {
@@ -1958,10 +1958,12 @@ pub const Loop = struct {
             if (!sim.isLive(buf[i].c, buf[i].id)) continue;
             const c: *Completion = @ptrCast(@alignCast(buf[i].c));
             if (!c.has_result) dgram: {
-                // A parked datagram op that a landing or a close made due.
+                // A parked datagram op that a landing or a close made due. It
+                // must still have the socket it was submitted on: an earlier
+                // entry's callback may have closed it and reused its number.
                 const h = simOpHandle(c) orelse break :dgram;
                 if (!sim.isDgramFd(h)) break :dgram;
-                if (buf[i].closed or !sim.dgramIsOpen(h)) {
+                if (!sim.dgramOpOnItsSocket(buf[i].c, buf[i].id, h)) {
                     c.setError(error.FileDescriptorNotASocket);
                 } else if (!tryDgramOp(c)) {
                     sim.dgramPark(h, c, buf[i].id, simDgramWait(c));

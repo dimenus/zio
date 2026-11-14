@@ -681,14 +681,14 @@ select adapter, which 9ecfbc6 removed.
   full buffer` (5 seeds x 1000 steps; six mutants killed). No defect found.
   The pipe buffer is not a ring (`drainBuf` moves the rest to the front),
   so it has no wrap. Pipe ends are never reused within a run.
-- **The owner's case after finding 2, checked in 2990bc2:** an op woken by
-  a landing, with its socket closed and its number reused near that time.
-  It cannot run against the new socket: a landing wakes an op only inside
-  `takeDue`, which harvests it in the same call, before any task runs.
-  `pushDueAt` panics if a datagram op is ever made due later than now, and
-  `sim: dgram ev: an op woken by a landing, with its socket closed and its
-  number reused near that time, ...` runs the sequence (180 runs). No socket
-  generation was added; see "Next".
+- **The owner's case after finding 2, checked in 2990bc2, and wrong:** an
+  op woken by a landing, with its socket closed and its number reused near
+  that time. 2990bc2 argued it cannot run against the new socket because
+  `takeDue` harvests it in the same call. Round 3 (P1) showed the gap is
+  between the entries of one harvest batch: an earlier entry's callback, or
+  a task that a CompletionQueue callback runs (`simCoopYield`), can close
+  the socket and reuse its number. Fixed with a socket generation (round 3
+  below).
 - **Open, not done:** t-4096, a zero-length receive on an empty sim pipe
   parks; check what the kernels do first.
 
@@ -735,6 +735,21 @@ fix, then the fix and mutants. Each commit has the failing output.
   flows that share a landing instant against an op model; a waiting pipe
   op with a deferred callback; a zero-room pipe receive (t-4096).
 
+### Round 3 of the outside review (gpt-simnet5.md, of b9b9bd1)
+
+F1's guard (`isLive`, `endOp`) was found sound.
+
+- **P1, fixed (the commit that adds `dgramOpOnItsSocket`):** a
+  receive or poll woken by a landing could reach a socket that reused its
+  number, because a callback earlier in the same harvest batch, or a task
+  that a CompletionQueue owner callback runs (`simCoopYield`), closed and
+  reopened it. Each datagram slot now has a generation; an ev op records it
+  at submit, and the harvest ends an op without a result
+  FileDescriptorNotASocket when it no longer matches
+  (`dgramOpOnItsSocket`). This replaces the `dgram_closed` due kind: one
+  mechanism. The pipe side has no reuse; a callback that closes an end
+  earlier in a batch leaves a later receive its bytes (tested).
+
 ### Next
 
 - **For hotseat, not zio:** ENet's receive returns 0 for an empty datagram,
@@ -742,9 +757,8 @@ fix, then the fix and mutants. Each commit has the failing output.
   service call. Later datagrams wait for the next call.
 - **Phase 2** (section 12): faults, counters, validation, promises 2 and 3.
   If a fault delays the wake of an op that a landing makes due, the check
-  in `pushDueAt` fires. Then each parked and due op must carry its
-  socket's generation, checked at the harvest, so the harvest no longer
-  trusts the fd number.
+  in `pushDueAt` fires. The socket generation already protects such an op;
+  that check can then be dropped, after a test of a delayed wake.
 
 ### Decided by the design's owner (2026-11-14, after reports 6-8)
 
