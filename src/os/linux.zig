@@ -1,4 +1,5 @@
 const std = @import("std");
+const sim = @import("../sim.zig");
 const posix = @import("posix.zig");
 
 const unexpectedError = @import("base.zig").unexpectedError;
@@ -82,6 +83,7 @@ pub fn io_uring_enter2(
     arg: ?*const io_uring_getevents_arg,
     argsz: usize,
 ) !u32 {
+    sim.refuseSimFd(@src(), fd);
     const SYS_io_uring_enter = 426; // syscall number for io_uring_enter2
 
     const rc = linux.syscall6(

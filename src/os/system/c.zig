@@ -11,6 +11,7 @@
 //! Cross-checked against headers for consistency. Values vary by OS.
 
 const std = @import("std");
+const sim = @import("../../sim.zig");
 const builtin = @import("builtin");
 const native_os = builtin.os.tag;
 const c = std.c;
@@ -354,6 +355,7 @@ pub const utimensat = libc.utimensat;
 /// reported through `new_offset`, to match the Linux syscall wrapper, which
 /// cannot return it on 32-bit platforms.
 pub fn lseek(fd: i32, offset: off_t, whence: u32, new_offset: ?*u64) off_t {
+    sim.refuseSimFd(@src(), fd);
     const rc = libc.lseek(fd, offset, @intCast(whence));
     if (rc == -1) return -1;
     if (new_offset) |out| out.* = @intCast(rc);

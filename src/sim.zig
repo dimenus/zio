@@ -1191,6 +1191,22 @@ pub fn isSimFd(fd: i32) bool {
     return fd >= fd_base and fd < fd_base + sim_fd_count;
 }
 
+/// The native-exit refusal (design section 3): the first line of every
+/// function in `src/os/` that takes an fd and has no sim branch of its own. A
+/// sim fd is not a kernel descriptor (section 3.3), so one that reaches a
+/// syscall is a bug; this panics, naming the function. `src` is the caller's
+/// `@src()`. Compiled out without sim, and a no-op outside a run.
+/// `sim_exits_test.zig` fails the build when an fd-taking function lacks it.
+pub inline fn refuseSimFd(comptime src: std.builtin.SourceLocation, fd: anytype) void {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return;
+    if (isSimFd(@intCast(fd))) refuse("sim: sim fd {d} reached the native exit " ++ src.file ++ " " ++ src.fn_name, .{fd});
+}
+
+/// `refuseSimFd` for a function that takes several fds, as a tuple.
+pub inline fn refuseSimFds(comptime src: std.builtin.SourceLocation, fds: anytype) void {
+    inline for (fds) |fd| refuseSimFd(src, fd);
+}
+
 /// Whether `fd` is in the datagram part of the sim fd range (open or not).
 pub fn isDgramFd(fd: i32) bool {
     return isSimFd(fd) and fd >= fd_base + max_ends;
@@ -4949,4 +4965,128 @@ test "sim: dgram trace: ten fresh processes with the heap moved give one transcr
     const t_at = (std.mem.indexOf(u8, first.?, "transcript=") orelse return error.NoTranscript) + "transcript=".len;
     try std.testing.expectEqual(@as(usize, 156), first.?.len - t_at);
     std.debug.print("10 children: {s}\n", .{first.?[0..@min(first.?.len, 90)]});
+}
+
+test {
+    _ = @import("sim_exits_test.zig");
+}
+
+// ---- Phase 1: the native-exit refusals, one test per class of exit ----
+
+test "sim: exits refuse: a read of a sim fd" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: exits refuse: a read of a sim fd", "sim: sim fd 100000 reached the native exit os/fs.zig read", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = pipePair()[0];
+            var buf: [4]u8 = undefined;
+            _ = try @import("os/fs.zig").read(fd, &buf);
+        }
+    }.body);
+}
+
+test "sim: exits refuse: a socket call on a sim pipe fd" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: exits refuse: a socket call on a sim pipe fd", "sim: sim fd 100000 reached the native exit os/net.zig listen", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = pipePair()[0];
+            try @import("os/net.zig").listen(fd, 8);
+        }
+    }.body);
+}
+
+test "sim: exits refuse: fcntl on a sim fd" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: exits refuse: fcntl on a sim fd", "sim: sim fd 100000 reached the native exit os/posix.zig setNonblocking", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = pipePair()[0];
+            try @import("os/posix.zig").setNonblocking(fd);
+        }
+    }.body);
+}
+
+test "sim: exits refuse: an ioctl on a sim fd" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: exits refuse: an ioctl on a sim fd", "sim: sim fd 100000 reached the native exit os/fs.zig isTty", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = pipePair()[0];
+            _ = @import("os/fs.zig").isTty(fd);
+        }
+    }.body);
+}
+
+test "sim: exits refuse: a poll set of sim pipe fds" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: exits refuse: a poll set of sim pipe fds", "sim: poll on sim fd 100000, which is not a datagram socket", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = pipePair()[0];
+            var fds = [1]dg.os_net.pollfd{.{ .fd = fd, .events = dg.os_net.POLL.IN, .revents = 0 }};
+            _ = try dg.os_net.poll(&fds, 0);
+        }
+    }.body);
+}
+
+test "sim: exits refuse: a file close of a sim fd" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: exits refuse: a file close of a sim fd", "sim: sim fd 100000 reached the native exit os/fs.zig close", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = pipePair()[0];
+            try @import("os/fs.zig").close(fd);
+        }
+    }.body);
+}
+
+test "sim: exits refuse: a posix close of a sim fd" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: exits refuse: a posix close of a sim fd", "sim: sim fd 100000 reached the native exit os/posix.zig close", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = pipePair()[0];
+            @import("os/posix.zig").close(fd);
+        }
+    }.body);
+}
+
+test "sim: exits refuse: a socket close of a sim pipe fd" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: exits refuse: a socket close of a sim pipe fd", "sim: sim fd 100000 reached the native exit os/net.zig close", struct {
+        fn body() !void {
+            try r3.up();
+            const fd = pipePair()[0];
+            dg.os_net.close(fd);
+        }
+    }.body);
+}
+
+const exits_cb = struct {
+    const Timer = @import("ev/completion.zig").Timer;
+    const Loop = @import("ev/loop.zig").Loop;
+    const Completion = @import("ev/completion.zig").Completion;
+    var timer: Timer = undefined;
+    var fd: i32 = 0;
+
+    /// A loop callback has no task, so a file close there takes the
+    /// blocking dispatch (`ev/blocking.zig` `executeBlocking`).
+    fn onTimer(_: *Loop, _: *Completion) void {
+        @import("fs.zig").File.fromFd(fd).close();
+    }
+};
+
+test "sim: exits refuse: File.fromFd(sim fd).close() in a loop callback, through the blocking dispatch" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: exits refuse: File.fromFd(sim fd).close() in a loop callback, through the blocking dispatch", "sim: sim fd 100000 reached the native exit os/fs.zig close", struct {
+        fn body() !void {
+            try r3.up();
+            exits_cb.fd = pipePair()[0];
+            exits_cb.timer = exits_cb.Timer.init(.{ .duration = .fromMilliseconds(1) });
+            exits_cb.timer.c.callback = exits_cb.onTimer;
+            r3.rt.main_executor.loop.add(&exits_cb.timer.c);
+            try r3.rt.sleep(.fromMilliseconds(5));
+        }
+    }.body);
 }

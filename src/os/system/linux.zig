@@ -10,6 +10,7 @@
 //! Cross-checked against headers for consistency.
 
 const std = @import("std");
+const sim = @import("../../sim.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 
@@ -153,6 +154,7 @@ pub fn errno(rc: usize) E {
 }
 
 pub fn fchmodat(dirfd: fd_t, path: [*:0]const u8, mode: mode_t, flags: u32) usize {
+    sim.refuseSimFd(@src(), dirfd);
     if (flags != 0) {
         // fchmodat2 required for flags support (Linux 6.6+)
         return linux.syscall4(
@@ -172,6 +174,7 @@ pub fn fchmodat(dirfd: fd_t, path: [*:0]const u8, mode: mode_t, flags: u32) usiz
 }
 
 pub fn fchownat(dirfd: fd_t, path: [*:0]const u8, owner: uid_t, group: gid_t, flags: u32) usize {
+    sim.refuseSimFd(@src(), dirfd);
     return linux.syscall5(
         .fchownat,
         @as(usize, @bitCast(@as(isize, dirfd))),
@@ -183,6 +186,7 @@ pub fn fchownat(dirfd: fd_t, path: [*:0]const u8, owner: uid_t, group: gid_t, fl
 }
 
 pub fn faccessat(dirfd: fd_t, path: [*:0]const u8, mode: u32, flags: u32) usize {
+    sim.refuseSimFd(@src(), dirfd);
     if (flags == 0) {
         return linux.syscall3(
             .faccessat,
@@ -201,6 +205,7 @@ pub fn faccessat(dirfd: fd_t, path: [*:0]const u8, mode: u32, flags: u32) usize 
 }
 
 pub fn linkat(oldfd: fd_t, oldpath: [*:0]const u8, newfd: fd_t, newpath: [*:0]const u8, flags: u32) usize {
+    sim.refuseSimFds(@src(), .{ oldfd, newfd });
     return linux.syscall5(
         .linkat,
         @as(usize, @bitCast(@as(isize, oldfd))),
@@ -247,6 +252,7 @@ pub fn munmap(addr: [*]const u8, len: usize) usize {
 }
 
 pub fn mmap(addr: ?[*]u8, len: usize, prot: u32, flags: u32, fd: i32, offset: i64) usize {
+    sim.refuseSimFd(@src(), fd);
     if (route_mmap_through_libc) {
         const res = std.c.mmap(@ptrCast(@alignCast(addr)), len, @bitCast(prot), @bitCast(flags), fd, @intCast(offset));
         // libc reports failure as MAP_FAILED, which is (void *)-1
@@ -280,6 +286,7 @@ pub fn mmap(addr: ?[*]u8, len: usize, prot: u32, flags: u32, fd: i32, offset: i6
 /// position is reported through `new_offset`, because it does not fit in the
 /// return value on 32-bit platforms.
 pub fn lseek(fd: i32, offset: off_t, whence: u32, new_offset: ?*u64) usize {
+    sim.refuseSimFd(@src(), fd);
     if (@sizeOf(usize) == 4) {
         // 32-bit platforms use llseek, which returns 0 on success and reports
         // the resulting position through a pointer.
@@ -402,6 +409,7 @@ pub fn sigaction(sig: SIG, act: ?*const Sigaction, oact: ?*Sigaction) usize {
 }
 
 pub fn utimensat(dirfd: fd_t, path: ?[*:0]const u8, times: ?*const [2]timespec, flags: u32) usize {
+    sim.refuseSimFd(@src(), dirfd);
     if (@hasField(linux.SYS, "utimensat")) {
         return linux.syscall4(
             .utimensat,
@@ -422,6 +430,7 @@ pub fn utimensat(dirfd: fd_t, path: ?[*:0]const u8, times: ?*const [2]timespec, 
 }
 
 pub fn unlinkat(dirfd: fd_t, path: [*:0]const u8, flags: u32) usize {
+    sim.refuseSimFd(@src(), dirfd);
     return linux.syscall3(
         .unlinkat,
         @as(usize, @bitCast(@as(isize, dirfd))),
@@ -438,10 +447,12 @@ pub const RENAME = packed struct(u32) {
 };
 
 pub fn renameat(oldfd: fd_t, oldpath: [*:0]const u8, newfd: fd_t, newpath: [*:0]const u8) usize {
+    sim.refuseSimFds(@src(), .{ oldfd, newfd });
     return renameat2(oldfd, oldpath, newfd, newpath, .{});
 }
 
 pub fn renameat2(oldfd: fd_t, oldpath: [*:0]const u8, newfd: fd_t, newpath: [*:0]const u8, flags: RENAME) usize {
+    sim.refuseSimFds(@src(), .{ oldfd, newfd });
     if (@hasField(linux.SYS, "renameat2")) {
         return linux.syscall5(
             .renameat2,
@@ -476,6 +487,7 @@ pub const SYNC_FILE_RANGE = packed struct(u32) {
 pub const has_sync_file_range = @sizeOf(usize) == 8;
 
 pub fn sync_file_range(fd: fd_t, offset: u64, nbytes: u64, flags: SYNC_FILE_RANGE) usize {
+    sim.refuseSimFd(@src(), fd);
     comptime std.debug.assert(has_sync_file_range);
     if (@hasField(linux.SYS, "sync_file_range")) {
         return linux.syscall4(
@@ -498,6 +510,7 @@ pub fn sync_file_range(fd: fd_t, offset: u64, nbytes: u64, flags: SYNC_FILE_RANG
 }
 
 pub fn mkdirat(dirfd: fd_t, path: [*:0]const u8, mode: mode_t) usize {
+    sim.refuseSimFd(@src(), dirfd);
     return linux.syscall3(
         .mkdirat,
         @as(usize, @bitCast(@as(isize, dirfd))),
@@ -532,6 +545,7 @@ pub const open_how = extern struct {
 };
 
 pub fn openat2(dirfd: fd_t, path: [*:0]const u8, how: *const open_how) usize {
+    sim.refuseSimFd(@src(), dirfd);
     return linux.syscall4(
         .openat2,
         @as(usize, @bitCast(@as(isize, dirfd))),

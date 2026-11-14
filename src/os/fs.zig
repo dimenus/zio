@@ -1,4 +1,5 @@
 const std = @import("std");
+const sim = @import("../sim.zig");
 const builtin = @import("builtin");
 const posix = @import("posix.zig");
 const darwin = @import("darwin.zig");
@@ -678,6 +679,7 @@ pub const FileSetTimestampsError = error{
 
 /// Open an existing file using openat() syscall
 pub fn openat(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags: FileOpenFlags) FileOpenError!fd_t {
+    sim.refuseSimFd(@src(), dir);
     if (builtin.os.tag == .windows) {
         if (flags.resolve_beneath) {
             if (options.resolve_beneath_mode == .strict) return error.Unsupported;
@@ -831,6 +833,7 @@ pub fn openat(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags: 
 
 /// Open a directory using openat() syscall
 pub fn dirOpen(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags: DirOpenFlags) DirOpenError!fd_t {
+    sim.refuseSimFd(@src(), dir);
     if (builtin.os.tag == .windows) {
         if (flags.resolve_beneath) {
             if (options.resolve_beneath_mode == .strict) return error.Unsupported;
@@ -955,6 +958,7 @@ pub const FileCreateError = FileOpenError;
 
 /// Create a file using openat() syscall
 pub fn createat(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags: FileCreateFlags) FileCreateError!fd_t {
+    sim.refuseSimFd(@src(), dir);
     if (builtin.os.tag == .windows) {
         if (flags.resolve_beneath) {
             if (options.resolve_beneath_mode == .strict) return error.Unsupported;
@@ -1099,6 +1103,7 @@ pub fn createat(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags
 
 /// Close a file descriptor
 pub fn close(fd: fd_t) FileCloseError!void {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag == .windows) {
         _ = w.CloseHandle(fd);
         return;
@@ -1141,6 +1146,7 @@ pub const FileLockError = error{
 /// here, this does not retry on EINTR; it surfaces error.Interrupted so the
 /// caller decides whether to retry.
 pub fn fileLock(fd: fd_t, op: FileLockOp, mode: FileLockMode) FileLockError!void {
+    sim.refuseSimFd(@src(), fd);
     switch (builtin.os.tag) {
         .windows => {
             var overlapped = std.mem.zeroes(w.OVERLAPPED);
@@ -1186,6 +1192,7 @@ pub fn fileLock(fd: fd_t, op: FileLockOp, mode: FileLockMode) FileLockError!void
 
 /// Downgrade a held exclusive whole-file lock to a shared lock.
 pub fn fileLockDowngrade(fd: fd_t) FileLockError!void {
+    sim.refuseSimFd(@src(), fd);
     switch (builtin.os.tag) {
         .windows => {
             try fileLock(fd, .shared, .non_blocking);
@@ -1199,6 +1206,7 @@ pub fn fileLockDowngrade(fd: fd_t) FileLockError!void {
 
 /// Read from file at offset using preadv()
 pub fn preadv(fd: fd_t, buffers: []iovec, offset: u64) FileReadError!usize {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag == .windows) {
         var total_read: usize = 0;
         for (buffers) |buffer| {
@@ -1247,6 +1255,7 @@ pub fn preadv(fd: fd_t, buffers: []iovec, offset: u64) FileReadError!usize {
 
 /// Write to file at offset using pwritev()
 pub fn pwritev(fd: fd_t, buffers: []const iovec_const, offset: u64) FileWriteError!usize {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag == .windows) {
         var total_written: usize = 0;
         for (buffers) |buffer| {
@@ -1291,6 +1300,7 @@ pub fn pwritev(fd: fd_t, buffers: []const iovec_const, offset: u64) FileWriteErr
 
 /// Read from file descriptor - for pipes and stream-like fds
 pub fn read(fd: fd_t, buffer: []u8) FileReadError!usize {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag == .windows) {
         const sc = try syscall_cancel.Syscall.begin();
         defer sc.finish();
@@ -1335,6 +1345,7 @@ pub fn read(fd: fd_t, buffer: []u8) FileReadError!usize {
 
 /// Read from file descriptor using readv() - for pipes and stream-like fds
 pub fn readv(fd: fd_t, buffers: []iovec) FileReadError!usize {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag == .windows) {
         const sc = try syscall_cancel.Syscall.begin();
         defer sc.finish();
@@ -1389,6 +1400,7 @@ pub fn readv(fd: fd_t, buffers: []iovec) FileReadError!usize {
 
 /// Write to file descriptor - for pipes and stream-like fds
 pub fn write(fd: fd_t, buffer: []const u8) FileWriteError!usize {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag == .windows) {
         const sc = try syscall_cancel.Syscall.begin();
         defer sc.finish();
@@ -1432,6 +1444,7 @@ pub fn write(fd: fd_t, buffer: []const u8) FileWriteError!usize {
 
 /// Write to file descriptor using writev() - for pipes and stream-like fds
 pub fn writev(fd: fd_t, buffers: []const iovec_const) FileWriteError!usize {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag == .windows) {
         const sc = try syscall_cancel.Syscall.begin();
         defer sc.finish();
@@ -1485,6 +1498,7 @@ pub fn writev(fd: fd_t, buffers: []const iovec_const) FileWriteError!usize {
 
 /// Sync file data to disk
 pub fn fileSync(fd: fd_t, flags: FileSyncFlags) FileSyncError!void {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag == .windows) {
         const success = w.FlushFileBuffers(fd);
         if (success == w.FALSE) {
@@ -1542,6 +1556,7 @@ pub fn fileSync(fd: fd_t, flags: FileSyncFlags) FileSyncError!void {
 /// needed to make data durable. `len == 0` means to the end of the file.
 /// Does nothing where the call is unavailable (other than 64-bit Linux).
 pub fn fileSyncRange(fd: fd_t, offset: u64, len: u64, flags: FileSyncRangeFlags) FileSyncRangeError!void {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag != .linux) return;
     if (!posix.sys.has_sync_file_range) return;
 
@@ -1566,6 +1581,7 @@ pub fn fileSyncRange(fd: fd_t, offset: u64, len: u64, flags: FileSyncRangeFlags)
 
 /// Move the file position by `offset` bytes, relative to the current position.
 pub fn fileSeekBy(fd: fd_t, offset: i64) FileSeekError!void {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag == .windows) {
         return seekWindows(fd, offset, w.FILE_CURRENT);
     }
@@ -1574,6 +1590,7 @@ pub fn fileSeekBy(fd: fd_t, offset: i64) FileSeekError!void {
 
 /// Set the file position to `offset` bytes from the start of the file.
 pub fn fileSeekTo(fd: fd_t, offset: u64) FileSeekError!void {
+    sim.refuseSimFd(@src(), fd);
     // Both `LARGE_INTEGER` and `off_t` are signed, so an offset past 2^63 has
     // no representation to seek to.
     const signed = std.math.cast(i64, offset) orelse return error.Unseekable;
@@ -1611,6 +1628,7 @@ fn seekPosix(fd: fd_t, offset: i64, whence: u32) FileSeekError!void {
 
 /// Rename a file using renameat() syscall
 pub fn renameat(allocator: std.mem.Allocator, old_dir: fd_t, old_path: []const u8, new_dir: fd_t, new_path: []const u8) DirRenameError!void {
+    sim.refuseSimFds(@src(), .{ old_dir, new_dir });
     if (builtin.os.tag == .windows) {
         const old_path_w = try w.pathToWide(allocator, old_dir, old_path);
         defer allocator.free(old_path_w);
@@ -1666,6 +1684,7 @@ pub fn renameat(allocator: std.mem.Allocator, old_dir: fd_t, old_path: []const u
 /// On other POSIX systems, falls back to hardlink + delete.
 /// On Windows, uses MoveFileExW without MOVEFILE_REPLACE_EXISTING.
 pub fn renameatPreserve(allocator: std.mem.Allocator, old_dir: fd_t, old_path: []const u8, new_dir: fd_t, new_path: []const u8) DirRenamePreserveError!void {
+    sim.refuseSimFds(@src(), .{ old_dir, new_dir });
     if (builtin.os.tag == .windows) {
         const old_path_w = try w.pathToWide(allocator, old_dir, old_path);
         defer allocator.free(old_path_w);
@@ -1830,6 +1849,7 @@ test "renameatPreserveFallback: rollback when source cannot be deleted" {
 
 /// Delete a file using unlinkat() syscall
 pub fn dirDeleteFile(allocator: std.mem.Allocator, dir: fd_t, path: []const u8) DirDeleteFileError!void {
+    sim.refuseSimFd(@src(), dir);
     if (builtin.os.tag == .windows) {
         const path_w = try w.pathToWide(allocator, dir, path);
         defer allocator.free(path_w);
@@ -1902,6 +1922,7 @@ pub fn dirDeleteFile(allocator: std.mem.Allocator, dir: fd_t, path: []const u8) 
 
 /// Delete a directory using unlinkat() syscall with AT_REMOVEDIR
 pub fn dirDeleteDir(allocator: std.mem.Allocator, dir: fd_t, path: []const u8) DirDeleteDirError!void {
+    sim.refuseSimFd(@src(), dir);
     if (builtin.os.tag == .windows) {
         const path_w = try w.pathToWide(allocator, dir, path);
         defer allocator.free(path_w);
@@ -1940,6 +1961,7 @@ pub fn dirDeleteDir(allocator: std.mem.Allocator, dir: fd_t, path: []const u8) D
 
 /// Create a directory using mkdirat() syscall
 pub fn mkdirat(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, mode: mode_t) DirCreateDirError!void {
+    sim.refuseSimFd(@src(), dir);
     if (builtin.os.tag == .windows) {
         const path_w = try w.pathToWide(allocator, dir, path);
         defer allocator.free(path_w);
@@ -2271,6 +2293,7 @@ pub fn errnoToDirCreateDirError(errno: posix.system.E) DirCreateDirError {
 
 /// Get the size of a file
 pub fn fileSize(fd: fd_t) FileSizeError!u64 {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag == .windows) {
         var file_size: w.LARGE_INTEGER = undefined;
         const success = w.GetFileSizeEx(fd, &file_size);
@@ -2329,6 +2352,7 @@ pub fn errnoToFileSizeError(errno: posix.system.E) FileSizeError {
 
 /// Get file metadata by file descriptor
 pub fn fstat(fd: fd_t) FileStatError!FileStatInfo {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag == .windows) {
         var info: w.BY_HANDLE_FILE_INFORMATION = undefined;
         const success = w.GetFileInformationByHandle(fd, &info);
@@ -2399,6 +2423,7 @@ pub fn fstat(fd: fd_t) FileStatError!FileStatInfo {
 
 /// Get file metadata by path relative to directory
 pub fn fstatat(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags: FileStatFlags) FileStatError!FileStatInfo {
+    sim.refuseSimFd(@src(), dir);
     if (builtin.os.tag == .windows) {
         const path_w = try w.pathToWide(allocator, dir, path);
         defer allocator.free(path_w);
@@ -2546,6 +2571,7 @@ pub fn errnoToFileStatError(errno: posix.system.E) FileStatError {
 
 /// Set file size (truncate or extend)
 pub fn fileSetSize(fd: fd_t, length: u64) FileSetSizeError!void {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag == .windows) {
         // Save current position
         var current_pos: w.LARGE_INTEGER = undefined;
@@ -2620,6 +2646,7 @@ pub const gid_t = if (builtin.os.tag == .windows) u32 else posix.system.gid_t;
 
 /// Set file permissions (mode)
 pub fn fileSetPermissions(fd: fd_t, mode: mode_t) FileSetPermissionsError!void {
+    sim.refuseSimFd(@src(), fd);
     // Windows doesn't have POSIX-style permissions
     if (builtin.os.tag == .windows) return;
 
@@ -2651,6 +2678,7 @@ pub fn errnoToFileSetPermissionsError(errno: posix.system.E) FileSetPermissionsE
 
 /// Set file owner (uid/gid)
 pub fn fileSetOwner(fd: fd_t, uid: ?uid_t, gid: ?gid_t) FileSetOwnerError!void {
+    sim.refuseSimFd(@src(), fd);
     // Windows doesn't have POSIX-style ownership
     if (builtin.os.tag == .windows) return;
 
@@ -2720,6 +2748,7 @@ fn setTimestampToFileTime(timestamp: SetTimestamp, now: w.FILETIME) ?w.FILETIME 
 
 /// Set file timestamps
 pub fn fileSetTimestamps(fd: fd_t, timestamps: FileTimestamps) FileSetTimestampsError!void {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag == .windows) {
         const now_ticks: u64 = if (timestamps.atime == .now or timestamps.mtime == .now)
             @bitCast(w.RtlGetSystemTimePrecise())
@@ -2782,6 +2811,7 @@ pub const PathSetFlags = struct {
 
 /// Set permissions of a file relative to a directory (fchmodat)
 pub fn dirSetFilePermissions(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, mode: mode_t, flags: PathSetFlags) FileSetPermissionsError!void {
+    sim.refuseSimFd(@src(), dir);
     // Windows doesn't have POSIX-style permissions
     if (builtin.os.tag == .windows) return;
 
@@ -2808,6 +2838,7 @@ pub fn dirSetFilePermissions(allocator: std.mem.Allocator, dir: fd_t, path: []co
 
 /// Set owner of a file relative to a directory (fchownat)
 pub fn dirSetFileOwner(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, uid: ?uid_t, gid: ?gid_t, flags: PathSetFlags) FileSetOwnerError!void {
+    sim.refuseSimFd(@src(), dir);
     // Windows doesn't have POSIX-style ownership
     if (builtin.os.tag == .windows) return;
 
@@ -2837,6 +2868,7 @@ pub fn dirSetFileOwner(allocator: std.mem.Allocator, dir: fd_t, path: []const u8
 
 /// Set timestamps of a file relative to a directory (utimensat)
 pub fn dirSetFileTimestamps(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, timestamps: FileTimestamps, flags: PathSetFlags) FileSetTimestampsError!void {
+    sim.refuseSimFd(@src(), dir);
     if (builtin.os.tag == .windows) {
         // On Windows, we need to open the file first, set timestamps, then close
         // For now, return success (no-op like other Windows permission functions)
@@ -2890,6 +2922,7 @@ pub const SymLinkFlags = struct {
 
 /// Create a symbolic link using symlinkat() syscall
 pub fn dirSymLink(allocator: std.mem.Allocator, dir: fd_t, target: []const u8, link_path: []const u8, flags: SymLinkFlags) SymLinkError!void {
+    sim.refuseSimFd(@src(), dir);
     _ = flags;
 
     if (builtin.os.tag == .windows) {
@@ -2952,6 +2985,7 @@ pub const ReadLinkError = error{
 
 /// Read a symbolic link using readlinkat() syscall
 pub fn dirReadLink(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, buffer: []u8) ReadLinkError!usize {
+    sim.refuseSimFd(@src(), dir);
     const path_z = allocator.dupeSentinel(u8, path, 0) catch return error.SystemResources;
     defer allocator.free(path_z);
 
@@ -2959,6 +2993,7 @@ pub fn dirReadLink(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, bu
 }
 
 pub fn dirReadLinkZ(dir: fd_t, path: [*:0]const u8, buffer: []u8) ReadLinkError!usize {
+    sim.refuseSimFd(@src(), dir);
     if (builtin.os.tag == .windows) {
         // TODO: Implement Windows readlink via DeviceIoControl with FSCTL_GET_REPARSE_POINT
         return error.Unexpected;
@@ -3018,6 +3053,7 @@ pub const HardLinkFlags = struct {
 
 /// Create a hard link using linkat() syscall
 pub fn dirHardLink(allocator: std.mem.Allocator, old_dir: fd_t, old_path: []const u8, new_dir: fd_t, new_path: []const u8, flags: HardLinkFlags) HardLinkError!void {
+    sim.refuseSimFds(@src(), .{ old_dir, new_dir });
     if (builtin.os.tag == .windows) {
         // TODO: Implement Windows hardlink via CreateHardLinkW
         return error.Unexpected;
@@ -3072,6 +3108,7 @@ pub const FileHardLinkError = HardLinkError || error{
 
 /// Create a hard link from an open file descriptor using linkat() with AT_EMPTY_PATH
 pub fn fileHardLink(allocator: std.mem.Allocator, fd: fd_t, new_dir: fd_t, new_path: []const u8, flags: HardLinkFlags) FileHardLinkError!void {
+    sim.refuseSimFds(@src(), .{ fd, new_dir });
     if (builtin.os.tag == .windows) {
         return error.OperationUnsupported;
     }
@@ -3149,6 +3186,7 @@ pub const AccessFlags = struct {
 
 /// Check file accessibility using faccessat() syscall
 pub fn dirAccess(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags: AccessFlags) DirAccessError!void {
+    sim.refuseSimFd(@src(), dir);
     if (builtin.os.tag == .windows) {
         return dirAccessWindows(allocator, dir, path, flags);
     }
@@ -3222,6 +3260,7 @@ fn dirAccessWindows(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, f
 /// Returns number of bytes read, 0 when no more entries.
 /// If restart is true, seeks to beginning first (POSIX) or passes RestartScan (Windows).
 pub fn dirRead(handle: fd_t, buffer: []u8, restart: bool) DirReadError!usize {
+    sim.refuseSimFd(@src(), handle);
     if (builtin.os.tag == .windows) {
         return dirReadWindows(handle, buffer, restart);
     } else {
@@ -3338,6 +3377,7 @@ pub const DirRealPathFileError = DirRealPathError || error{
 
 /// Get the real path of a directory fd using /proc/self/fd on Linux or F_GETPATH on macOS
 pub fn dirRealPath(fd: fd_t, buffer: []u8) DirRealPathError!usize {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag == .windows) {
         return dirRealPathWindows(fd, buffer);
     }
@@ -3421,6 +3461,7 @@ pub fn dirRealPath(fd: fd_t, buffer: []u8) DirRealPathError!usize {
 
 /// Get the real path of a file relative to a directory
 pub fn dirRealPathFile(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, buffer: []u8) DirRealPathFileError!usize {
+    sim.refuseSimFd(@src(), dir);
     if (builtin.os.tag == .windows) {
         return dirRealPathFileWindows(allocator, dir, path, buffer);
     }
@@ -3434,6 +3475,7 @@ pub fn dirRealPathFile(allocator: std.mem.Allocator, dir: fd_t, path: []const u8
 /// POSIX only; Windows paths have to be converted to UTF-16 first, which
 /// `dirRealPathFile` does.
 pub fn dirRealPathFileZ(dir: fd_t, path: [*:0]const u8, buffer: []u8) DirRealPathFileError!usize {
+    sim.refuseSimFd(@src(), dir);
     // On non-Linux with libc, we can use realpath() directly for AT_FDCWD
     if (builtin.os.tag != .linux and builtin.link_libc and dir == posix.AT.FDCWD) {
         if (buffer.len < posix.PATH_MAX) return error.NameTooLong;
@@ -3616,6 +3658,7 @@ fn dirRealPathFileWindows(allocator: std.mem.Allocator, dir: fd_t, path: []const
 
 /// Returns true if `fd` refers to a terminal.
 pub fn isTty(fd: fd_t) bool {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag == .windows) {
         // A console handle is one the console driver will report a mode for.
         var mode: w.DWORD = undefined;
@@ -3640,6 +3683,7 @@ pub fn isTty(fd: fd_t) bool {
 
 /// Returns true if ANSI escape codes written to `fd` will be interpreted.
 pub fn supportsAnsiEscapeCodes(fd: fd_t) bool {
+    sim.refuseSimFd(@src(), fd);
     if (builtin.os.tag == .windows) {
         var mode: w.DWORD = undefined;
         if (w.GetConsoleMode(fd, &mode) != w.FALSE) {

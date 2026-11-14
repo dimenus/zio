@@ -1,4 +1,5 @@
 const std = @import("std");
+const sim = @import("../sim.zig");
 const builtin = @import("builtin");
 const posix = @import("posix.zig");
 const w = @import("windows.zig");
@@ -164,6 +165,7 @@ fn win32ErrorToSetCurrentPathError(err: w.Win32Error) SetCurrentPathError {
 
 /// Change the working directory to an already open directory.
 pub fn setCurrentDir(allocator: std.mem.Allocator, fd: fs.fd_t) SetCurrentDirError!void {
+    sim.refuseSimFd(@src(), fd);
     // The cwd sentinel is not a descriptor fchdir can take, and asking for the
     // directory we are already in is a no-op anyway.
     if (fd == fs.cwd()) return;

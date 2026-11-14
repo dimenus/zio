@@ -1,4 +1,5 @@
 const std = @import("std");
+const sim = @import("../sim.zig");
 const builtin = @import("builtin");
 const posix = @import("posix.zig");
 
@@ -71,6 +72,7 @@ pub fn eventfd(initval: u32, flags: u32) !i32 {
 
 /// Read the eventfd counter (8 bytes)
 pub fn eventfd_read(fd: i32) !u64 {
+    sim.refuseSimFd(@src(), fd);
     var value: u64 = undefined;
     switch (builtin.os.tag) {
         .linux => {
@@ -105,6 +107,7 @@ pub fn eventfd_read(fd: i32) !u64 {
 
 /// Write to the eventfd counter (8 bytes)
 pub fn eventfd_write(fd: i32, value: u64) !void {
+    sim.refuseSimFd(@src(), fd);
     const bytes = std.mem.asBytes(&value);
     switch (builtin.os.tag) {
         .linux => {

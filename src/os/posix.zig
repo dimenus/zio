@@ -1,4 +1,5 @@
 const std = @import("std");
+const sim = @import("../sim.zig");
 const builtin = @import("builtin");
 
 const unexpectedError = @import("base.zig").unexpectedError;
@@ -120,6 +121,7 @@ pub fn mmap(
     fd: fd_t,
     offset: u64,
 ) MmapError![]align(std.heap.page_size_min) u8 {
+    sim.refuseSimFd(@src(), fd);
     while (true) {
         const err = if (builtin.os.tag == .linux) blk: {
             const rc = sys.mmap(ptr, len, prot, flags, fd, @bitCast(offset));
@@ -163,6 +165,7 @@ pub fn sigaltstack(ss: ?*const stack_t, old_ss: ?*stack_t) SigaltstackError!void
 }
 
 pub fn setNonblocking(fd: fd_t) error{Unexpected}!void {
+    sim.refuseSimFd(@src(), fd);
     const fl_flags = system.fcntl(fd, system.F.GETFL, @as(c_int, 0));
     switch (errno(fl_flags)) {
         .SUCCESS => {},
@@ -187,6 +190,7 @@ pub fn setNonblocking(fd: fd_t) error{Unexpected}!void {
 /// Uses lseek(fd, 0, SEEK_CUR): a no-op seek that returns ESPIPE on
 /// non-seekable descriptors without disturbing the file offset.
 pub fn isPollable(fd: fd_t) bool {
+    sim.refuseSimFd(@src(), fd);
     while (true) {
         const rc = sys.lseek(fd, 0, system.SEEK.CUR, null);
         switch (errno(rc)) {
@@ -199,6 +203,7 @@ pub fn isPollable(fd: fd_t) bool {
 }
 
 pub fn setCloexec(fd: fd_t) error{Unexpected}!void {
+    sim.refuseSimFd(@src(), fd);
     switch (errno(system.fcntl(fd, system.F.SETFD, @as(c_int, system.FD_CLOEXEC)))) {
         .SUCCESS => {},
         .BADF => unreachable,
@@ -269,6 +274,7 @@ pub fn pipe(flags: PipeFlags) PipeError![2]fd_t {
 }
 
 pub fn close(fd: fd_t) void {
+    sim.refuseSimFd(@src(), fd);
     switch (errno(system.close(fd))) {
         .SUCCESS, .INTR => return,
         .BADF => unreachable, // Invalid fd - would be a bug

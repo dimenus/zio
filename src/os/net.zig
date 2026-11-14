@@ -162,6 +162,7 @@ pub fn poll(fds: []pollfd, timeout: i32) PollError!usize {
 pub fn close(fd: fd_t) void {
     if (comptime sim_layer) {
         if (sim.isDgramFd(fd)) return sim.dgramClose(fd);
+        sim.refuseSimFd(@src(), fd);
     }
     switch (builtin.os.tag) {
         .windows => {
@@ -204,6 +205,7 @@ pub fn shutdown(fd: fd_t, how: ShutdownHow) ShutdownError!void {
     if (comptime sim_layer) {
         // An unconnected UDP socket: ENOTCONN, as Linux answers.
         if (sim.isDgramFd(fd)) return error.SocketUnconnected;
+        sim.refuseSimFd(@src(), fd);
     }
     switch (builtin.os.tag) {
         .windows => {
@@ -612,6 +614,7 @@ pub fn errnoToListenError(err: E) ListenError {
 pub fn listen(fd: fd_t, backlog: u31) ListenError!void {
     if (comptime sim_layer) {
         if (sim.isDgramFd(fd)) return error.OperationNotSupported;
+        sim.refuseSimFd(@src(), fd);
     }
     switch (builtin.os.tag) {
         .windows => {
@@ -661,6 +664,7 @@ pub const ConnectError = error{
 pub fn connect(fd: fd_t, addr: *const sockaddr, addr_len: socklen_t) ConnectError!void {
     if (comptime sim_layer) {
         if (sim.isDgramFd(fd)) sim.panic("sim: connect on sim datagram socket {d}: connected UDP is not simulated", .{fd});
+        sim.refuseSimFd(@src(), fd);
     }
     switch (builtin.os.tag) {
         .windows => {
@@ -702,6 +706,7 @@ pub const AcceptError = error{
 pub fn accept(fd: fd_t, addr: ?*sockaddr, addr_len: ?*socklen_t, flags: OpenFlags) AcceptError!fd_t {
     if (comptime sim_layer) {
         if (sim.isDgramFd(fd)) return error.OperationNotSupported;
+        sim.refuseSimFd(@src(), fd);
     }
     switch (builtin.os.tag) {
         .windows => {
@@ -1162,6 +1167,7 @@ pub fn recv(fd: fd_t, buffers: []iovec, flags: RecvFlags) RecvError!usize {
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
         if (sim.isDgramFd(fd)) return error.OperationNotSupported;
+        sim.refuseSimFd(@src(), fd);
     }
 
     const sys_flags = recvFlagsToSys(flags);
@@ -1286,6 +1292,7 @@ pub fn send(fd: fd_t, buffers: []const iovec_const, flags: SendFlags) SendError!
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
         if (sim.isDgramFd(fd)) return error.OperationNotSupported;
+        sim.refuseSimFd(@src(), fd);
     }
 
     const sys_flags = sendFlagsToSys(flags);
@@ -1665,6 +1672,7 @@ pub fn recvmmsg(
     vlen: u32,
     flags: RecvFlags,
 ) RecvError!u32 {
+    sim.refuseSimFd(@src(), fd);
     const sys_flags = recvFlagsToSys(flags);
 
     while (true) {
@@ -1721,6 +1729,7 @@ pub fn sendmmsg(
     vlen: u32,
     flags: SendFlags,
 ) SendError!u32 {
+    sim.refuseSimFd(@src(), fd);
     const sys_flags = sendFlagsToSys(flags);
 
     while (true) {
