@@ -336,6 +336,9 @@ option, and hotseat's bridge will not; `IP_TTL` is not modelled.
 - A blocking receive on a socket not set non-blocking.
 - `zio.randomSecure` and off-executor `zio.random` during a run.
 - A datagram over 65507 bytes.
+- A send or receive of more than IOV_MAX buffers (1024 on macOS and Linux,
+  measured; both kernels answer EMSGSIZE). Up to that, any count works:
+  the sim reads the caller's iovecs in place (`sim.max_iovecs`).
 
 ## 10. Fidelity limits: what is not modelled, so not tested under sim
 
@@ -919,6 +922,16 @@ the mutants in its commits.
   transcript and counts equal and only the wire digest differs. Mutants:
   `mut/20-s4.json` (4, all killed; a draw that reads a heap address is
   caught only by the fresh processes).
+- **t-4101 (sitting 21): any buffer count up to IOV_MAX.** The sim took at
+  most 16 buffers per send or receive (`sim_max_iovecs` in the socket
+  layer and in the ev loop's pipe path); ENet sends up to 65. Now the
+  limit is 1024, `sim.max_iovecs`, and the sim reads the iovecs in place,
+  so the limit costs no stack. Tests: `sim: dgram iovecs: ...`, `sim: pipe
+  iovecs: ...`, six `... of IOV_MAX + 1 buffers` refusals, `sim: enet
+  bridge: a datagram gathered from ENet's most buffers, 65, ...` (both
+  builds), and the op model's seeds 9 to 16, which gather one send in 16
+  from many buffers (215 sends of exactly 1024). Mutants:
+  `mut/21-iov.json` (17, all killed).
 - **Phase 2 is built.** Not done in it, by decision: NAT rebinding
   (t-4100). Still open from phase 1: t-4096, t-4098 (the op model's
   holes; flows sharing a landing instant are still kept out of it).

@@ -850,20 +850,49 @@ pub fn faultStats(fd: i32) FaultStats {
     return ends[i].stats;
 }
 
-fn totalLen(slices: []const []const u8) usize {
+/// The most buffers one send or receive on a sim fd takes: IOV_MAX, 1024 on
+/// macOS 25.6 and Linux 6.8 (measured with `sysconf(_SC_IOV_MAX)`, 3 runs
+/// each, sitting 21). Both kernels send and receive with 1024 and answer
+/// EMSGSIZE for 1025. The sim refuses above the limit instead, by name: a
+/// program that passes more is broken on every host, and local send errors
+/// are not modelled (design section 10). ENet builds a datagram from up to
+/// 65 (`ENET_BUFFER_MAXIMUM`, 1 + 2 * 32 commands).
+///
+/// The sim reads the caller's list in place (`bufBytes`), never copying it
+/// into an array, so the limit costs no stack: a copy would take 16 bytes
+/// per entry, 16 KiB at this limit.
+pub const max_iovecs = 1024;
+
+fn checkIovecs(comptime what: []const u8, fd: i32, n: usize) void {
+    if (n > max_iovecs) panic("sim: " ++ what ++ " of {d} buffers on sim fd {d}: the limit is IOV_MAX, {d} (the kernel answers EMSGSIZE)", .{ n, fd, max_iovecs });
+}
+
+/// One entry of a buffer list as a slice. The sim takes a list of slices
+/// (its own tests) or of the socket layer's iovecs (`base`, `len`).
+inline fn bufBytes(b: anytype) BufBytes(@TypeOf(b)) {
+    if (comptime @typeInfo(@TypeOf(b)) == .pointer) return b;
+    return b.base[0..b.len];
+}
+
+fn BufBytes(comptime T: type) type {
+    if (@typeInfo(T) == .pointer) return T;
+    return if (@FieldType(T, "base") == [*]const u8) []const u8 else []u8;
+}
+
+fn totalLen(bufs: anytype) usize {
     var n: usize = 0;
-    for (slices) |sl| n += sl.len;
+    for (bufs) |b| n += bufBytes(b).len;
     return n;
 }
 
 /// Copy from `src` (gathered across its slices) into the peer's buffer.
-pub fn sendBytes(fd: i32, src: []const []const u8, send_c: *anyopaque) IoSubmit {
+pub fn sendBytes(fd: i32, src: anytype, send_c: *anyopaque) IoSubmit {
     return copySend(fd, src, send_c, allocOpId(send_c), true);
 }
 
 /// Harvest a capacity-woken send: copy without re-queueing this completion.
 /// `id` is the submit-time id from the due entry.
-pub fn harvestSend(fd: i32, src: []const []const u8, send_c: *anyopaque, id: u32) IoSubmit {
+pub fn harvestSend(fd: i32, src: anytype, send_c: *anyopaque, id: u32) IoSubmit {
     return copySend(fd, src, send_c, id, false);
 }
 
@@ -885,7 +914,8 @@ fn resetPipe(i: u8) void {
     }
 }
 
-fn copySend(fd: i32, src: []const []const u8, send_c: *anyopaque, id: u32, schedule: bool) IoSubmit {
+fn copySend(fd: i32, src: anytype, send_c: *anyopaque, id: u32, schedule: bool) IoSubmit {
+    checkIovecs("a send", fd, src.len);
     const i = endIndex(fd) orelse {
         if (schedule) pushDueKind(send_c, .send, id);
         return .bad_fd;
@@ -944,7 +974,8 @@ fn copySend(fd: i32, src: []const []const u8, send_c: *anyopaque, id: u32, sched
         }
     }
     var copied: usize = 0;
-    for (src) |sl| {
+    for (src) |b| {
+        const sl = bufBytes(b);
         if (copied == limit) break;
         const k = @min(sl.len, limit - copied);
         @memcpy(ends[p].buf[ends[p].buf_len + copied ..][0..k], sl[0..k]);
@@ -967,7 +998,8 @@ fn atEof(i: u8) bool {
     return ends[i].buf_len == 0 and (ends[i].closed or ends[i].rd_shut or ends[p].closed or ends[p].wr_shut);
 }
 
-pub fn recvInto(fd: i32, dst: []const []u8, recv_c: *anyopaque, dont_wait: bool) IoSubmit {
+pub fn recvInto(fd: i32, dst: anytype, recv_c: *anyopaque, dont_wait: bool) IoSubmit {
+    checkIovecs("a receive", fd, dst.len);
     const id = allocOpId(recv_c);
     const i = endIndex(fd) orelse {
         pushDueKind(recv_c, .recv, id);
@@ -1006,10 +1038,11 @@ fn wakeSender(i: u8) void {
 }
 
 /// Copy buffered bytes into `dst` (scattered across its slices).
-pub fn drainBuf(fd: i32, dst: []const []u8) usize {
+pub fn drainBuf(fd: i32, dst: anytype) usize {
     const i = endIndex(fd) orelse return 0;
     var n: usize = 0;
-    for (dst) |d| {
+    for (dst) |b| {
+        const d = bufBytes(b);
         if (n == ends[i].buf_len) break;
         const k = @min(d.len, ends[i].buf_len - n);
         @memcpy(d[0..k], ends[i].buf[n..][0..k]);
@@ -1030,16 +1063,15 @@ pub fn drainBuf(fd: i32, dst: []const []u8) usize {
 /// at submit while this one is unresolved. Before that rule (round 3,
 /// findings 2 and 3) another receive could take them, and this one parked
 /// again (7c0c22e); now an empty end here is a broken invariant.
-pub fn harvestRecv(fd: i32, dst: []const []u8) usize {
+pub fn harvestRecv(fd: i32, dst: anytype) usize {
     const i = endIndex(fd) orelse panic("sim: a harvested receive on sim fd {d}, which is not a pipe end", .{fd});
-    var room: usize = 0;
-    for (dst) |d| room += d.len;
+    const room = totalLen(dst);
     if (ends[i].buf_len == 0 and room > 0) panic("sim: a woken ev receive on sim pipe fd {d} found no bytes, no end of stream and no reset: only another ev receive takes bytes, and that refuses while this one is unresolved", .{fd});
     return drainForRecv(fd, dst);
 }
 
 /// For a harvested recv: drain, and wake a sender the drain made room for.
-pub fn drainForRecv(fd: i32, dst: []const []u8) usize {
+pub fn drainForRecv(fd: i32, dst: anytype) usize {
     const n = drainBuf(fd, dst);
     if (n > 0) {
         if (endIndex(fd)) |i| wakeSender(i);
@@ -1500,8 +1532,9 @@ pub fn dgramEnableDestinationAddress(fd: i32) void {
 /// address, or for a wildcard socket any 127/8 address. Else
 /// `AddressUnavailable`, as the kernel says. Completes at once; the datagram
 /// lands `wire_latency_ns` later.
-pub fn dgramSend(fd: i32, src: []const []const u8, to: Ip4, from: ?[4]u8) error{ AddressUnavailable, SystemResources }!usize {
+pub fn dgramSend(fd: i32, src: anytype, to: Ip4, from: ?[4]u8) error{ AddressUnavailable, SystemResources }!usize {
     refuseOtherThread("sim socket send");
+    checkIovecs("a send", fd, src.len);
     const d = dgramSlot("send", fd);
     refuseNonLoopback("send to", to.ip);
     if (to.port == 0) panic("sim: send to port 0 from sim fd {d}", .{fd});
@@ -1524,7 +1557,8 @@ pub fn dgramSend(fd: i32, src: []const []const u8, to: Ip4, from: ?[4]u8) error{
     }
     const bytes = net_alloc.alloc(u8, total) catch return error.SystemResources;
     var at: usize = 0;
-    for (src) |sl| {
+    for (src) |b| {
+        const sl = bufBytes(b);
         @memcpy(bytes[at..][0..sl.len], sl);
         at += sl.len;
     }
@@ -1591,8 +1625,9 @@ pub const Received = struct {
 /// is lost: the datagram is consumed whole, as the kernel does. An empty
 /// queue is `WouldBlock` when `dont_wait` or the socket is non-blocking;
 /// otherwise the receive would block the sim thread for ever, so it refuses.
-pub fn dgramRecv(fd: i32, dst: []const []u8, dont_wait: bool) error{WouldBlock}!Received {
+pub fn dgramRecv(fd: i32, dst: anytype, dont_wait: bool) error{WouldBlock}!Received {
     refuseOtherThread("sim socket receive");
+    checkIovecs("a receive", fd, dst.len);
     const d = dgramSlot("receive", fd);
     if (d.meta_len == 0) {
         if (dont_wait or d.nonblocking) return error.WouldBlock;
@@ -1600,7 +1635,8 @@ pub fn dgramRecv(fd: i32, dst: []const []u8, dont_wait: bool) error{WouldBlock}!
     }
     const q = d.meta[d.meta_head];
     var copied: usize = 0;
-    for (dst) |buf| {
+    for (dst) |b| {
+        const buf = bufBytes(b);
         if (copied == q.len) break;
         const k = @min(buf.len, q.len - copied);
         ringRead(d, q.off + copied, buf[0..k]);
@@ -2647,31 +2683,31 @@ pub fn runWakeOrderProbe(seed_value: u64, first: WakeFirst) ProbeOut {
     var da: [1]u8 = undefined;
     var db: [1]u8 = undefined;
 
-    switch (recvInto(pa[0], &.{@as([]u8, &da)}, &ca, false)) {
+    switch (recvInto(pa[0], &[_][]u8{&da}, &ca, false)) {
         .parked => {},
         else => panic("probe: recv A should park", .{}),
     }
-    switch (recvInto(pb[0], &.{@as([]u8, &db)}, &cb, false)) {
+    switch (recvInto(pb[0], &[_][]u8{&db}, &cb, false)) {
         .parked => {},
         else => panic("probe: recv B should park", .{}),
     }
 
     const payload = "x";
     if (first == .a) {
-        switch (sendBytes(pa[1], &.{@as([]const u8, payload)}, &sa)) {
+        switch (sendBytes(pa[1], &[_][]const u8{payload}, &sa)) {
             .due => {},
             else => panic("probe: send A should complete", .{}),
         }
-        switch (sendBytes(pb[1], &.{@as([]const u8, payload)}, &sb)) {
+        switch (sendBytes(pb[1], &[_][]const u8{payload}, &sb)) {
             .due => {},
             else => panic("probe: send B should complete", .{}),
         }
     } else {
-        switch (sendBytes(pb[1], &.{@as([]const u8, payload)}, &sb)) {
+        switch (sendBytes(pb[1], &[_][]const u8{payload}, &sb)) {
             .due => {},
             else => panic("probe: send B should complete", .{}),
         }
-        switch (sendBytes(pa[1], &.{@as([]const u8, payload)}, &sa)) {
+        switch (sendBytes(pa[1], &[_][]const u8{payload}, &sa)) {
             .due => {},
             else => panic("probe: send A should complete", .{}),
         }
@@ -2708,11 +2744,11 @@ pub fn runCancelOrderProbe(seed_value: u64, first: WakeFirst) ProbeOut {
     var da: [1]u8 = undefined;
     var db: [1]u8 = undefined;
 
-    switch (recvInto(pa[0], &.{@as([]u8, &da)}, &ca, false)) {
+    switch (recvInto(pa[0], &[_][]u8{&da}, &ca, false)) {
         .parked => {},
         else => panic("probe: recv A should park", .{}),
     }
-    switch (recvInto(pb[0], &.{@as([]u8, &db)}, &cb, false)) {
+    switch (recvInto(pb[0], &[_][]u8{&db}, &cb, false)) {
         .parked => {},
         else => panic("probe: recv B should park", .{}),
     }
@@ -8967,4 +9003,223 @@ test "sim: net faults: ten fresh processes with the heap moved give one transcri
     const t_at = (std.mem.indexOf(u8, first.?, "transcript=") orelse return error.NoTranscript) + "transcript=".len;
     try std.testing.expect(first.?.len - t_at > 100);
     std.debug.print("10 children: {s}\n", .{first.?[0..@min(first.?.len, 400)]});
+}
+
+// ---- Buffer counts up to IOV_MAX (t-4101) ----
+
+/// IOV_MAX on macOS 25.6 and Linux 6.8 (measured, sitting 21). The tests
+/// state it themselves rather than read `max_iovecs`, so a sim limit set
+/// lower fails them by its refusal, not by their own array bounds.
+const kernel_iov_max = 1024;
+
+/// A datagram or pipe write gathered from `n` buffers of 1 to 3 bytes each,
+/// and receive lists of `n` buffers of the same sizes. Static, so a test of
+/// `kernel_iov_max + 1` buffers costs a task no stack.
+const many_iov = struct {
+    const os_net = @import("os/net.zig");
+    var src: [3 * (kernel_iov_max + 1)]u8 = undefined;
+    var siov: [kernel_iov_max + 1]os_net.iovec_const = undefined;
+    var dst: [3 * (kernel_iov_max + 1)]u8 = undefined;
+    var riov: [kernel_iov_max + 1]os_net.iovec = undefined;
+    var whole: [3 * (kernel_iov_max + 1)]u8 = undefined;
+    var whole_iov: [1]os_net.iovec = undefined;
+
+    fn partLen(i: usize) usize {
+        return 1 + i % 3;
+    }
+
+    /// The bytes are a count from 0 (mod 256), so order and loss both show.
+    fn gather(n: usize) []const os_net.iovec_const {
+        var at: usize = 0;
+        for (0..n) |i| {
+            for (0..partLen(i)) |j| src[at + j] = @truncate(at + j);
+            siov[i] = os_net.iovecConstFromSlice(src[at..][0..partLen(i)]);
+            at += partLen(i);
+        }
+        return siov[0..n];
+    }
+
+    fn total(n: usize) usize {
+        var t: usize = 0;
+        for (0..n) |i| t += partLen(i);
+        return t;
+    }
+
+    fn scatter(n: usize) []os_net.iovec {
+        @memset(&dst, 0xEE);
+        var at: usize = 0;
+        for (0..n) |i| {
+            riov[i] = os_net.iovecFromSlice(dst[at..][0..partLen(i)]);
+            at += partLen(i);
+        }
+        return riov[0..n];
+    }
+
+    fn one() []os_net.iovec {
+        @memset(&whole, 0xEE);
+        whole_iov[0] = os_net.iovecFromSlice(&whole);
+        return &whole_iov;
+    }
+
+    fn check(got: []const u8, n: usize) !void {
+        try std.testing.expectEqual(total(n), got.len);
+        for (got, 0..) |b, k| {
+            if (b != @as(u8, @truncate(k))) {
+                std.debug.print("{d} buffers: byte {d} is {d}, expected {d}\n", .{ n, k, b, @as(u8, @truncate(k)) });
+                return error.WrongByte;
+            }
+        }
+    }
+
+    fn sendmsgTo(fd: i32, to: *const os_net.sockaddr.in, n: usize) !usize {
+        return os_net.sendmsg(fd, gather(n), .{}, @ptrCast(to), @sizeOf(os_net.sockaddr.in), null);
+    }
+
+    fn evSendTo(fd: i32, to: *const os_net.sockaddr.in, n: usize) !usize {
+        var op = dg.ev.NetSendTo.init(fd, .{ .iovecs = gather(n) }, .{}, @ptrCast(to), @sizeOf(os_net.sockaddr.in));
+        try dg.io_common.waitForIo(&op.c);
+        return op.getResult();
+    }
+
+    fn evRecvFrom(fd: i32, bufs: []os_net.iovec) !usize {
+        var from: os_net.sockaddr.in = undefined;
+        var from_len: os_net.socklen_t = @sizeOf(os_net.sockaddr.in);
+        var op = dg.ev.NetRecvFrom.init(fd, .{ .iovecs = bufs }, .{}, @ptrCast(&from), &from_len);
+        try dg.io_common.waitForIo(&op.c);
+        return op.getResult();
+    }
+
+    fn dgramBody() !void {
+        const rx = try nf.sock(1, 7000);
+        const tx = try nf.sock(1, 7001);
+        const to = dg.addr(127, 0, 0, 1, 7000);
+        for ([_]usize{ 65, kernel_iov_max }) |n| {
+            // sendDatagram, read whole by the layer.
+            try std.testing.expectEqual(total(n), try os_net.sendDatagram(tx, gather(n), .{}, &to, null));
+            try dg.settle();
+            const a = try os_net.recvDatagram(rx, one(), .{ .dontwait = true }, null);
+            try check(whole[0..a.len], n);
+            // sendmsg, scattered over n buffers by the layer.
+            try std.testing.expectEqual(total(n), try sendmsgTo(tx, &to, n));
+            try dg.settle();
+            const b = try os_net.recvDatagram(rx, scatter(n), .{ .dontwait = true }, null);
+            try check(dst[0..b.len], n);
+            // The ev send, scattered over n buffers by the ev receive.
+            try std.testing.expectEqual(total(n), try evSendTo(tx, &to, n));
+            try check(dst[0..try evRecvFrom(rx, scatter(n))], n);
+        }
+    }
+
+    fn pipeBody() !void {
+        const fds = pipePair();
+        for ([_]usize{ 65, kernel_iov_max }) |n| {
+            var s = dg.ev.NetSend.init(fds[1], .{ .iovecs = gather(n) }, .{});
+            try dg.io_common.waitForIo(&s.c);
+            try std.testing.expectEqual(total(n), try s.getResult());
+            var r = dg.ev.NetRecv.init(fds[0], .{ .iovecs = scatter(n) }, .{});
+            try dg.io_common.waitForIo(&r.c);
+            try check(dst[0..try r.getResult()], n);
+        }
+    }
+};
+
+test "sim: dgram iovecs: 65 and 1024 buffers through sendDatagram, sendmsg and the ev send arrive whole and in order, read into one buffer and scattered over as many by the layer and the ev receive" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, many_iov.dgramBody);
+}
+
+test "sim: pipe iovecs: an ev send of 65 and of 1024 buffers on a sim pipe arrives in order, read by an ev receive of as many buffers" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, many_iov.pipeBody);
+}
+
+const iov_over = kernel_iov_max + 1;
+
+test "sim: dgram refuses: a sendDatagram of IOV_MAX + 1 buffers" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: a sendDatagram of IOV_MAX + 1 buffers", "sim: a send of 1025 buffers on sim fd ", struct {
+        fn body() !void {
+            try dg.run(1, struct {
+                fn b() !void {
+                    const tx = try nf.sock(1, 7001);
+                    const to = dg.addr(127, 0, 0, 1, 7000);
+                    _ = try many_iov.os_net.sendDatagram(tx, many_iov.gather(iov_over), .{}, &to, null);
+                }
+            }.b);
+        }
+    }.body);
+}
+
+test "sim: dgram refuses: a sendmsg of IOV_MAX + 1 buffers" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: a sendmsg of IOV_MAX + 1 buffers", "sim: a send of 1025 buffers on sim fd ", struct {
+        fn body() !void {
+            try dg.run(1, struct {
+                fn b() !void {
+                    const tx = try nf.sock(1, 7001);
+                    const to = dg.addr(127, 0, 0, 1, 7000);
+                    _ = try many_iov.sendmsgTo(tx, &to, iov_over);
+                }
+            }.b);
+        }
+    }.body);
+}
+
+test "sim: dgram refuses: an ev send of IOV_MAX + 1 buffers" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: an ev send of IOV_MAX + 1 buffers", "sim: a send of 1025 buffers on sim fd ", struct {
+        fn body() !void {
+            try dg.run(1, struct {
+                fn b() !void {
+                    const tx = try nf.sock(1, 7001);
+                    const to = dg.addr(127, 0, 0, 1, 7000);
+                    _ = try many_iov.evSendTo(tx, &to, iov_over);
+                }
+            }.b);
+        }
+    }.body);
+}
+
+test "sim: dgram refuses: a receive of IOV_MAX + 1 buffers" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: a receive of IOV_MAX + 1 buffers", "sim: a receive of 1025 buffers on sim fd ", struct {
+        fn body() !void {
+            try dg.run(1, struct {
+                fn b() !void {
+                    const rx = try nf.sock(1, 7000);
+                    _ = many_iov.os_net.recvDatagram(rx, many_iov.scatter(iov_over), .{ .dontwait = true }, null) catch {};
+                }
+            }.b);
+        }
+    }.body);
+}
+
+test "sim: pipe refuses: an ev send of IOV_MAX + 1 buffers" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: pipe refuses: an ev send of IOV_MAX + 1 buffers", "sim: a send of 1025 buffers on sim fd ", struct {
+        fn body() !void {
+            try dg.run(1, struct {
+                fn b() !void {
+                    const fds = pipePair();
+                    var s = dg.ev.NetSend.init(fds[1], .{ .iovecs = many_iov.gather(iov_over) }, .{});
+                    try dg.io_common.waitForIo(&s.c);
+                }
+            }.b);
+        }
+    }.body);
+}
+
+test "sim: pipe refuses: an ev receive of IOV_MAX + 1 buffers" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: pipe refuses: an ev receive of IOV_MAX + 1 buffers", "sim: a receive of 1025 buffers on sim fd ", struct {
+        fn body() !void {
+            try dg.run(1, struct {
+                fn b() !void {
+                    const fds = pipePair();
+                    var r = dg.ev.NetRecv.init(fds[0], .{ .iovecs = many_iov.scatter(iov_over) }, .{});
+                    try dg.io_common.waitForIo(&r.c);
+                }
+            }.b);
+        }
+    }.body);
 }

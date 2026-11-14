@@ -34,7 +34,8 @@
 //   reorder and duplication, a partition, or a silence, on paths of the
 //   sockets' ports with wildcards; at most `max_frules` in force. A removal
 //   checks the counts the sim returns against the model's. The end removes
-//   every rule before its proof.
+//   every rule before its proof. The same seeds also gather one send in 16
+//   from many buffers, up to IOV_MAX (`kernel_iov_max`).
 //
 // The model knows only byte strings, queues, ports and which ops are
 // pending. It shares no helper with the sim: it lands datagrams by the
@@ -141,6 +142,9 @@ fn faultsOn() bool {
 const default_steps: usize = 5000;
 
 const n_socks = 4;
+/// IOV_MAX on macOS 25.6 and Linux 6.8 (measured, sitting 21). Stated here,
+/// not read from `sim.max_iovecs`, so a sim limit set lower is caught.
+const kernel_iov_max = 1024;
 const n_slots = 64;
 const n_groups = 8;
 const max_iov = 3;
@@ -203,8 +207,10 @@ const Slot = struct {
     n_iov: usize = 0,
     bufs: [max_iov][iov_cap]u8 = undefined,
     iov: [max_iov]os_net.iovec = undefined,
-    iovc: [max_iov]os_net.iovec_const = undefined,
-    parts: [max_iov][]const u8 = undefined,
+    /// A send's buffers: up to `kernel_iov_max`. A receive's buffers stay
+    /// at `max_iov`.
+    iovc: [kernel_iov_max]os_net.iovec_const = undefined,
+    parts: [kernel_iov_max][]const u8 = undefined,
     total: usize = 0,
     addr: os_net.sockaddr.in = undefined,
     addr_len: os_net.socklen_t = 0,
@@ -419,6 +425,10 @@ const Counts = struct {
     /// dropped, by cause, and copies made, delayed, clamped and overtaking;
     /// a waiting op woken by a delayed landing; removals whose returned
     /// counts the model checked.
+    /// Sends gathered from many buffers (4 to `kernel_iov_max`), and from
+    /// exactly `kernel_iov_max` (t-4101).
+    many_iov_sends: u64 = 0,
+    max_iov_sends: u64 = 0,
     fault_sets: u64 = 0,
     fault_removals: u64 = 0,
     lost: u64 = 0,
@@ -918,10 +928,24 @@ fn takeHead(s: *MSock) Dgm {
 fn randomParts(s: *Slot, max_part: usize, allow_none: bool) void {
     const r = M.r();
     s.n_iov = r.intRangeAtMost(usize, 1, max_iov);
+    // Seeds 9 to 16: one send in 16 is gathered from many buffers of 0 to 2
+    // bytes: ENet's most (65), IOV_MAX (`kernel_iov_max`), or a count in
+    // between. Seeds 1 to 8 keep the phase 1 mix.
+    var tiny = false;
+    if (faultsOn() and r.uintLessThan(u8, 16) == 0) {
+        s.n_iov = switch (r.uintLessThan(u8, 3)) {
+            0 => 65,
+            1 => kernel_iov_max,
+            else => r.intRangeAtMost(usize, 4, kernel_iov_max),
+        };
+        tiny = true;
+        M.c.many_iov_sends += 1;
+        if (s.n_iov == kernel_iov_max) M.c.max_iov_sends += 1;
+    }
     var total: usize = 0;
     const all_empty = allow_none and r.uintLessThan(u8, 5) == 0;
     for (0..s.n_iov) |k| {
-        const len: usize = if (all_empty or r.uintLessThan(u8, 4) == 0) 0 else r.intRangeAtMost(usize, 1, max_part);
+        const len: usize = if (tiny) r.uintAtMost(usize, 2) else if (all_empty or r.uintLessThan(u8, 4) == 0) 0 else r.intRangeAtMost(usize, 1, max_part);
         const p = M.gpa().alloc(u8, len) catch @panic("oom");
         r.bytes(p);
         s.parts[k] = p;
@@ -2406,6 +2430,7 @@ fn printCounts(c: Counts, seeds: usize, steps: usize) void {
     std.debug.print("op model counts: ops={d} parked={d} canceled={d} closed_hit={d} reused_number_ops={d} closed_then_reused={d} groups={d} f1_shape_groups={d} followups={d} followups_into_canceled_due={d}\n", .{ c.ops, c.parked, c.canceled, c.closed_hit, c.reused_number_ops, c.closed_then_reused, c.groups, c.f1_shape_groups, c.followups, c.followups_into_canceled_due });
     std.debug.print("op model counts: dgrams_sent={d} empty={d} truncated={d} scatter_recvs={d} dropped_rcvbuf={d} dropped_nosock={d} discarded_at_close={d} landed_in_new_socket={d} only_empty_left={d} landed_behind_empty={d} pipe_parked_sends={d} would_block={d} polls={d} no_free_slot={d}\n", .{ c.dgrams_sent, c.empty_dgrams, c.truncated, c.scatter_recvs, c.dropped_rcvbuf, c.dropped_nosock, c.discarded_at_close, c.landed_in_new_socket, c.only_empty_left, c.landed_behind_empty, c.pipe_parked_sends, c.would_block, c.polls, c.no_free_slot });
     std.debug.print("op model counts: woken_completed={d} registration_proofs={d} end_groups={d} in_batch_reopen={d} in_batch_steal={d} in_batch_cancel={d} timers_fired={d} timer_and_io_at_one_time={d} pipe_pairs={d} pipe_closes={d} pipe_shutdowns={d} pipe_resets={d} end_of_stream={d} broken_pipe={d} reset_errors={d}\n", .{ c.woken_completed, c.registration_proofs, c.end_groups, c.in_batch_reopen, c.in_batch_steal, c.in_batch_cancel, c.timers_fired, c.timer_and_io_at_one_time, c.pipe_pairs, c.pipe_closes, c.pipe_shutdowns, c.pipe_resets, c.end_of_stream, c.broken_pipe, c.reset_errors });
+    std.debug.print("op model counts: many_iov_sends={d} max_iov_sends={d}\n", .{ c.many_iov_sends, c.max_iov_sends });
     std.debug.print("op model counts: fault_sets={d} fault_removals={d} lost={d} lost_burst={d} partitioned_at_send={d} partitioned_in_flight={d} silenced_at_send={d} silenced_in_flight={d} duplicated={d} delayed={d} clamped={d} overtaking={d} delayed_wakes={d}\n", .{ c.fault_sets, c.fault_removals, c.lost, c.lost_burst, c.partitioned_at_send, c.partitioned_in_flight, c.silenced_at_send, c.silenced_in_flight, c.duplicated, c.delayed, c.clamped, c.overtaking, c.delayed_wakes });
 }
 
@@ -2440,7 +2465,7 @@ test "sim: op model: datagram sockets and a pipe under random sends, receives, p
     for (total.steps, 0..) |n, k| {
         if (n == 0) fail("no step of kind {t} ran", .{@as(StepKind, @fromBackingInt(@intCast(k)))});
     }
-    inline for (.{ "parked", "canceled", "closed_hit", "reused_number_ops", "closed_then_reused", "f1_shape_groups", "followups_into_canceled_due", "empty_dgrams", "truncated", "scatter_recvs", "dropped_rcvbuf", "dropped_nosock", "discarded_at_close", "landed_in_new_socket", "pipe_parked_sends", "woken_completed", "registration_proofs", "end_groups", "in_batch_reopen", "in_batch_steal", "in_batch_cancel", "timers_fired", "timer_and_io_at_one_time", "pipe_closes", "pipe_shutdowns", "pipe_resets", "end_of_stream", "broken_pipe", "reset_errors", "fault_sets", "fault_removals", "lost", "lost_burst", "partitioned_at_send", "partitioned_in_flight", "silenced_at_send", "silenced_in_flight", "duplicated", "delayed", "clamped", "overtaking", "delayed_wakes" }) |name| {
+    inline for (.{ "parked", "canceled", "closed_hit", "reused_number_ops", "closed_then_reused", "f1_shape_groups", "followups_into_canceled_due", "empty_dgrams", "truncated", "scatter_recvs", "dropped_rcvbuf", "dropped_nosock", "discarded_at_close", "landed_in_new_socket", "pipe_parked_sends", "woken_completed", "registration_proofs", "end_groups", "in_batch_reopen", "in_batch_steal", "in_batch_cancel", "timers_fired", "timer_and_io_at_one_time", "pipe_closes", "pipe_shutdowns", "pipe_resets", "end_of_stream", "broken_pipe", "reset_errors", "fault_sets", "fault_removals", "lost", "lost_burst", "partitioned_at_send", "partitioned_in_flight", "silenced_at_send", "silenced_in_flight", "duplicated", "delayed", "clamped", "overtaking", "delayed_wakes", "many_iov_sends", "max_iov_sends" }) |name| {
         if (@field(total, name) == 0) fail("the counter {s} is 0: that case never ran", .{name});
     }
     sim.childDone(child_name);

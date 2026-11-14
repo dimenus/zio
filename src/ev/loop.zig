@@ -1740,20 +1740,6 @@ pub const Loop = struct {
         return try self.backend.poll(&self.state, timeout);
     }
 
-    const sim_max_iovecs = 16;
-
-    fn readSlices(buf: ReadBuf, out: *[sim_max_iovecs][]u8) [][]u8 {
-        if (buf.iovecs.len > sim_max_iovecs) sim.panic("sim: recv with {d} iovecs (max {d})", .{ buf.iovecs.len, sim_max_iovecs });
-        for (buf.iovecs, 0..) |v, i| out[i] = v.base[0..v.len];
-        return out[0..buf.iovecs.len];
-    }
-
-    fn writeSlices(buf: WriteBuf, out: *[sim_max_iovecs][]const u8) []const []const u8 {
-        if (buf.iovecs.len > sim_max_iovecs) sim.panic("sim: send with {d} iovecs (max {d})", .{ buf.iovecs.len, sim_max_iovecs });
-        for (buf.iovecs, 0..) |v, i| out[i] = v.base[0..v.len];
-        return out[0..buf.iovecs.len];
-    }
-
     /// Sim: the fd a net op names, or null for one that names none.
     fn simOpHandle(c: *Completion) ?i32 {
         return switch (c.op) {
@@ -1781,8 +1767,9 @@ pub const Loop = struct {
             .net_recv => {
                 const op = c.cast(NetRecv);
                 refuseSimPipeFlags("receive", op.flags, op.handle, &.{"dontwait"});
-                var sl: [sim_max_iovecs][]u8 = undefined;
-                switch (sim.recvInto(op.handle, readSlices(op.buffers, &sl), c, op.flags.dontwait)) {
+                // The sim reads the iovecs in place; their count is checked
+                // against IOV_MAX there (`sim.max_iovecs`).
+                switch (sim.recvInto(op.handle, op.buffers.iovecs, c, op.flags.dontwait)) {
                     .due => |n| c.setResult(.net_recv, n),
                     .eof => c.setResult(.net_recv, 0),
                     .reset => c.setError(error.ConnectionResetByPeer),
@@ -1798,8 +1785,7 @@ pub const Loop = struct {
             .net_send => {
                 const op = c.cast(NetSend);
                 refuseSimPipeFlags("send", op.flags, op.handle, &.{});
-                var sl: [sim_max_iovecs][]const u8 = undefined;
-                switch (sim.sendBytes(op.handle, writeSlices(op.buffer, &sl), c)) {
+                switch (sim.sendBytes(op.handle, op.buffer.iovecs, c)) {
                     .due => |n| c.setResult(.net_send, n),
                     .eof => c.setError(error.BrokenPipe),
                     .reset => c.setError(error.ConnectionResetByPeer),
@@ -1988,13 +1974,12 @@ pub const Loop = struct {
                 switch (c.op) {
                     .net_recv => {
                         const op = c.cast(NetRecv);
-                        var sl: [sim_max_iovecs][]u8 = undefined;
                         if (sim.isReset(op.handle)) {
                             c.setError(error.ConnectionResetByPeer);
                         } else if (sim.recvIsEof(op.handle)) {
                             c.setResult(.net_recv, 0);
                         } else {
-                            c.setResult(.net_recv, sim.harvestRecv(op.handle, readSlices(op.buffers, &sl)));
+                            c.setResult(.net_recv, sim.harvestRecv(op.handle, op.buffers.iovecs));
                         }
                     },
                     .net_send => {
@@ -2002,8 +1987,7 @@ pub const Loop = struct {
                         // Do not re-queue this completion. BrokenPipe is
                         // only for a closed peer.
                         const op = c.cast(NetSend);
-                        var sl: [sim_max_iovecs][]const u8 = undefined;
-                        switch (sim.harvestSend(op.handle, writeSlices(op.buffer, &sl), c, buf[i].id)) {
+                        switch (sim.harvestSend(op.handle, op.buffer.iovecs, c, buf[i].id)) {
                             .due => |sent| c.setResult(.net_send, sent),
                             .eof => c.setError(error.BrokenPipe),
                             .reset => c.setError(error.ConnectionResetByPeer),

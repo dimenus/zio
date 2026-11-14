@@ -551,6 +551,64 @@ int ebt_empty_datagram(void) {
     return 0;
 }
 
+// ENet builds one datagram from up to ENET_BUFFER_MAXIMUM buffers: enet.h of
+// cgutman/enet aca8784 (the version hotseat pins) defines it as 1 + 2 *
+// ENET_PROTOCOL_MAXIMUM_PACKET_COMMANDS (32), a header and two per command;
+// unix.h replaces it with MSG_MAXIOVLEN only where that is defined, and
+// macOS does not define it. One flush with 32 commands sends all of them.
+#define EBT_ENET_BUFFER_MAXIMUM (1 + 2 * 32)
+
+// Groups 1 and 7: a datagram gathered from ENet's most buffers, 1 to 3 bytes
+// each, arrives whole and in order, read into one buffer and into as many
+// buffers as were sent.
+int ebt_max_buffers(void) {
+    enum { n = EBT_ENET_BUFFER_MAXIMUM };
+    ENetSocket rx, tx;
+    uint16_t rx_port;
+    TRY(open_bound(loopback, &rx, &rx_port));
+    TRY(open_bound(loopback, &tx, NULL));
+    static uint8_t parts[n][3];
+    ENetBuffer out[n];
+    int total = 0;
+    for (int i = 0; i < n; i++) {
+        int len = 1 + i % 3;
+        for (int j = 0; j < len; j++) parts[i][j] = (uint8_t)(total + j);
+        out[i].data = parts[i];
+        out[i].dataLength = (size_t)len;
+        total += len;
+    }
+    ENetAddress to = ip4(loopback, rx_port);
+    ENetAddress from;
+    for (int round = 0; round < 2; round++) {
+        EXPECT("send of 65 buffers", enet_socket_send(tx, &to, NULL, out, n), total);
+        TRY(arrive(rx));
+        static uint8_t whole[256];
+        static uint8_t scattered[n][3];
+        ENetBuffer in[n];
+        int count = 1;
+        if (round == 0) {
+            in[0].data = whole;
+            in[0].dataLength = sizeof(whole);
+        } else {
+            count = n;
+            for (int i = 0; i < n; i++) {
+                in[i].data = scattered[i];
+                in[i].dataLength = (size_t)(1 + i % 3);
+            }
+        }
+        EXPECT(round == 0 ? "receive into one buffer" : "receive into 65 buffers", enet_socket_receive(rx, &from, NULL, in, (size_t)count), total);
+        int at = 0;
+        for (int i = 0; i < count; i++) {
+            const uint8_t *b = in[i].data;
+            int len = round == 0 ? total : (int)in[i].dataLength;
+            for (int j = 0; j < len; j++, at++) {
+                if (b[j] != (uint8_t)at) FAIL("round %d, byte %d: got %d, expected %d", round, at, b[j], (uint8_t)at);
+            }
+        }
+    }
+    return 0;
+}
+
 // Group 2 and 7: a datagram that does not fit is -2 and is consumed: the
 // next receive is the next datagram.
 int ebt_truncation(void) {

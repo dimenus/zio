@@ -152,6 +152,7 @@ extern fn ebt_host_create() c_int;
 extern fn ebt_would_block() c_int;
 extern fn ebt_empty_datagram() c_int;
 extern fn ebt_truncation() c_int;
+extern fn ebt_max_buffers() c_int;
 extern fn ebt_unsupported_option() c_int;
 extern fn ebt_wait() c_int;
 extern fn ebt_wait_interrupt() c_int;
@@ -268,6 +269,10 @@ test "sim: enet bridge: a receive with nothing queued is 0, errno EWOULDBLOCK, a
 
 test "sim: enet bridge: an empty datagram is received as 0 with its source written, and the next datagram is next" {
     try runC(ebt_empty_datagram);
+}
+
+test "sim: enet bridge: a datagram gathered from ENet's most buffers, 65, arrives whole and in order, read into one buffer and into 65" {
+    try runC(ebt_max_buffers);
 }
 
 test "sim: enet bridge: a datagram that does not fit is -2 and is consumed" {

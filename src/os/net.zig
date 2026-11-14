@@ -2053,8 +2053,6 @@ fn simPoll(fds: []pollfd, timeout: i32) ?usize {
     return ready;
 }
 
-const sim_max_iovecs = 16;
-
 fn simAddr(comptime what: []const u8, addr: *const sockaddr, len: socklen_t) sim.Ip4 {
     // The family is checked once, in `simAddrIn`, before anything else reads
     // the address as IPv4.
@@ -2083,10 +2081,9 @@ fn writeSimAddr(a: sim.Ip4, out: *sockaddr, out_len: *socklen_t) void {
 fn simRecv(fd: fd_t, buffers: []iovec, flags: RecvFlags) RecvError!sim.Received {
     if (flags.peek) sim.panic("sim: MSG_PEEK on sim fd {d} is not simulated", .{fd});
     if (flags.waitall or flags.oob) sim.panic("sim: MSG_WAITALL or MSG_OOB on sim fd {d} is not simulated", .{fd});
-    if (buffers.len > sim_max_iovecs) sim.panic("sim: a receive with {d} buffers (max {d})", .{ buffers.len, sim_max_iovecs });
-    var sl: [sim_max_iovecs][]u8 = undefined;
-    for (buffers, 0..) |b, i| sl[i] = b.base[0..b.len];
-    return sim.dgramRecv(fd, sl[0..buffers.len], flags.dontwait);
+    // The sim reads the iovecs in place and checks their count against
+    // IOV_MAX (`sim.max_iovecs`).
+    return sim.dgramRecv(fd, buffers, flags.dontwait);
 }
 
 /// The length a receive reports, as the host's kernel does: Linux gives the
@@ -2105,10 +2102,7 @@ fn simSend(fd: fd_t, buffers: []const iovec_const, flags: SendFlags, to: sim.Ip4
         const accepted = comptime std.mem.eql(u8, name, "no_signal") or std.mem.eql(u8, name, "dontwait");
         if (!accepted and @field(flags, name)) sim.panic("sim: send flag " ++ name ++ " on sim fd {d} is not simulated", .{fd});
     }
-    if (buffers.len > sim_max_iovecs) sim.panic("sim: a send with {d} buffers (max {d})", .{ buffers.len, sim_max_iovecs });
-    var sl: [sim_max_iovecs][]const u8 = undefined;
-    for (buffers, 0..) |b, i| sl[i] = b.base[0..b.len];
-    return sim.dgramSend(fd, sl[0..buffers.len], to, from);
+    return sim.dgramSend(fd, buffers, to, from);
 }
 
 /// Creates a connected socket pair using loopback connection (for Windows async wakeup)
