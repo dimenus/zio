@@ -12,49 +12,72 @@
 //   A timer far in the future keeps the loop from counting as done, so a poll
 //   moves the clock even when no op is live.
 // - Four datagram socket slots, each bound to 127.0.0.1 on its own port, and
-//   one sim pipe. A random step is one of `StepKind`. ev ops live in a fixed
-//   pool of slots; a race group's members live in slots too, and the group's
-//   callback frees them all.
+//   a series of sim pipe pairs (a new one when the current one is closed on
+//   both ends or reset; up to 15). A random step is one of `StepKind`. ev ops
+//   live in a fixed pool of slots; a race group's members live in slots too,
+//   and the group's callback frees them all.
 // - A group's callback that runs inside a poll may submit new ops into the
 //   slots it just freed ("follow-ups"), often of the same type, so a new op
 //   can sit at the address of an op that is still in the harvest's batch.
+// - A callback that does not defer (an op's, or a timer's) may act inside the
+//   poll as a program can (`inBatch`): close a socket and open it again (its
+//   number is reused), take a datagram with a layer receive (a woken receive
+//   on that socket then parks again), or cancel an op. Each can hit an op
+//   later in the same harvest batch. Timers are due when a datagram lands or
+//   a pipe op is harvested, so a timer and an I/O completion share a time.
+// - Pipe steps also close an end, shut it down (receive, send or both), and
+//   arm a write error (`sim.setSendFaults(.fail_at_byte)`) that resets the
+//   pair.
 //
 // The model knows only byte strings, queues, ports and which ops are
 // pending. It shares no helper with the sim: it lands datagrams by the
 // design's rules (section 4 and 6: wire latency, the socket bound to the
 // destination port, the byte budget of length plus 256 and the 1024-packet
-// limit), and it keeps each pipe direction as a list of bytes of at most
-// `pipe_buf_cap`.
+// limit), and it keeps each pipe end as a list of bytes of at most
+// `pipe_buf_cap` with the sim's documented rules for close, shutdown and
+// reset written as its own (`pipeSendNow`, `pipeRecvNow`).
 //
 // What it checks:
 // - after every op's completion: the op completed once, and its result (the
 //   count, the error, the bytes in every buffer, the source port) is the
 //   model's. A result decided at submit must come back unchanged, also when
-//   the op was cancelled. An op that waited (parked) may end `Canceled` only
-//   if a cancel was asked for it (by the test, or by a race sibling that
-//   finished first); otherwise its result is computed from the model at its
-//   callback.
+//   the op was cancelled. An op that waited may end `Canceled` only if a
+//   cancel was asked for it (by the test, or by a race sibling that finished
+//   first); otherwise its result is computed from the model at its callback,
+//   and a pipe op must have been woken first.
 // - after every step: each open socket's `dropped_rcvbuf`, the run's
 //   no-socket drops, and the bytes buffered at each pipe end
 //   (`sim.testPipeBuffered`) equal the model's.
-// - after every poll: a datagram op that was due before the poll began has
-//   completed, a parked receive or poll on a socket that now has a datagram
-//   has completed, and a pipe op whose result was decided at submit has
-//   completed 10 ms after its submit (the sim's delay is at most 5 ms).
-// - at the end: every op still waiting has a reason to wait (an empty
-//   queue or pipe, a full pipe); after cancelling them and draining every
-//   queue, nothing is live or due, nothing is on the wire, and every
-//   datagram sent was received once or counted as dropped, and every pipe
-//   byte accepted was received once.
+// - after every poll, the wake obligations: a datagram op due before the
+//   poll began has completed; a receive or poll waiting on a socket that now
+//   has a datagram has completed; a pipe op woken (bytes, room, a close, a
+//   shutdown or a reset) has completed `pipe_wake_ns` after its wake; a
+//   pipe op decided at submit, 10 ms after it; a timer, once past its
+//   deadline, fired exactly at it.
+// - at the end: every op still waiting is given what it waits for (bytes,
+//   room or a datagram) and must then complete with the model's result: an
+//   op that lost its registration fails here, where a cancel would hide it.
+//   Then nothing is live or due, nothing is on the wire, every datagram sent
+//   was received once or counted as dropped, and every pipe byte accepted
+//   was received once, dropped by a reset, or left at an end closed for
+//   reading.
+// - probes (`ZIO_OP_MODEL_PROBE`, run by the parent in their own children):
+//   a second ev receive, a second ev send, and a second datagram receive
+//   inside a harvest, each behind a woken op; the sim must refuse each.
 //
 // Rules the generator keeps, so that the model has one answer:
-// - Never two ops waiting on one socket, or two waiting receives (or sends)
-//   on one pipe end at once: the sim refuses both by name.
+// - One ev receive or poll for reading per socket, and one ev receive and
+//   one ev send per pipe end, until it completes: the sim refuses a second
+//   (`refuseSecondPipeWaiter`, `dgramRefuseSecondWaiter`).
+// - No op on a pipe end after the program closed it.
 // - Within one virtual instant, each destination port gets datagrams from
 //   one source only: the sim orders flows due at one time by the seed, and
 //   the model does not guess that order. Each flow is first in, first out.
 // - A pipe op that will wait is never deferred: its harvest moves bytes, and
 //   a deferred callback would show that later than it happened.
+// - A callback acts inside a poll only on a socket whose waiting op does not
+//   defer: that op has not been harvested yet, or its callback would have
+//   run, so the model's queue is the sim's.
 // - A group has members on distinct fds and at most one pipe member, so the
 //   order in which the loop submits members does not matter.
 // - Follow-ups only use fds with no op in flight.
@@ -63,10 +86,11 @@
 //   inside `Loop.add`, and a race would then cancel siblings the model has
 //   already applied at submit.
 //
-// What it does not reach (measured with mutants, see the commit): the
+// What it does not reach (measured with mutants, see the commits): the
 // 1024-packet limit (queues here stay short; the queue model test in
-// `sim.zig` fills it), pipe close, shutdown and reset during the steps (only
-// a close at the end), and flows that share a landing instant.
+// `sim.zig` fills it), flows that share a landing instant, a waiting pipe op
+// with a deferred callback (t-4098), and a CompletionQueue's coop yield (a
+// bare loop has no runtime; `sim.zig` has its own test of that route).
 //
 // The clock step is one poll (a cap of 0 only harvests), or polls until the
 // clock has moved by a fixed time. One poll stops at the next due op, and a
@@ -99,8 +123,14 @@ const iov_cap = 1500;
 const max_payload_part = 500;
 const pipe_part_max = 1800;
 const base_port: u16 = 7000;
+/// Pipe pairs in one run: the sim has 32 ends and never reuses one.
+const max_pairs = 15;
+const n_timers = 4;
+/// The sim's largest delay from a pipe op's wake to its harvest
+/// (`ioDelayNs`: 1 or 5 ms).
+const pipe_wake_ns: u64 = 5 * std.time.ns_per_ms;
 
-const OpKind = enum { d_send, d_recv, d_poll_recv, d_poll_send, d_close, p_send, p_recv };
+const OpKind = enum { d_send, d_recv, d_poll_recv, d_poll_send, d_close, p_send, p_recv, p_close, p_shutdown };
 
 const Box = union {
     sendto: ev.NetSendTo,
@@ -109,6 +139,7 @@ const Box = union {
     close: ev.NetClose,
     send: ev.NetSend,
     recv: ev.NetRecv,
+    shutdown: ev.NetShutdown,
 };
 
 /// A result: a count, success with no value, or an error.
@@ -165,6 +196,11 @@ const Slot = struct {
     in_poll: bool = false,
     done_poll: u64 = 0,
     on_reused: bool = false,
+    /// For an op that waits: when what it waits for happened (bytes, room,
+    /// a close, a shutdown, a reset). It must then complete within
+    /// `pipe_wake_ns` (a pipe op); a datagram op that waits must complete in
+    /// the poll whose harvest landed its datagram.
+    wake_since: ?u64 = null,
 
     fn comp(s: *Slot) *ev.Completion {
         return switch (s.kind) {
@@ -174,6 +210,8 @@ const Slot = struct {
             .d_close => &s.box.close.c,
             .p_send => &s.box.send.c,
             .p_recv => &s.box.recv.c,
+            .p_close => &s.box.close.c,
+            .p_shutdown => &s.box.shutdown.c,
         };
     }
 
@@ -185,6 +223,8 @@ const Slot = struct {
             .d_close => if (s.box.close.getResult()) |_| .ok else |e| .{ .err = e },
             .p_send => if (s.box.send.getResult()) |n| .{ .n = n } else |e| .{ .err = e },
             .p_recv => if (s.box.recv.getResult()) |n| .{ .n = n } else |e| .{ .err = e },
+            .p_close => if (s.box.close.getResult()) |_| .ok else |e| .{ .err = e },
+            .p_shutdown => if (s.box.shutdown.getResult()) |_| .ok else |e| .{ .err = e },
         };
     }
 
@@ -234,15 +274,34 @@ const MSock = struct {
 
 const MWire = struct { due: u64, from_port: u16, to_port: u16, bytes: []const u8, to_gen: u32 };
 
-/// One pipe end: `buf` holds the bytes sent TO it, not yet received.
+/// One pipe end: `buf` holds the bytes sent TO it, not yet received. The
+/// flags are the sim's (`sim.End`), kept by the model from the steps.
 const MEnd = struct {
     fd: i32 = -1,
     buf: std.ArrayList(u8) = .empty,
     waiting_recv: ?*Slot = null,
     waiting_send: ?*Slot = null,
     inflight: u32 = 0,
+    /// Bytes this end's sends copied (the sim's `sent_bytes`).
     accepted: u64 = 0,
     received: u64 = 0,
+    closed: bool = false,
+    rd_shut: bool = false,
+    wr_shut: bool = false,
+    reset: bool = false,
+    /// `sim.setSendFaults(.fail_at_byte)`: the sent-byte count at which a
+    /// send resets the pipe.
+    fail_at: ?u64 = null,
+    /// Bytes dropped from `buf` by a reset.
+    dropped: u64 = 0,
+};
+
+const TimerSlot = struct {
+    used: bool = false,
+    t: ev.Timer = undefined,
+    deadline: u64 = 0,
+    completions: u32 = 0,
+    cancel_req: bool = false,
 };
 
 const StepKind = enum {
@@ -260,13 +319,18 @@ const StepKind = enum {
     open,
     rcvbuf,
     clock,
+    pipe_close,
+    pipe_shutdown,
+    pipe_reset,
+    timer,
 };
 
 const step_weights = [_]struct { StepKind, u32 }{
-    .{ .ev_send, 12 },   .{ .layer_send, 5 }, .{ .ev_recv, 12 },  .{ .layer_recv, 4 },
-    .{ .layer_poll, 3 }, .{ .ev_poll, 5 },    .{ .pipe_send, 9 }, .{ .pipe_recv, 9 },
-    .{ .cancel, 6 },     .{ .group, 9 },      .{ .close, 3 },     .{ .open, 4 },
-    .{ .rcvbuf, 3 },     .{ .clock, 22 },
+    .{ .ev_send, 12 },   .{ .layer_send, 5 }, .{ .ev_recv, 12 },   .{ .layer_recv, 4 },
+    .{ .layer_poll, 3 }, .{ .ev_poll, 5 },    .{ .pipe_send, 9 },  .{ .pipe_recv, 9 },
+    .{ .cancel, 6 },     .{ .group, 9 },      .{ .close, 3 },      .{ .open, 4 },
+    .{ .rcvbuf, 3 },     .{ .clock, 22 },     .{ .pipe_close, 1 }, .{ .pipe_shutdown, 1 },
+    .{ .pipe_reset, 1 }, .{ .timer, 3 },
 };
 
 const Counts = struct {
@@ -284,7 +348,6 @@ const Counts = struct {
     f1_shape_groups: u64 = 0,
     followups: u64 = 0,
     followups_into_canceled_due: u64 = 0,
-    f2_shape: u64 = 0,
     dgrams_sent: u64 = 0,
     empty_dgrams: u64 = 0,
     truncated: u64 = 0,
@@ -301,6 +364,27 @@ const Counts = struct {
     pipe_parked_sends: u64 = 0,
     would_block: u64 = 0,
     polls: u64 = 0,
+    /// Ops that waited, were woken, and completed (the wake obligation met).
+    woken_completed: u64 = 0,
+    /// Inside a poll, from a callback that does not defer (or a timer's):
+    /// a socket closed and reopened; a layer receive that took the datagram
+    /// a woken op was due to take (that op parks again); a cancel.
+    in_batch_reopen: u64 = 0,
+    in_batch_steal: u64 = 0,
+    in_batch_cancel: u64 = 0,
+    timers_fired: u64 = 0,
+    /// A timer fired at the virtual time an op completed, in one poll.
+    timer_and_io_at_one_time: u64 = 0,
+    pipe_pairs: u64 = 0,
+    pipe_closes: u64 = 0,
+    pipe_shutdowns: u64 = 0,
+    pipe_resets: u64 = 0,
+    end_of_stream: u64 = 0,
+    broken_pipe: u64 = 0,
+    reset_errors: u64 = 0,
+    /// Ops still waiting at the end that completed once given what they
+    /// waited for: proof they were still registered.
+    registration_proofs: u64 = 0,
 
     fn add(a: *Counts, b: Counts) void {
         inline for (comptime std.meta.fieldNames(Counts)) |name| {
@@ -313,6 +397,10 @@ const Counts = struct {
     }
 };
 
+/// A refusal probe (`ZIO_OP_MODEL_PROBE`): at its first chance the child
+/// submits a second ev op behind a woken one, which the sim must refuse.
+const Probe = enum { none, recv, send, dgram };
+
 const M = struct {
     var seed: u64 = 0;
     var step: usize = 0;
@@ -323,7 +411,16 @@ const M = struct {
     var slots: [n_slots]Slot = undefined;
     var groups: [n_groups]GroupFrame = undefined;
     var socks: [n_socks]MSock = undefined;
-    var ends: [2]MEnd = undefined;
+    var ends: [2 * max_pairs]MEnd = undefined;
+    /// The current pipe pair: ends `2 * pair` and `2 * pair + 1`.
+    var pair: u8 = 0;
+    var pairs: u8 = 0;
+    var timers: [n_timers]TimerSlot = undefined;
+    var last_io_clock: u64 = std.math.maxInt(u64);
+    var last_io_poll: u64 = 0;
+    var last_timer_clock: u64 = std.math.maxInt(u64);
+    var last_timer_poll: u64 = 0;
+    var probe: Probe = .none;
     var wire: std.ArrayList(MWire) = .empty;
     var next_gen: u32 = 1;
     var next_serial: u64 = 1;
@@ -622,59 +719,217 @@ fn buildDgramPoll(i: u8, sock_idx: u8, for_recv: bool) ?*Slot {
     return s;
 }
 
+// ---- the model's pipes ----
+//
+// The sim's rules (`sim.copySend`, `recvInto`, `closeFd`, `shutdownFd`,
+// `resetPipe`) written as the model's own, from the design and the sim's
+// doc comments: end `e` reads `ends[e].buf`; its peer is `e ^ 1`.
+
+/// End of stream for a read on end `e`: nothing buffered, and either side
+/// closed, this side shut its reads, or the peer shut its writes.
+fn pipeEof(e: u8) bool {
+    const E = &M.ends[e];
+    const P = &M.ends[e ^ 1];
+    return E.buf.items.len == 0 and (E.closed or E.rd_shut or P.closed or P.wr_shut);
+}
+
+/// What an op waiting on it waits for has happened: from now it has
+/// `pipe_wake_ns` to complete.
+fn wakeOp(w: ?*Slot) void {
+    const op = w orelse return;
+    if (op.wake_since == null) op.wake_since = sim.clockNs();
+}
+
+/// A reset (an injected write error): both ends fail every later op, unread
+/// bytes are dropped, and ops waiting on either end wake.
+fn resetPair(e: u8) void {
+    M.c.pipe_resets += 1;
+    for ([2]u8{ e, e ^ 1 }) |x| {
+        const X = &M.ends[x];
+        X.reset = true;
+        X.dropped += X.buf.items.len;
+        X.buf.clearRetainingCapacity();
+        wakeOp(X.waiting_recv);
+        wakeOp(X.waiting_send);
+    }
+}
+
+/// A send on end `e` now: its result and its effect. Null: it waits for
+/// room. At a harvest (`waited`), no room is a broken sim rule.
+fn pipeSendNow(e: u8, s: *Slot, waited: bool) ?Res {
+    const E = &M.ends[e];
+    const P = &M.ends[e ^ 1];
+    if (E.reset) return .{ .err = error.ConnectionResetByPeer };
+    if (E.closed or E.wr_shut or P.closed) return .{ .err = error.BrokenPipe };
+    if (s.total == 0) return .{ .n = 0 };
+    var limit = s.total;
+    if (E.fail_at) |at| {
+        const room = at -| E.accepted;
+        if (room == 0) {
+            E.fail_at = null;
+            resetPair(e);
+            return .{ .err = error.ConnectionResetByPeer };
+        }
+        limit = @min(limit, room);
+    }
+    const space = sim.pipe_buf_cap - P.buf.items.len;
+    if (space == 0) {
+        if (waited) fail("p_send op #{d} (waited) completed into a full pipe", .{s.serial});
+        return null;
+    }
+    const n = @min(limit, space);
+    P.buf.appendSlice(M.gpa(), gathered(s, n)) catch @panic("oom");
+    E.accepted += n;
+    wakeOp(P.waiting_recv);
+    return .{ .n = n };
+}
+
+/// A receive on end `e` now: its result (and `s.want`, the bytes it takes).
+/// Null: it waits. At a harvest (`waited`), nothing to read and no end of
+/// stream is a broken sim rule: only an ev receive takes bytes.
+fn pipeRecvNow(e: u8, s: *Slot, waited: bool) ?Res {
+    const E = &M.ends[e];
+    if (E.reset) return .{ .err = error.ConnectionResetByPeer };
+    const level = E.buf.items.len;
+    if (level == 0) {
+        if (pipeEof(e)) return .{ .n = 0 };
+        if (waited) fail("p_recv op #{d} (waited) completed on an open pipe with nothing buffered: a kernel reader keeps waiting", .{s.serial});
+        if (s.dontwait) return .{ .err = error.WouldBlock };
+        return null;
+    }
+    const n = @min(s.room(), level);
+    s.want = M.gpa().dupe(u8, E.buf.items[0..n]) catch @panic("oom");
+    E.buf.replaceRange(M.gpa(), 0, n, &.{}) catch @panic("oom");
+    E.received += n;
+    if (n > 0) wakeOp(M.ends[e ^ 1].waiting_send);
+    return .{ .n = n };
+}
+
+fn countPipeResult(r: Res) void {
+    switch (r) {
+        .n => |n| if (n == 0) {
+            M.c.end_of_stream += 1;
+        },
+        .err => |e| switch (e) {
+            error.BrokenPipe => M.c.broken_pipe += 1,
+            error.ConnectionResetByPeer => M.c.reset_errors += 1,
+            else => {},
+        },
+        .ok => {},
+    }
+}
+
+/// Whether ops may be submitted on end `e`: a closed end's number is not
+/// the program's to use any more.
+fn endUsable(e: u8) bool {
+    return M.ends[e].fd != -1 and !M.ends[e].closed;
+}
+
+/// A new pipe pair becomes the current one; ops on the old pair go on.
+fn newPair() bool {
+    if (M.pairs == max_pairs) return false;
+    const p = sim.pipePair();
+    const k = M.pairs;
+    M.ends[2 * k] = .{ .fd = p[0] };
+    M.ends[2 * k + 1] = .{ .fd = p[1] };
+    M.pair = k;
+    M.pairs += 1;
+    M.c.pipe_pairs += 1;
+    return true;
+}
+
+/// The current pair, replaced first when it is spent (both ends closed, or
+/// reset) and a new one can be made.
+fn currentPair() u8 {
+    const a = 2 * M.pair;
+    const spent = (M.ends[a].closed and M.ends[a + 1].closed) or M.ends[a].reset;
+    if (spent) _ = newPair();
+    return M.pair;
+}
+
 fn buildPipeSend(i: u8, e: u8) ?*Slot {
-    const peer = &M.ends[1 - e];
     // One unresolved ev send per pipe end (`sim.refuseSecondPipeWaiter`).
-    if (M.ends[e].waiting_send != null) return null;
+    if (!endUsable(e) or M.ends[e].waiting_send != null) return null;
     const s = initSlot(i, .p_send);
     s.fd = M.ends[e].fd;
     s.target = e;
     randomParts(s, pipe_part_max, true);
-    const space = sim.pipe_buf_cap - peer.buf.items.len;
-    if (s.total == 0) {
-        s.at_submit = .{ .n = 0 };
-    } else if (space == 0) {
+    if (pipeSendNow(e, s, false)) |res| {
+        s.at_submit = res;
+        countPipeResult(res);
+        s.must_by_clock = sim.clockNs() + 2 * pipe_wake_ns;
+    } else {
         M.ends[e].waiting_send = s;
         M.c.parked += 1;
         M.c.pipe_parked_sends += 1;
-    } else {
-        const n = @min(s.total, space);
-        peer.buf.appendSlice(M.gpa(), gathered(s, n)) catch @panic("oom");
-        M.ends[e].accepted += n;
-        s.at_submit = .{ .n = n };
     }
-    if (s.at_submit != null) s.must_by_clock = sim.clockNs() + 10 * std.time.ns_per_ms;
     s.box = .{ .send = ev.NetSend.init(s.fd, .{ .iovecs = s.iovc[0..s.n_iov] }, .{}) };
     return s;
 }
 
 fn buildPipeRecv(i: u8, e: u8, allow_dontwait: bool) ?*Slot {
-    const end = &M.ends[e];
-    const r = M.r();
-    const dontwait = allow_dontwait and r.uintLessThan(u8, 5) == 0;
-    const level = end.buf.items.len;
     // One unresolved ev receive per pipe end.
-    if (end.waiting_recv != null) return null;
+    if (!endUsable(e) or M.ends[e].waiting_recv != null) return null;
     const s = initSlot(i, .p_recv);
-    s.fd = end.fd;
+    s.fd = M.ends[e].fd;
     s.target = e;
-    s.dontwait = dontwait;
+    s.dontwait = allow_dontwait and M.r().uintLessThan(u8, 5) == 0;
     randomBufs(s, true);
-    if (level > 0) {
-        const n = @min(s.room(), level);
-        s.want = M.gpa().dupe(u8, end.buf.items[0..n]) catch @panic("oom");
-        end.buf.replaceRange(M.gpa(), 0, n, &.{}) catch @panic("oom");
-        end.received += n;
-        s.at_submit = .{ .n = n };
-        s.must_by_clock = sim.clockNs() + 10 * std.time.ns_per_ms;
-    } else if (dontwait) {
-        s.at_submit = .{ .err = error.WouldBlock };
-        M.c.would_block += 1;
+    if (pipeRecvNow(e, s, false)) |res| {
+        s.at_submit = res;
+        countPipeResult(res);
+        if (res == .err and res.err == error.WouldBlock) M.c.would_block += 1;
+        s.must_by_clock = sim.clockNs() + 2 * pipe_wake_ns;
     } else {
-        end.waiting_recv = s;
+        M.ends[e].waiting_recv = s;
         M.c.parked += 1;
     }
-    s.box = .{ .recv = ev.NetRecv.init(s.fd, .{ .iovecs = s.iov[0..s.n_iov] }, .{ .dontwait = dontwait }) };
+    s.box = .{ .recv = ev.NetRecv.init(s.fd, .{ .iovecs = s.iov[0..s.n_iov] }, .{ .dontwait = s.dontwait }) };
+    return s;
+}
+
+/// An ev close of end `e`: the end is closed at submit, and ops waiting on
+/// either end wake (a receive to its bytes or end of stream, a send to
+/// BrokenPipe). Its own result comes after the seeded delay.
+fn buildPipeClose(i: u8, e: u8) ?*Slot {
+    if (!endUsable(e)) return null;
+    const s = initSlot(i, .p_close);
+    s.fd = M.ends[e].fd;
+    s.target = e;
+    s.box = .{ .close = ev.NetClose.init(s.fd) };
+    s.at_submit = .ok;
+    s.must_by_clock = sim.clockNs() + 2 * pipe_wake_ns;
+    M.ends[e].closed = true;
+    for ([2]u8{ e, e ^ 1 }) |x| {
+        wakeOp(M.ends[x].waiting_recv);
+        wakeOp(M.ends[x].waiting_send);
+    }
+    M.c.pipe_closes += 1;
+    return s;
+}
+
+/// An ev shutdown of end `e`: `.receive` makes its reads end of stream once
+/// empty; `.send` fails its sends and makes the peer's reads end of stream
+/// once empty. It wakes the ops that now end.
+fn buildPipeShutdown(i: u8, e: u8, how: os_net.ShutdownHow) ?*Slot {
+    if (!endUsable(e)) return null;
+    const s = initSlot(i, .p_shutdown);
+    s.fd = M.ends[e].fd;
+    s.target = e;
+    s.box = .{ .shutdown = ev.NetShutdown.init(s.fd, how) };
+    s.at_submit = .ok;
+    s.must_by_clock = sim.clockNs() + 2 * pipe_wake_ns;
+    const E = &M.ends[e];
+    if (how != .send) {
+        E.rd_shut = true;
+        wakeOp(E.waiting_recv);
+    }
+    if (how != .receive) {
+        E.wr_shut = true;
+        wakeOp(E.waiting_send);
+        wakeOp(M.ends[e ^ 1].waiting_recv);
+    }
+    M.c.pipe_shutdowns += 1;
     return s;
 }
 
@@ -689,7 +944,7 @@ fn arm(s: *Slot, deferred: bool) void {
     cp.flags.defer_callback = s.deferred;
     M.c.ops += 1;
     switch (s.kind) {
-        .p_send, .p_recv => M.ends[s.target].inflight += 1,
+        .p_send, .p_recv, .p_close, .p_shutdown => M.ends[s.target].inflight += 1,
         else => {
             M.socks[s.target].inflight += 1;
             if (M.socks[s.target].reused) {
@@ -729,15 +984,16 @@ fn buildAny(i: u8, kind: OpKind, idle_only: bool) ?*Slot {
             return null;
         },
         .p_send, .p_recv => {
-            if (idle_only and (M.ends[0].inflight != 0 or M.ends[1].inflight != 0)) return null;
-            const first: u8 = @intCast(r.uintLessThan(u8, 2));
-            for ([2]u8{ first, 1 - first }) |e| {
+            const a = 2 * currentPair();
+            if (idle_only and (M.ends[a].inflight != 0 or M.ends[a + 1].inflight != 0)) return null;
+            const first: u8 = a + @as(u8, @intCast(r.uintLessThan(u8, 2)));
+            for ([2]u8{ first, first ^ 1 }) |e| {
                 const s = if (kind == .p_send) buildPipeSend(i, e) else buildPipeRecv(i, e, !idle_only);
                 if (s) |op| return op;
             }
             return null;
         },
-        .d_close => unreachable,
+        .d_close, .p_close, .p_shutdown => unreachable,
     }
 }
 
@@ -761,14 +1017,20 @@ fn complete(s: *Slot) void {
         if (!Res.eql(want, got)) fail("{s} op #{d}: result {any}, the model's (decided at submit) {any}", .{ what, s.serial, got, want });
         if (s.kind == .d_recv and want == .n) checkDgram(s);
         if (s.kind == .p_recv and want == .n) checkScatter(s, s.want, what);
+        if (s.wake_since != null) M.c.woken_completed += 1;
     } else if (got == .err and got.err == error.Canceled) {
         if (!s.cancel_req) fail("{s} op #{d} ended Canceled, but no cancel was asked for it", .{ what, s.serial });
         clearWaiting(s);
     } else if (s.woken_closed) {
         if (!(got == .err and got.err == error.FileDescriptorNotASocket)) fail("{s} op #{d} was waiting when its socket closed: result {any}, wanted FileDescriptorNotASocket", .{ what, s.serial, got });
         if (sockFdOpen(s.fd)) M.c.closed_then_reused += 1;
-    } else harvestAction(s, got);
+    } else {
+        harvestAction(s, got);
+        M.c.woken_completed += 1;
+    }
     finishOp(s);
+    noteIoCompletion();
+    if (!s.deferred) inBatch(s);
 }
 
 fn sockFdOpen(fd: i32) bool {
@@ -789,6 +1051,7 @@ fn checkDgram(s: *Slot) void {
 
 fn clearWaiting(s: *Slot) void {
     switch (s.kind) {
+        .p_close, .p_shutdown => {},
         .p_recv => if (M.ends[s.target].waiting_recv == s) {
             M.ends[s.target].waiting_recv = null;
         },
@@ -825,34 +1088,26 @@ fn harvestAction(s: *Slot, got: Res) void {
             checkDgram(s);
         },
         .p_recv => {
-            const end = &M.ends[s.target];
-            const level = end.buf.items.len;
-            if (level == 0) fail("p_recv op #{d} (waited) completed {any} on an open pipe with nothing buffered: a kernel reader keeps waiting", .{ s.serial, got });
-            const n = @min(s.room(), level);
-            const want: Res = .{ .n = n };
+            if (s.wake_since == null) fail("p_recv op #{d} completed {any} though nothing woke it", .{ s.serial, got });
+            const want = pipeRecvNow(s.target, s, true).?;
             if (!Res.eql(want, got)) fail("p_recv op #{d} (waited): result {any}, the model's {any}", .{ s.serial, got, want });
-            checkScatter(s, end.buf.items[0..n], what);
-            end.buf.replaceRange(M.gpa(), 0, n, &.{}) catch @panic("oom");
-            end.received += n;
+            if (want == .n) checkScatter(s, s.want, what);
+            countPipeResult(want);
         },
         .p_send => {
-            const peer = &M.ends[1 - s.target];
-            const space = sim.pipe_buf_cap - peer.buf.items.len;
-            if (space == 0) fail("p_send op #{d} (waited) completed {any} into a full pipe", .{ s.serial, got });
-            const n = @min(s.total, space);
-            const want: Res = .{ .n = n };
+            if (s.wake_since == null) fail("p_send op #{d} completed {any} though nothing woke it", .{ s.serial, got });
+            const want = pipeSendNow(s.target, s, true).?;
             if (!Res.eql(want, got)) fail("p_send op #{d} (waited): result {any}, the model's {any}", .{ s.serial, got, want });
-            peer.buf.appendSlice(M.gpa(), gathered(s, n)) catch @panic("oom");
-            M.ends[s.target].accepted += n;
+            countPipeResult(want);
         },
-        .d_send, .d_poll_send, .d_close => fail("{s} op #{d} waited, but it never waits", .{ what, s.serial }),
+        .d_send, .d_poll_send, .d_close, .p_close, .p_shutdown => fail("{s} op #{d} waited, but it never waits", .{ what, s.serial }),
     }
 }
 
 fn finishOp(s: *Slot) void {
     s.done_poll = M.polls;
     switch (s.kind) {
-        .p_send, .p_recv => M.ends[s.target].inflight -= 1,
+        .p_send, .p_recv, .p_close, .p_shutdown => M.ends[s.target].inflight -= 1,
         // An op that outlived its socket counts against that incarnation only.
         else => if (M.socks[s.target].gen == s.gen) {
             M.socks[s.target].inflight -= 1;
@@ -968,31 +1223,7 @@ fn runStep(kind: StepKind) bool {
             if (n != tmp.total) fail("layer send of {d} bytes returned {d}", .{ tmp.total, n });
             modelSend(from, to_port, gathered(&tmp, tmp.total));
         },
-        .layer_recv => {
-            const k = openSock(false) orelse return false;
-            const sk = &M.socks[k];
-            var tmp: Slot = .{};
-            randomBufs(&tmp, false);
-            var from: os_net.sockaddr.in = undefined;
-            const got = os_net.recvDatagram(sk.fd, tmp.iov[0..tmp.n_iov], .{ .dontwait = true }, &from);
-            if (sk.qlen() == 0) {
-                if (got) |info| fail("layer receive on an empty queue got {d} bytes", .{info.len}) else |e| {
-                    if (e != error.WouldBlock) fail("layer receive on an empty queue: {t}", .{e});
-                }
-                M.c.would_block += 1;
-            } else {
-                const info = got catch |e| fail("layer receive with {d} queued: {t}", .{ sk.qlen(), e });
-                const d = takeHead(sk);
-                if (info.len != @min(tmp.room(), d.bytes.len) or info.truncated != (d.bytes.len > tmp.room())) {
-                    fail("layer receive: len {d} truncated {any}; the model's datagram has {d} bytes, room {d}", .{ info.len, info.truncated, d.bytes.len, tmp.room() });
-                }
-                if (info.truncated) M.c.truncated += 1;
-                tmp.addr = from;
-                tmp.want = d.bytes;
-                tmp.want_from = d.from_port;
-                checkDgram(&tmp);
-            }
-        },
+        .layer_recv => layerRecv(openSock(false) orelse return false),
         .layer_poll => {
             var fds: [n_socks]os_net.pollfd = undefined;
             var idx: [n_socks]u8 = undefined;
@@ -1021,6 +1252,16 @@ fn runStep(kind: StepKind) bool {
                 }
             }
             if (n == 0) return false;
+            if (r.uintLessThan(u8, 5) == 0) {
+                for (&M.timers) |*t| {
+                    if (!t.used or t.completions != 0) continue;
+                    t.cancel_req = true;
+                    M.in_cancel = true;
+                    M.loop.cancel(&t.t.c);
+                    M.in_cancel = false;
+                    return true;
+                }
+            }
             const s = &M.slots[cand[r.uintLessThan(usize, n)]];
             if (s.group != null and r.boolean()) {
                 const g = &M.groups[s.group.?];
@@ -1071,6 +1312,30 @@ fn runStep(kind: StepKind) bool {
             os_net.setsockopt(M.socks[k].fd, std.posix.system.SOL.SOCKET, std.posix.system.SO.RCVBUF, std.mem.asBytes(&v)) catch |e| fail("SO_RCVBUF: {t}", .{e});
             M.socks[k].limit = @intCast(v);
         },
+        .pipe_close, .pipe_shutdown => {
+            // Rare: a pair spent by closes or a reset is not reused, and a
+            // run has 15.
+            if (r.uintLessThan(u8, 3) != 0) return false;
+            const i = freeSlot() orelse return false;
+            const e = 2 * currentPair() + @as(u8, @intCast(r.uintLessThan(u8, 2)));
+            const s = (if (kind == .pipe_close) buildPipeClose(i, e) else buildPipeShutdown(i, e, switch (r.uintLessThan(u8, 3)) {
+                0 => .receive,
+                1 => .send,
+                else => .both,
+            })) orelse return false;
+            arm(s, r.boolean());
+            addToLoop(s.comp());
+        },
+        .pipe_reset => {
+            if (r.uintLessThan(u8, 3) != 0) return false;
+            const e = 2 * currentPair() + @as(u8, @intCast(r.uintLessThan(u8, 2)));
+            const E = &M.ends[e];
+            if (!endUsable(e) or E.reset or E.fail_at != null) return false;
+            const at = E.accepted + r.uintAtMost(u64, 3000);
+            sim.setSendFaults(E.fd, .{ .fail_at_byte = at });
+            E.fail_at = at;
+        },
+        .timer => return armTimer(),
         .clock => {
             // One poll (a cap of 0 only harvests), or polls until the clock
             // has moved by a fixed time: one poll stops at the next due op.
@@ -1113,7 +1378,7 @@ fn runGroup() bool {
         // Pick a target fd not used by another member.
         const s: ?*Slot = blk: {
             if (is_pipe) {
-                const e: u8 = @intCast(r.uintLessThan(u8, 2));
+                const e: u8 = 2 * currentPair() + @as(u8, @intCast(r.uintLessThan(u8, 2)));
                 break :blk if (kind == .p_send) buildPipeSend(i, e) else buildPipeRecv(i, e, false);
             }
             var cand: [n_socks]u8 = undefined;
@@ -1167,6 +1432,213 @@ fn runGroup() bool {
     return true;
 }
 
+/// A layer receive (`recvDatagram`, `dontwait`) on socket `k`, checked
+/// against the model's queue.
+fn layerRecv(k: u8) void {
+    const sk = &M.socks[k];
+    var tmp: Slot = .{};
+    randomBufs(&tmp, false);
+    var from: os_net.sockaddr.in = undefined;
+    const got = os_net.recvDatagram(sk.fd, tmp.iov[0..tmp.n_iov], .{ .dontwait = true }, &from);
+    if (sk.qlen() == 0) {
+        if (got) |info| fail("layer receive on an empty queue got {d} bytes", .{info.len}) else |e| {
+            if (e != error.WouldBlock) fail("layer receive on an empty queue: {t}", .{e});
+        }
+        M.c.would_block += 1;
+        return;
+    }
+    const info = got catch |e| fail("layer receive with {d} queued: {t}", .{ sk.qlen(), e });
+    const d = takeHead(sk);
+    if (info.len != @min(tmp.room(), d.bytes.len) or info.truncated != (d.bytes.len > tmp.room())) {
+        fail("layer receive: len {d} truncated {any}; the model's datagram has {d} bytes, room {d}", .{ info.len, info.truncated, d.bytes.len, tmp.room() });
+    }
+    if (info.truncated) M.c.truncated += 1;
+    tmp.addr = from;
+    tmp.want = d.bytes;
+    tmp.want_from = d.from_port;
+    checkDgram(&tmp);
+}
+
+/// A socket on which a callback inside a poll may act: its waiting op, if
+/// any, does not defer its callback, so that op has not been harvested yet
+/// (its callback would have run): the model's queue is the sim's.
+fn sockSafeInPoll() ?u8 {
+    const start = M.r().uintLessThan(u8, n_socks);
+    for (0..n_socks) |off| {
+        const k: u8 = @intCast((start + off) % n_socks);
+        const sk = &M.socks[k];
+        if (!sk.open) continue;
+        if (sk.waiting) |w| {
+            if (w.deferred) continue;
+        }
+        return k;
+    }
+    return null;
+}
+
+/// A socket whose waiting op does not defer, has not been called back, and
+/// has a datagram queued: woken in this batch, later in it.
+fn wokenSock() ?u8 {
+    for (&M.socks, 0..) |*sk, k| {
+        const w = sk.waiting orelse continue;
+        if (!w.deferred and w.completions == 0 and sk.open and sk.gen == w.gen and sk.qlen() > 0) return @intCast(k);
+    }
+    return null;
+}
+
+/// Inside a poll, from a callback that does not defer (an op's or a
+/// timer's), sometimes act as a program's callback can: close a socket and
+/// open it again (its number is reused), take a datagram with a layer
+/// receive (a woken receive on that socket then parks again), or cancel an
+/// op. Each can hit an op later in the same harvest batch.
+fn inBatch(from: ?*Slot) void {
+    if (!M.in_poll or M.in_add or M.in_cancel) return;
+    if (M.probe == .dgram) probeDgram();
+    const r = M.r();
+    // A woken op later in this batch is rare; take its datagram often.
+    if (wokenSock()) |k| {
+        if (r.boolean()) {
+            M.c.in_batch_steal += 1;
+            layerRecv(k);
+            return;
+        }
+    }
+    if (r.uintLessThan(u8, 6) != 0) return;
+    switch (r.uintLessThan(u8, 3)) {
+        0 => {
+            const k = sockSafeInPoll() orelse return;
+            const fd = M.socks[k].fd;
+            closeModel(k);
+            os_net.close(fd);
+            openModel(k);
+            M.c.in_batch_reopen += 1;
+        },
+        1 => {
+            // Prefer a socket whose op is woken in this batch and not yet
+            // harvested: the layer receive takes its datagram, and it must
+            // park again (the datagram repark).
+            const k = wokenSock() orelse sockSafeInPoll() orelse return;
+            const sk = &M.socks[k];
+            if (sk.waiting != null and sk.qlen() > 0) M.c.in_batch_steal += 1;
+            layerRecv(k);
+        },
+        else => {
+            var cand: [n_slots]u8 = undefined;
+            var n: usize = 0;
+            for (&M.slots, 0..) |*o, i| {
+                if (o.used and o.completions == 0 and o != from) {
+                    cand[n] = @intCast(i);
+                    n += 1;
+                }
+            }
+            if (n == 0) return;
+            const o = &M.slots[cand[r.uintLessThan(usize, n)]];
+            o.cancel_req = true;
+            M.in_cancel = true;
+            M.loop.cancel(o.comp());
+            M.in_cancel = false;
+            M.c.in_batch_cancel += 1;
+        },
+    }
+}
+
+// ---- refusal probes: a second ev op behind a woken one ----
+
+fn probeSubmit(s: *Slot, what: []const u8, behind: *Slot) noreturn {
+    std.debug.print("op model probe: seed {d} step {d}: a second ev {s} on fd {d} behind op #{d}, which is woken and not yet harvested\n", .{ M.seed, M.step, what, s.fd, behind.serial });
+    arm(s, false);
+    addToLoop(s.comp());
+    fail("probe: the sim accepted a second ev {s} behind a woken one", .{what});
+}
+
+/// Before a step: a pipe op that waits on the current pair and was woken
+/// (its callback has not run, so it is not harvested).
+fn probePipe() void {
+    const a = 2 * M.pair;
+    for ([2]u8{ a, a + 1 }) |e| {
+        const E = &M.ends[e];
+        const w = (if (M.probe == .recv) E.waiting_recv else E.waiting_send) orelse continue;
+        if (w.wake_since == null or w.completions != 0) continue;
+        const i = freeSlot() orelse return;
+        const s = initSlot(i, if (M.probe == .recv) .p_recv else .p_send);
+        s.fd = E.fd;
+        s.target = e;
+        if (M.probe == .recv) {
+            randomBufs(s, true);
+            s.box = .{ .recv = ev.NetRecv.init(s.fd, .{ .iovecs = s.iov[0..s.n_iov] }, .{}) };
+            probeSubmit(s, "receive", w);
+        }
+        randomParts(s, pipe_part_max, true);
+        s.box = .{ .send = ev.NetSend.init(s.fd, .{ .iovecs = s.iovc[0..s.n_iov] }, .{}) };
+        probeSubmit(s, "send", w);
+    }
+}
+
+/// Inside a harvest: a socket whose receive or poll waits, does not defer,
+/// has not been called back, and whose datagram has landed: it is woken and
+/// later in this batch.
+fn probeDgram() void {
+    for (&M.socks) |*sk| {
+        const w = sk.waiting orelse continue;
+        if (w.deferred or w.completions != 0 or !sk.open or sk.gen != w.gen or sk.qlen() == 0) continue;
+        const i = freeSlot() orelse return;
+        const s = initSlot(i, .d_recv);
+        s.fd = sk.fd;
+        s.target = @intCast((@intFromPtr(sk) - @intFromPtr(&M.socks[0])) / @sizeOf(MSock));
+        s.gen = sk.gen;
+        randomBufs(s, false);
+        s.addr_len = @sizeOf(os_net.sockaddr.in);
+        s.box = .{ .recvfrom = ev.NetRecvFrom.init(s.fd, .{ .iovecs = s.iov[0..s.n_iov] }, .{}, @ptrCast(&s.addr), &s.addr_len) };
+        probeSubmit(s, "receive", w);
+    }
+}
+
+fn noteIoCompletion() void {
+    if (!M.in_poll) return;
+    const now = sim.clockNs();
+    if (M.last_timer_clock == now and M.last_timer_poll == M.polls) M.c.timer_and_io_at_one_time += 1;
+    M.last_io_clock = now;
+    M.last_io_poll = M.polls;
+}
+
+fn onTimer(_: *ev.Loop, cp: *ev.Completion) void {
+    const t: *TimerSlot = @ptrCast(@alignCast(cp.userdata.?));
+    syncLand();
+    t.completions += 1;
+    if (t.completions > 1) fail("a timer completed {d} times", .{t.completions});
+    const now = sim.clockNs();
+    if (t.t.getResult()) |_| {
+        if (now != t.deadline) fail("a timer due at {d} ns fired at {d} ns", .{ t.deadline, now });
+        M.c.timers_fired += 1;
+        if (M.last_io_clock == now and M.last_io_poll == M.polls) M.c.timer_and_io_at_one_time += 1;
+        M.last_timer_clock = now;
+        M.last_timer_poll = M.polls;
+    } else |e| {
+        if (e != error.Canceled or !t.cancel_req) fail("a timer ended {t}", .{e});
+    }
+    t.used = false;
+    inBatch(null);
+}
+
+/// A timer due when a datagram lands (the wire latency), when a pipe op is
+/// harvested (1 or 5 ms), or at another time; its callback does not defer,
+/// and may act as `inBatch` does.
+fn armTimer() bool {
+    for (&M.timers) |*t| {
+        if (t.used) continue;
+        const offs = [_]u64{ sim.wire_latency_ns, std.time.ns_per_ms, 5 * std.time.ns_per_ms, 200_000 };
+        const d = offs[M.r().uintLessThan(usize, offs.len)];
+        t.* = .{ .used = true, .deadline = sim.clockNs() + d };
+        t.t = ev.Timer.init(.{ .duration = .fromNanoseconds(d) });
+        t.t.c.callback = onTimer;
+        t.t.c.userdata = t;
+        t.t.c.flags.defer_callback = false;
+        addToLoop(&t.t.c);
+        return true;
+    }
+    return false;
+}
+
 fn openModel(k: u8) void {
     const sk = &M.socks[k];
     const fd = os_net.socket(.ipv4, .dgram, .ip, .{ .nonblocking = true }) catch |e| fail("open: {t}", .{e});
@@ -1190,7 +1662,8 @@ fn closeModel(k: u8) void {
     M.c.discarded_at_close += sk.qlen();
     if (sk.waiting) |w| {
         w.woken_closed = true;
-        w.must_by_poll = M.polls + 1;
+        // A close inside a poll wakes it after that harvest took its batch.
+        w.must_by_poll = M.polls + 1 + @intFromBool(M.in_poll);
         sk.waiting = null;
     }
     // The dropped count is per socket; check it one last time.
@@ -1219,10 +1692,21 @@ fn pollOnce(cap_ns: u64) void {
         if (s.must_by_clock) |t| {
             if (now >= t) fail("{t} op #{d}, decided at submit, has not completed 10 ms later", .{ s.kind, s.serial });
         }
-        const sk = &M.socks[s.target];
-        if ((s.kind == .d_recv or s.kind == .d_poll_recv) and s.at_submit == null and !s.woken_closed and sk.open and sk.gen == s.gen and sk.qlen() > 0) {
-            fail("{t} op #{d} still waits on a socket with {d} datagrams queued", .{ s.kind, s.serial, sk.qlen() });
+        switch (s.kind) {
+            .d_recv, .d_poll_recv => {
+                const sk = &M.socks[s.target];
+                if (s.at_submit == null and !s.woken_closed and sk.open and sk.gen == s.gen and sk.qlen() > 0) {
+                    fail("{t} op #{d} still waits on a socket with {d} datagrams queued: its wake was lost, or it lost its registration", .{ s.kind, s.serial, sk.qlen() });
+                }
+            },
+            .p_recv, .p_send => if (s.wake_since) |t| {
+                if (now >= t + pipe_wake_ns) fail("{t} op #{d} was woken at {d} ns (bytes, room, a close, a shutdown or a reset) and has not completed at {d} ns: its wake was lost, or it lost its registration", .{ s.kind, s.serial, t, now });
+            },
+            else => {},
         }
+    }
+    for (&M.timers) |*t| {
+        if (t.used and t.completions == 0 and !t.cancel_req and now > t.deadline) fail("a timer due at {d} ns has not fired at {d} ns", .{ t.deadline, now });
     }
 }
 
@@ -1230,7 +1714,7 @@ fn checkAfterStep() void {
     for (&M.socks) |*sk| {
         if (sk.open) checkSockStats(sk);
     }
-    for (&M.ends) |*e| {
+    for (M.ends[0 .. 2 * @as(usize, M.pairs)]) |*e| {
         const got = sim.testPipeBuffered(e.fd);
         if (got != e.buf.items.len) fail("pipe end fd {d} holds {d} bytes, the model {d}", .{ e.fd, got, e.buf.items.len });
     }
@@ -1249,6 +1733,11 @@ fn runSeed(seed_value: u64, steps: usize, child: bool) Counts {
     M.groups = @splat(.{});
     M.socks = @splat(.{});
     M.ends = @splat(.{});
+    M.pairs = 0;
+    M.pair = 0;
+    M.timers = @splat(.{});
+    M.last_io_clock = std.math.maxInt(u64);
+    M.last_timer_clock = std.math.maxInt(u64);
     M.wire = .empty;
     M.used_fds = .empty;
     M.next_gen = 1;
@@ -1265,13 +1754,12 @@ fn runSeed(seed_value: u64, steps: usize, child: bool) Counts {
     M.keepalive = ev.Timer.init(.{ .duration = .fromSeconds(1_000_000) });
     M.loop.add(&M.keepalive.c);
 
-    const p = sim.pipePair();
-    M.ends[0].fd = p[0];
-    M.ends[1].fd = p[1];
+    _ = newPair();
     for (0..n_socks) |k| openModel(@intCast(k));
 
     while (M.step < steps) : (M.step += 1) {
         if (child) progress();
+        if (M.probe == .recv or M.probe == .send) probePipe();
         const kind = pickStep();
         if (runStep(kind)) M.c.steps[@backingInt(kind)] += 1 else M.c.skipped[@backingInt(kind)] += 1;
         checkAfterStep();
@@ -1281,41 +1769,48 @@ fn runSeed(seed_value: u64, steps: usize, child: bool) Counts {
     return M.c;
 }
 
-/// Settle, check that what still waits has a reason to, cancel it, drain
-/// everything, close everything, and check that nothing is left.
+/// Settle; then give every op that still waits what it waits for, and
+/// require it to complete with the model's result: an op that lost its
+/// registration fails here, where cancelling it would have hidden it. Then
+/// drain and close everything, and check that nothing is left.
 fn finish() void {
     // Settle by clock time, not by a count of polls: a poll moves the clock
     // only to the next due op, and a pipe op is due up to 5 ms after a wake.
-    const settle_until = sim.clockNs() + 20 * std.time.ns_per_ms;
-    while (sim.clockNs() < settle_until) pollOnce(2_000_000);
+    settle(20 * std.time.ns_per_ms);
     checkAfterStep();
-    for (&M.slots) |*s| {
-        if (!s.used or s.completions != 0) continue;
-        if (s.at_submit != null or s.cancel_req or s.woken_closed) fail("{t} op #{d} never completed (cancel asked: {any})", .{ s.kind, s.serial, s.cancel_req });
-        const ok = switch (s.kind) {
-            .d_recv, .d_poll_recv => M.socks[s.target].open and M.socks[s.target].gen == s.gen and M.socks[s.target].qlen() == 0,
-            .p_recv => M.ends[s.target].buf.items.len == 0,
-            .p_send => M.ends[1 - s.target].buf.items.len == sim.pipe_buf_cap,
-            else => false,
-        };
-        if (!ok) fail("{t} op #{d} (target {d}, submitted at poll {d}, deferred {any}, group {any}) still waits with nothing to wait for; pipe levels {d} and {d}", .{ s.kind, s.serial, s.target, s.submit_poll, s.deferred, s.group, M.ends[0].buf.items.len, M.ends[1].buf.items.len });
+    var round: usize = 0;
+    while (round < 4) : (round += 1) {
+        // First list them, then give: a gift is an op in a free slot, and
+        // the list must not see it.
+        var waiting: usize = 0;
+        var to_give: [n_slots]*Slot = undefined;
+        var n_give: usize = 0;
+        for (&M.slots) |*s| {
+            if (!s.used or s.completions != 0) continue;
+            if (s.at_submit != null or s.cancel_req or s.woken_closed) fail("{t} op #{d} never completed (decided at submit {any}, cancel asked {any}, woken by a close {any}, group {any}, deferred {any}, submitted at poll {d}, now {d} ns, must by {any} ns)", .{ s.kind, s.serial, s.at_submit, s.cancel_req, s.woken_closed, s.group, s.deferred, s.submit_poll, sim.clockNs(), s.must_by_clock });
+            waiting += 1;
+            // Woken already (maybe late in the settle): `pollOnce` holds it
+            // to its wake time; give it nothing more.
+            if (s.wake_since == null) {
+                to_give[n_give] = s;
+                n_give += 1;
+            }
+        }
+        for (to_give[0..n_give]) |s| give(s);
+        if (waiting == 0) break;
+        settle(2 * pipe_wake_ns);
+        checkAfterStep();
     }
-    M.step = std.math.maxInt(usize);
     for (&M.slots) |*s| {
-        if (!s.used or s.completions != 0) continue;
-        s.cancel_req = true;
-        M.in_cancel = true;
-        M.loop.cancel(s.comp());
-        M.in_cancel = false;
-    }
-    const cancel_until = sim.clockNs() + 20 * std.time.ns_per_ms;
-    while (sim.clockNs() < cancel_until) pollOnce(2_000_000);
-    for (&M.slots) |*s| {
-        if (s.used and s.completions == 0) fail("{t} op #{d} did not complete after its cancel", .{ s.kind, s.serial });
+        if (s.used and s.completions == 0) fail("{t} op #{d} still waits after what it waits for was given to it: it lost its registration", .{ s.kind, s.serial });
     }
     for (&M.groups) |*g| {
         if (g.used) fail("a race group never completed", .{});
     }
+    for (&M.timers) |*t| {
+        if (t.used) fail("a timer due at {d} ns never fired", .{t.deadline});
+    }
+    M.step = std.math.maxInt(usize);
     // Drain every socket through the layer.
     for (&M.socks) |*sk| {
         if (!sk.open) continue;
@@ -1341,44 +1836,32 @@ fn finish() void {
             checkDgram(&tmp);
         }
     }
-    // Drain the pipe with ev receives.
-    for (0..2) |e| {
-        while (M.ends[e].buf.items.len > 0) {
+    // Drain every pipe end that can still be read, with ev receives. Bytes
+    // at an end closed for reading stay there: `left` in the ledger.
+    var left: u64 = 0;
+    for (M.ends[0 .. 2 * @as(usize, M.pairs)], 0..) |*E, e| {
+        while (E.buf.items.len > 0 and endUsable(@intCast(e)) and !E.reset) {
             const i = freeSlot().?;
             const s = buildPipeRecv(i, @intCast(e), false).?;
             arm(s, false);
             addToLoop(s.comp());
-            pollOnce(10_000_000);
+            settle(2 * pipe_wake_ns);
         }
-        const i = freeSlot().?;
-        const s = initSlot(i, .p_recv);
-        s.fd = M.ends[e].fd;
-        s.target = @intCast(e);
-        s.dontwait = true;
-        randomBufs(s, true);
-        s.box = .{ .recv = ev.NetRecv.init(s.fd, .{ .iovecs = s.iov[0..s.n_iov] }, .{ .dontwait = true }) };
-        s.at_submit = .{ .err = error.WouldBlock };
-        arm(s, false);
-        addToLoop(s.comp());
+        left += E.buf.items.len;
     }
     for (&M.socks, 0..) |*sk, k| {
         if (!sk.open) continue;
         closeModel(@intCast(k));
         os_net.close(sk.fd);
     }
-    for (0..2) |e| {
-        var cl = ev.NetClose.init(M.ends[e].fd);
-        pipe_closed = false;
-        cl.c.callback = onPipeClose;
-        addToLoop(&cl.c);
-        var tries: usize = 0;
-        while (!pipe_closed) : (tries += 1) {
-            if (tries == 10) fail("the close of pipe end {d} never completed", .{e});
-            pollOnce(10_000_000);
-        }
-        cl.getResult() catch |err| fail("pipe close: {t}", .{err});
+    for (M.ends[0 .. 2 * @as(usize, M.pairs)], 0..) |*E, e| {
+        if (E.closed) continue;
+        const i = freeSlot().?;
+        const s = buildPipeClose(i, @intCast(e)).?;
+        arm(s, false);
+        addToLoop(s.comp());
     }
-    pollOnce(10_000_000);
+    settle(2 * pipe_wake_ns);
     if (sim.hasLiveIo()) fail("ops still live at the end", .{});
     if (sim.hasDueIo() or sim.nextDueIoRemaining() != null) fail("I/O still due or on the wire at the end", .{});
     if (sim.hasParkedIo()) fail("a pipe op still parked at the end", .{});
@@ -1388,8 +1871,63 @@ fn finish() void {
     }
     const lost = M.c.dgrams_sent - M.delivered - M.c.dropped_rcvbuf - M.c.dropped_nosock - M.c.discarded_at_close;
     if (lost != 0) fail("{d} datagrams sent, {d} received, {d} + {d} dropped, {d} discarded at close", .{ M.c.dgrams_sent, M.delivered, M.c.dropped_rcvbuf, M.c.dropped_nosock, M.c.discarded_at_close });
-    for (0..2) |e| {
-        if (M.ends[e].accepted != M.ends[1 - e].received) fail("pipe end {d}: {d} bytes accepted, {d} received at the other end", .{ e, M.ends[e].accepted, M.ends[1 - e].received });
+    var accepted: u64 = 0;
+    var received: u64 = 0;
+    var dropped: u64 = 0;
+    for (M.ends[0 .. 2 * @as(usize, M.pairs)]) |*E| {
+        accepted += E.accepted;
+        received += E.received;
+        dropped += E.dropped;
+    }
+    if (accepted != received + dropped + left) fail("pipes: {d} bytes accepted, {d} received, {d} dropped by a reset, {d} left at ends closed for reading", .{ accepted, received, dropped, left });
+}
+
+/// Polls until the clock has moved by `ns`.
+fn settle(ns: u64) void {
+    const until = sim.clockNs() + ns;
+    while (sim.clockNs() < until) pollOnce(until - sim.clockNs());
+}
+
+/// Gives a waiting op what it waits for: bytes or room on its pipe, or a
+/// datagram on its socket. Its completion is then checked as any other.
+fn give(w: *Slot) void {
+    M.c.registration_proofs += 1;
+    switch (w.kind) {
+        .p_recv => {
+            const p = w.target ^ 1;
+            if (!endUsable(p) or M.ends[p].waiting_send != null) fail("p_recv op #{d} waits, but its peer cannot send to it", .{w.serial});
+            const i = freeSlot() orelse fail("no free slot to give op #{d} its bytes", .{w.serial});
+            const s = initSlot(i, .p_send);
+            s.fd = M.ends[p].fd;
+            s.target = p;
+            s.n_iov = 1;
+            s.parts[0] = "registered";
+            s.iovc[0] = os_net.iovecConstFromSlice(s.parts[0]);
+            s.total = s.parts[0].len;
+            s.at_submit = pipeSendNow(p, s, false) orelse fail("p_recv op #{d} waits on an empty end, but its peer's buffer is full", .{w.serial});
+            s.box = .{ .send = ev.NetSend.init(s.fd, .{ .iovecs = s.iovc[0..1] }, .{}) };
+            arm(s, false);
+            addToLoop(s.comp());
+        },
+        .p_send => {
+            const p = w.target ^ 1;
+            const i = freeSlot() orelse fail("no free slot to give op #{d} room", .{w.serial});
+            const s = buildPipeRecv(i, p, false) orelse fail("p_send op #{d} waits, but its peer cannot receive", .{w.serial});
+            arm(s, false);
+            addToLoop(s.comp());
+        },
+        .d_recv, .d_poll_recv => {
+            const sk = &M.socks[w.target];
+            for (&M.socks) |*from| {
+                if (!from.open or flowClash(from.port, sk.port)) continue;
+                var one = [1]os_net.iovec_const{os_net.iovecConstFromSlice("registered")};
+                const to = sockAddr(sk.port);
+                _ = os_net.sendDatagram(from.fd, &one, .{}, &to, null) catch |e| fail("give: send: {t}", .{e});
+                modelSend(from, sk.port, "registered");
+                return;
+            }
+        },
+        else => fail("{t} op #{d} waits, but it never waits", .{ w.kind, w.serial }),
     }
 }
 
@@ -1411,14 +1949,16 @@ fn printCounts(c: Counts, seeds: usize, steps: usize) void {
     std.debug.print("\nop model counts: skipped by kind (the rules or the state forbade it then):", .{});
     inline for (comptime std.meta.fieldNames(StepKind), 0..) |name, k| std.debug.print(" {s}={d}", .{ name, c.skipped[k] });
     std.debug.print("\n", .{});
-    std.debug.print("op model counts: ops={d} parked={d} canceled={d} closed_hit={d} reused_number_ops={d} closed_then_reused={d} groups={d} f1_shape_groups={d} followups={d} followups_into_canceled_due={d} f2_shape={d}\n", .{ c.ops, c.parked, c.canceled, c.closed_hit, c.reused_number_ops, c.closed_then_reused, c.groups, c.f1_shape_groups, c.followups, c.followups_into_canceled_due, c.f2_shape });
+    std.debug.print("op model counts: ops={d} parked={d} canceled={d} closed_hit={d} reused_number_ops={d} closed_then_reused={d} groups={d} f1_shape_groups={d} followups={d} followups_into_canceled_due={d}\n", .{ c.ops, c.parked, c.canceled, c.closed_hit, c.reused_number_ops, c.closed_then_reused, c.groups, c.f1_shape_groups, c.followups, c.followups_into_canceled_due });
     std.debug.print("op model counts: dgrams_sent={d} empty={d} truncated={d} scatter_recvs={d} dropped_rcvbuf={d} dropped_nosock={d} discarded_at_close={d} landed_in_new_socket={d} only_empty_left={d} landed_behind_empty={d} pipe_parked_sends={d} would_block={d} polls={d} no_free_slot={d}\n", .{ c.dgrams_sent, c.empty_dgrams, c.truncated, c.scatter_recvs, c.dropped_rcvbuf, c.dropped_nosock, c.discarded_at_close, c.landed_in_new_socket, c.only_empty_left, c.landed_behind_empty, c.pipe_parked_sends, c.would_block, c.polls, c.no_free_slot });
+    std.debug.print("op model counts: woken_completed={d} registration_proofs={d} in_batch_reopen={d} in_batch_steal={d} in_batch_cancel={d} timers_fired={d} timer_and_io_at_one_time={d} pipe_pairs={d} pipe_closes={d} pipe_shutdowns={d} pipe_resets={d} end_of_stream={d} broken_pipe={d} reset_errors={d}\n", .{ c.woken_completed, c.registration_proofs, c.in_batch_reopen, c.in_batch_steal, c.in_batch_cancel, c.timers_fired, c.timer_and_io_at_one_time, c.pipe_pairs, c.pipe_closes, c.pipe_shutdowns, c.pipe_resets, c.end_of_stream, c.broken_pipe, c.reset_errors });
 }
 
 test "sim: op model: datagram sockets and a pipe under random sends, receives, polls, cancels, race groups, close and reopen, in a child process" {
     if (comptime !sim.compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
     if (!sim.isDeathChild()) return;
     sim.noCoreDump();
+    if (std.c.getenv("ZIO_OP_MODEL_PROBE")) |pv| M.probe = std.meta.stringToEnum(Probe, std.mem.span(pv)) orelse @panic("op model: ZIO_OP_MODEL_PROBE is recv, send or dgram");
     const steps: usize = @intCast(envU64("ZIO_OP_MODEL_STEPS") orelse default_steps);
     var total: Counts = .{};
     var n_seeds: usize = 0;
@@ -1429,22 +1969,26 @@ test "sim: op model: datagram sockets and a pipe under random sends, receives, p
         total.add(runSeed(s, steps, true));
         n_seeds += 1;
     }
+    if (M.probe != .none) {
+        // The probe never had its chance: the parent fails on this line.
+        std.debug.print("op model probe: never reached\n", .{});
+        return;
+    }
     printCounts(total, n_seeds, steps);
     // A kind that never happened is a hole in the instrument, not a pass.
     for (total.steps, 0..) |n, k| {
         if (n == 0) fail("no step of kind {t} ran", .{@as(StepKind, @fromBackingInt(@intCast(k)))});
     }
-    inline for (.{ "parked", "canceled", "closed_hit", "reused_number_ops", "closed_then_reused", "f1_shape_groups", "followups_into_canceled_due", "empty_dgrams", "truncated", "scatter_recvs", "dropped_rcvbuf", "dropped_nosock", "discarded_at_close", "landed_in_new_socket", "pipe_parked_sends" }) |name| {
+    inline for (.{ "parked", "canceled", "closed_hit", "reused_number_ops", "closed_then_reused", "f1_shape_groups", "followups_into_canceled_due", "empty_dgrams", "truncated", "scatter_recvs", "dropped_rcvbuf", "dropped_nosock", "discarded_at_close", "landed_in_new_socket", "pipe_parked_sends", "woken_completed", "registration_proofs", "in_batch_reopen", "in_batch_steal", "in_batch_cancel", "timers_fired", "timer_and_io_at_one_time", "pipe_closes", "pipe_shutdowns", "pipe_resets", "end_of_stream", "broken_pipe", "reset_errors" }) |name| {
         if (@field(total, name) == 0) fail("the counter {s} is 0: that case never ran", .{name});
     }
     sim.childDone(child_name);
 }
 
-test "sim: op model: datagram sockets and a pipe under random sends, receives, polls, cancels, race groups, close and reopen" {
-    if (comptime !sim.compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
-    if (sim.isDeathChild()) return;
+/// Runs the child test with `probe` (null: the normal run); returns its
+/// result, owned by `gpa`.
+fn runChild(gpa: std.mem.Allocator, probe: ?[]const u8) !std.process.RunResult {
     const io = std.testing.io;
-    const gpa = std.testing.allocator;
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_len = try std.process.executablePath(io, &exe_buf);
     var env: std.process.Environ.Map = .init(gpa);
@@ -1453,13 +1997,21 @@ test "sim: op model: datagram sockets and a pipe under random sends, receives, p
     for ([_][:0]const u8{ "ZIO_OP_MODEL_SEED", "ZIO_OP_MODEL_STEPS" }) |name| {
         if (std.c.getenv(name)) |v| try env.put(name, std.mem.span(v));
     }
+    if (probe) |p| try env.put("ZIO_OP_MODEL_PROBE", p);
     try env.put("TEST_FILTER", child_name);
     try env.put(sim.death_child_env, "1");
-    const res = try std.process.run(gpa, io, .{
+    return std.process.run(gpa, io, .{
         .argv = &.{exe_buf[0..exe_len]},
         .environ_map = &env,
         .timeout = .{ .duration = .{ .raw = .fromSeconds(600), .clock = .awake } },
     });
+}
+
+test "sim: op model: datagram sockets and a pipe under random sends, receives, polls, cancels, race groups, close and reopen" {
+    if (comptime !sim.compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    if (sim.isDeathChild()) return;
+    const gpa = std.testing.allocator;
+    const res = try runChild(gpa, null);
     defer gpa.free(res.stdout);
     defer gpa.free(res.stderr);
     const ok = switch (res.term) {
@@ -1482,4 +2034,31 @@ test "sim: op model: datagram sockets and a pipe under random sends, receives, p
         return error.OpModelFailed;
     }
     try sim.checkDoneMarkers(child_name, res.stderr);
+    if (std.c.getenv("ZIO_OP_MODEL_SEED") != null) return;
+    // The probes: in a run, at the first chance, a second ev op behind a
+    // woken one; the sim must refuse it, naming the woken one's state.
+    const probes = [_]struct { []const u8, []const u8 }{
+        .{ "recv", "sim: a second ev receive while one is woken and not yet harvested, on sim pipe fd " },
+        .{ "send", "sim: a second ev send while one is woken and not yet harvested, on sim pipe fd " },
+        .{ "dgram", "sim: a second ev receive or poll while one is woken and not yet harvested, on sim datagram socket " },
+    };
+    for (probes) |pr| {
+        const pres = try runChild(gpa, pr[0]);
+        defer gpa.free(pres.stdout);
+        defer gpa.free(pres.stderr);
+        var where: []const u8 = "op model probe: never reached";
+        var pit = std.mem.splitScalar(u8, pres.stderr, '\n');
+        while (pit.next()) |line| {
+            if (std.mem.indexOf(u8, line, "op model probe: ") != null) where = line;
+        }
+        const died = switch (pres.term) {
+            .signal => |sg| sg == .ABRT,
+            else => false,
+        };
+        if (!died or !sim.hasPanicLine(pres.stderr, pr[1])) {
+            std.debug.print("op model probe {s}: term {any}; {s}; wanted the panic \"{s}...\"\n", .{ pr[0], pres.term, where, pr[1] });
+            return error.ProbeNotRefused;
+        }
+        std.debug.print("{s}: refused\n", .{where});
+    }
 }

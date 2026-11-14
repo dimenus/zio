@@ -2123,7 +2123,7 @@ fn expectChildPanics(comptime test_name: []const u8, comptime want: []const u8) 
 /// `refuse` writes, or `thread <n> panic: <want>`. A plain substring match is
 /// not enough: a panic's stack trace prints source lines, and the test's own
 /// line holds `want` as a literal, so any other panic would match it.
-fn hasPanicLine(stderr: []const u8, want: []const u8) bool {
+pub fn hasPanicLine(stderr: []const u8, want: []const u8) bool {
     var it = std.mem.splitScalar(u8, stderr, '\n');
     while (it.next()) |raw| {
         var line = raw;

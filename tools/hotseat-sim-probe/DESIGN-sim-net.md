@@ -731,10 +731,10 @@ fix, then the fix and mutants. Each commit has the failing output.
   needs).
 - **The pipe model test, 1143822:** the reference calls no helper of the
   pipe code; zero to five slices.
-- **Not reached by any model test yet (t-4098):** pipe close,
-  shutdown and reset in the middle of the op-level test's steps; datagram
-  flows that share a landing instant against an op model; a waiting pipe
-  op with a deferred callback; a zero-room pipe receive (t-4096).
+- **Not reached by any model test yet (t-4098):** datagram flows that
+  share a landing instant against an op model; a waiting pipe op with a
+  deferred callback; a zero-room pipe receive (t-4096). (Pipe close,
+  shutdown and reset in the steps were added in round 3.)
 
 ### Round 3 of the outside review (gpt-simnet5.md, of b9b9bd1)
 
@@ -762,6 +762,16 @@ F1's guard (`isLive`, `endOp`) was found sound.
   repark stays, for a layer receive (`recvDatagram`) that takes the
   datagram first. starh2's gate with the rule: no refusal. A receive with no
   room no longer wakes the parked send (it freed nothing).
+- **Finding 4 and the model's gaps:** the op model now holds every waiting
+  op to its wake: after each poll, a pipe op woken (bytes, room, close,
+  shutdown, reset) must have completed `pipe_wake_ns` after its wake, and a
+  datagram op as soon as its datagram landed; at the end each op still
+  waiting is given what it waits for and must complete, not be cancelled.
+  It also generates, inside a poll, a socket closed and reopened, a layer
+  receive that takes a woken op's datagram, and a cancel; timers due with
+  I/O; pipe close, shutdown and reset; and probes of a second op behind a
+  woken one (receive, send, datagram). It does not reach a CompletionQueue's
+  coop yield (no runtime); `sim.zig` tests that route alone.
 
 ### Next
 
