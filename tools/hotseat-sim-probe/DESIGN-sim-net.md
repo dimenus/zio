@@ -991,6 +991,14 @@ the mutants in its commits.
     stream parity`. Mutants: `mut/27-s1.json` beside report 27, all
     killed; d613fd1's message has their table and what was rejected.
     Report 27 has the gates' commands and output.
+  - **The outside review of slice 1's code** (`gpt-simnet12.md`, of
+    efa63a1): no P1; three P2 and one P3, all answered in 2ea6222. Empty
+    buffer lists on a stream fd refuse in the layer's eight calls and in
+    std.Io's read; each op row of the surface table has its own check;
+    the rule rows have typed identities (`Rule`, `ruleSlice`), so a row
+    cannot vanish; the TCP landing time and `next_conn_id` are checked,
+    named panics. Mutants: `mut/28-f.json` beside report 28, all killed.
+    Report 28 has the gates.
   - **Next: slice 2** (17.16: bytes, chunks, window, credit and
     conservation; FIN and RST with data; the profiles' send and receive
     rules; `.both`; linger 0; `getpeername`; `bytesReadable`; the window
@@ -1036,7 +1044,8 @@ the mutants in its commits.
     to 29, 33 to 38; mutants; the gates of this section.
   - Open for the sim seat, queued, not started: t-4096 (refuse a
     zero-room receive, decided yes), t-4106 (the spawn windows), t-4115
-    (the bind cells slice 1 refuses as not measured).
+    (the bind cells slice 1 refuses as not measured), t-4117 (the
+    datagram and pipe wire times are still unchecked additions).
 - **For hotseat, not zio:** ENet's receive returns 0 for an empty datagram,
   the same as would-block, so ENet's receive loop stops there for that
   service call. Later datagrams wait for the next call.
@@ -1094,6 +1103,16 @@ the mutants in its commits.
   one. Before `sim.end`, a stream test closes every stream socket and
   sleeps while `sim.streamEntriesInFlight()` is not 0 (`drain` in
   `src/sim_stream_test.zig`); `end` panics on what is left.
+- **The surface table needs the filter `sim: stream`:** its refusal rows
+  run other tests in child processes, and a build filtered to the table
+  alone does not contain them. To run the table by itself, build with
+  `-Dtest-filter="sim: stream" -Demit-test-bin=true --prefix <d>` and
+  run `<d>/bin/test` with `TEST_FILTER="sim: stream surface table"`.
+  The same works for a mutant that the runner reports NOT RUN because
+  an earlier test crashed the process.
+- **A new rule of section 17** gets a tag in `Rule` and its slice in
+  `ruleSlice` in `src/sim_stream_test.zig`; the build fails until it
+  has exactly one row.
 
 - **zig:** `$(mise where zig@0.17.0)/zig`. Never `zig` by name;
   `~/.zvm/bin/zig` is 0.16.
