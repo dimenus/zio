@@ -2612,16 +2612,27 @@ fn tcpBefore(a: TcpEntry, b: TcpEntry) bool {
 fn sendTcp(ci: u16, from: Side, kind: TcpKind, to: Ip4) void {
     const k = &conns[ci];
     const d = @backingInt(from);
-    const e: TcpEntry = .{ .due_at = clock_ns + wire_latency_ns, .conn_id = k.id, .conn = ci, .dir = from, .seq = k.next_seq[d], .kind = kind, .to = to };
+    const e: TcpEntry = .{ .due_at = tcpLandingTime(), .conn_id = k.id, .conn = ci, .dir = from, .seq = k.next_seq[d], .kind = kind, .to = to };
     k.next_seq[d] += 1;
     var pos = tcp_wire.items.len;
     while (pos > 0 and tcpBefore(e, tcp_wire.items[pos - 1])) pos -= 1;
     tcp_wire.insertAssumeCapacity(pos, e);
 }
 
-/// Room for `n` more TCP entries. Out of memory panics: a landing that must
-/// answer has no error to return.
+/// When a TCP entry sent now lands. The clock can reach `maxInt(u64)`
+/// (`advanceNs` saturates), and a landing time past it would wrap to the
+/// past: that is the sim's time limit, a named panic, never a wrapped or
+/// saturated time (outside review 5, finding 4).
+fn tcpLandingTime() u64 {
+    return std.math.add(u64, clock_ns, wire_latency_ns) catch panic("sim: a TCP entry sent at {d} ns would land after maxInt(u64) ns: the sim's time limit", .{clock_ns});
+}
+
+/// Room for `n` more TCP entries, and a landing time for them: every path
+/// that sends calls this before it changes any state, so a limit panics
+/// with nothing half done. Out of memory panics: a landing that must answer
+/// has no error to return.
 fn reserveTcp(n: usize) void {
+    _ = tcpLandingTime();
     if (tcp_wire.items.len + n > max_tcp_entries) panic("sim: {d} TCP entries on the wire: the limit is max_tcp_entries, {d}", .{ tcp_wire.items.len + n, max_tcp_entries });
     tcp_wire.ensureUnusedCapacity(net_alloc, n) catch panic("sim: out of memory for a TCP wire entry", .{});
 }
@@ -2667,12 +2678,17 @@ pub fn streamConnect(fd: i32, to: Ip4, c: *anyopaque, id: u32) error{AddressInUs
     var ci: usize = 0;
     while (ci < max_conns and conns[ci].used) ci += 1;
     if (ci == max_conns) panic("sim: {d} connections at once: the limit is max_conns", .{max_conns});
+    // A conn_id is never reused in a run, so the run's last u32 cannot be
+    // handed out: the connect after it would need a successor that wraps
+    // (outside review 5, finding 4). Checked, with the time limit, before
+    // the port counter or any table moves.
+    const after_id = std.math.add(u32, next_conn_id, 1) catch panic("sim: conn_id {d} is the last a u32 holds: conn_ids are never reused in a run, so a run makes at most {d} connections", .{ next_conn_id, std.math.maxInt(u32) - 1 });
+    reserveTcp(1);
     const here: [4]u8 = .{ 127, 0, 0, 1 };
     const port = try tcpEphemeral(here);
-    reserveTcp(1);
     const local: Ip4 = .{ .ip = here, .port = port };
     conns[ci] = .{ .used = true, .id = next_conn_id };
-    next_conn_id += 1;
+    next_conn_id = after_id;
     conns[ci].ends[@backingInt(Side.client)] = .{ .phase = .c_syn, .slot = @intCast(sockIndex(fd)), .local = local, .peer = to };
     s.kind = .endpoint;
     s.conn = @intCast(ci);
@@ -2804,10 +2820,11 @@ fn closeListener(j: usize) void {
         const e = &k.ends[@backingInt(Side.server)];
         if (e.phase != .s_prov and e.phase != .s_queued) continue;
         if (e.listener_slot != j or e.listener_gen != dgram_gen[j]) continue;
+        const answer = !e.reset_received and !e.rst_sent;
+        if (answer) reserveTcp(1);
         e.phase = .dead;
-        if (!e.reset_received and !e.rst_sent) {
+        if (answer) {
             e.rst_sent = true;
-            reserveTcp(1);
             sendTcp(@intCast(ci), .server, .rst, e.peer);
         }
         maybeRetire(ci);
@@ -2821,8 +2838,8 @@ fn closeEndpoint(ci: u16, side: Side, reuse: bool) void {
         // has, the SYN-ACK is answered with an RST at its landing.
         .c_syn, .c_failed => {},
         .est => if (!e.reset_received and !e.fin_out) {
-            e.fin_out = true;
             reserveTcp(1);
+            e.fin_out = true;
             sendTcp(ci, side, .fin, e.peer);
             if (!e.fin_in) {
                 reservations.append(net_alloc, .{ .ip = e.local.ip, .port = e.local.port, .reuse = reuse }) catch panic("sim: out of memory for a TIME_WAIT reservation", .{});
@@ -2907,10 +2924,10 @@ fn recordStream(e: TcpEntry, outcome: StreamOutcome) void {
 /// A SYN lands at its address (design 17.6).
 fn landSyn(e: TcpEntry) StreamOutcome {
     const k = &conns[e.conn];
-    k.syn_landed = true;
     const cl = &k.ends[@backingInt(Side.client)];
+    if (cl.phase != .dead) reserveTcp(1);
+    k.syn_landed = true;
     if (cl.phase == .dead) return .dropped_dead_client;
-    reserveTcp(1);
     const j = listenerAt(e.to) orelse {
         stream_stats.refused += 1;
         sendTcp(e.conn, .server, .rst, cl.local);
@@ -2929,16 +2946,16 @@ fn landSynAck(ci: u16) StreamOutcome {
     switch (cl.phase) {
         .dead => {
             if (!cl.rst_sent) {
-                cl.rst_sent = true;
                 reserveTcp(1);
+                cl.rst_sent = true;
                 sendTcp(ci, .client, .rst, cl.peer);
             }
             return .dropped_dead;
         },
         .c_syn => {
+            reserveTcp(1);
             cl.phase = .est;
             wakeStream(cl.slot);
-            reserveTcp(1);
             sendTcp(ci, .client, .ack, cl.peer);
             return .landed;
         },
@@ -3037,6 +3054,13 @@ pub fn testConnEnd(conn_id: u32, server: bool) ?TestStreamEnd {
         if (k.used and k.id == conn_id) return endView(ci, if (server) .server else .client);
     }
     return null;
+}
+
+/// Moves the next `conn_id` of this run, to reach its limit in a test.
+pub fn testSetNextConnId(id: u32) void {
+    if (comptime !builtin.is_test) @compileError("testSetNextConnId is for tests");
+    if (!begun) panic("sim: testSetNextConnId outside a run", .{});
+    next_conn_id = id;
 }
 
 /// Live `S-prov` and `S-queued` endpoints of listener `fd`.

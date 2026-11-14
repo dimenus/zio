@@ -1265,6 +1265,42 @@ const chk = struct {
         for (1..17) |s| try run(s, null, batch_reopen.body);
         if (batch_reopen.seen[0] == 0 or batch_reopen.seen[1] == 0) return error.OneBatchOrderNeverHappened;
     }
+    fn cancelParkedConnect() anyerror!void {
+        for ([_]u64{ 50, 150 }) |us| {
+            cancel_parked.at_us = us;
+            try run(1, null, cancel_parked.body);
+        }
+    }
+    fn closeParkedConnect() anyerror!void {
+        for ([_]u64{ 50, 150 }) |us| {
+            close_parked.at_us = us;
+            try run(1, null, close_parked.body);
+        }
+    }
+    fn synInFlightNoListener() anyerror!void {
+        syn_in_flight.replace = false;
+        try run(1, null, syn_in_flight.body);
+    }
+    fn synInFlightReplacement() anyerror!void {
+        syn_in_flight.replace = true;
+        defer syn_in_flight.replace = false;
+        try run(1, null, syn_in_flight.body);
+    }
+    const boundNotListening = scenario(null, bound_not_listening.body);
+    fn emptyLists() anyerror!void {
+        inline for (.{ "recv", "send", "recvfrom", "sendto", "recvmsg", "sendmsg", "recvDatagram", "sendDatagram" }) |name| {
+            try sim.expectChildPanics("sim: stream refuses: an empty list: the layer's " ++ name, "sim: the socket layer's " ++ (if (comptime std.mem.eql(u8, name, "recv")) "receive" else name) ++ " on sim stream socket 100032 is not simulated yet");
+        }
+        try sim.expectChildPanics("sim: stream refuses: an empty list: std.Io's netRead", "sim: std.Io's netRead with no buffers on sim stream socket 100033");
+    }
+    const accept_second_woken = refusedIn("sim: stream refuses: a second accept while the first is woken", "sim: a second accept while one is woken and not yet harvested, on sim listener 100032");
+    const limit_time = refusedIn("sim: stream refuses: a TCP landing time past", "sim: a TCP entry sent at 18446744073709551615 ns would land after maxInt(u64) ns");
+    const limit_conn_id = refusedIn("sim: stream refuses: the last conn_id a u32 holds", "sim: conn_id 4294967295 is the last a u32 holds");
+    const recvfrom = refusedIn("sim: stream refuses: NetRecvFrom on a stream socket", "sim: net_recvfrom on sim stream socket 100033 is not simulated");
+    const recvmsg = refusedIn("sim: stream refuses: NetRecvMsg on a stream socket", "sim: net_recvmsg on sim stream socket 100033 is not simulated");
+    const recvmmsg = refusedIn("sim: stream refuses: NetRecvMmsg on a stream socket", "sim: net_recvmmsg on sim stream socket 100033 is not simulated");
+    const sendmsg = refusedIn("sim: stream refuses: NetSendMsg on a stream socket", "sim: net_sendmsg on sim stream socket 100033 is not simulated");
+    const sendmmsg = refusedIn("sim: stream refuses: NetSendMmsg on a stream socket", "sim: net_sendmmsg on sim stream socket 100033 is not simulated");
     fn parityBoth() anyerror!void {
         try parity.inSim(.linux);
         try parity.inSim(.macos);
@@ -1331,12 +1367,12 @@ const op_rows = [_]Row{
     .{ .name = "net_send", .status = .{ .pending = 2 } },
     .{ .name = "net_shutdown", .status = .{ .pending = 2 } },
     .{ .name = "net_poll", .status = built(chk.poll) },
-    .{ .name = "net_recvfrom", .status = built(chk.sendto) },
+    .{ .name = "net_recvfrom", .status = built(chk.recvfrom) },
     .{ .name = "net_sendto", .status = built(chk.sendto) },
-    .{ .name = "net_recvmsg", .status = built(chk.sendto) },
-    .{ .name = "net_recvmmsg", .status = built(chk.sendto) },
-    .{ .name = "net_sendmsg", .status = built(chk.sendto) },
-    .{ .name = "net_sendmmsg", .status = built(chk.sendto) },
+    .{ .name = "net_recvmsg", .status = built(chk.recvmsg) },
+    .{ .name = "net_recvmmsg", .status = built(chk.recvmmsg) },
+    .{ .name = "net_sendmsg", .status = built(chk.sendmsg) },
+    .{ .name = "net_sendmmsg", .status = built(chk.sendmmsg) },
     .{ .name = "net_send_file", .status = built(chk.send_file) },
 };
 
@@ -1357,77 +1393,180 @@ const vtable_rows = [_]Row{
     .{ .name = "netLookup", .status = .{ .outside = "interfaces and DNS are outside sim runs (section 2)" } },
 };
 
-/// One row per line of design 17.6's and 17.8's decision lists, and the
-/// other rules slice 1 builds; the later slices' lines are pending.
-const rule_rows = [_]Row{
-    .{ .name = "17.6 NetConnect 1: not an open stream socket, or bound by the program: refused", .status = built(chk.connect_bound) },
-    .{ .name = "17.6 NetConnect 1: local_address refused in the adapter, before a socket opens", .status = built(chk.local_address) },
-    .{ .name = "17.6 NetConnect 2: conn_id, C-syn, SYN, parks", .status = built(chk.handshake_) },
-    .{ .name = "17.6 NetConnect harvest: generation, then ok at the SYN-ACK", .status = built(chk.handshake_) },
-    .{ .name = "17.6 NetConnect harvest: ConnectionRefused at the RST", .status = built(chk.refused_) },
-    .{ .name = "17.6 SYN 1: dead client: dropped, server stays absent", .status = built(chk.cancel_before) },
-    .{ .name = "17.6 SYN 2: listener with room: S-prov, SYN-ACK (exact address, then 0.0.0.0)", .status = built(chk.other_lo) },
-    .{ .name = "17.6 SYN 3: full listener: panic", .status = built(chk.backlog) },
-    .{ .name = "17.6 SYN 4: no listener: RST, server absent", .status = built(chk.refused_) },
-    .{ .name = "17.6 SYN-ACK 1: failed client (failStream)", .status = .{ .pending = 3 } },
-    .{ .name = "17.6 SYN-ACK 2: dead client: RST back", .status = built(chk.cancel_after) },
-    .{ .name = "17.6 SYN-ACK 3: C-syn: est, connect ok, ACK", .status = built(chk.handshake_) },
-    .{ .name = "17.6 ACK 1: dead server endpoint: dropped", .status = built(chk.port_reuse_) },
-    .{ .name = "17.6 ACK 2: S-prov: queued, accept woken", .status = built(chk.handshake_) },
-    .{ .name = "17.6 RST at C-syn: C-failed, ConnectionRefused", .status = built(chk.refused_) },
-    .{ .name = "17.6 cancel or deadline of a parked connect: Timeout, endpoint stays C-syn", .status = built(chk.cancel_after) },
-    .{ .name = "17.6 cancel of a woken connect: Canceled, endpoint est", .status = built(chk.wokenCancel) },
-    .{ .name = "17.6 close of a client 1: C-open or C-failed: nothing on the wire", .status = built(chk.refused_) },
-    .{ .name = "17.6 close of a client 2: C-syn, SYN not landed", .status = built(chk.cancel_before) },
-    .{ .name = "17.6 close of a client 3: C-syn, SYN landed", .status = built(chk.cancel_after) },
-    .{ .name = "17.6 close of a client 4 and 17.8 close 3: est: FIN, active closer reserved", .status = built(chk.handshake_) },
-    .{ .name = "17.6 NetAccept 1: not a listener: refused", .status = built(chk.accept_kind) },
-    .{ .name = "17.6 NetAccept 2: a second unresolved accept: refused", .status = built(chk.accept_second) },
-    .{ .name = "17.6 NetAccept 3: queue not empty: claimed at the call", .status = built(chk.closed_before_accept) },
-    .{ .name = "17.6 NetAccept 4: parks; a wake claims nothing", .status = built(chk.wokenCancel) },
-    .{ .name = "17.6 NetAccept harvest 1: generation: FileDescriptorNotASocket", .status = built(chk.close_wakes) },
-    .{ .name = "17.6 NetAccept harvest 1: generation, the number reused inside the batch", .status = built(chk.batchReopen) },
-    .{ .name = "17.6 NetAccept harvest 2: claims the head", .status = built(chk.handshake_) },
-    .{ .name = "17.6 cancel of a woken accept: the connection stays queued", .status = built(chk.wokenCancel) },
-    .{ .name = "17.6 listener close 1: S-prov and S-queued die, RST to each client", .status = built(chk.listener_close_) },
-    .{ .name = "17.6 listener close 2: accepted connections not affected (row 29)", .status = built(chk.listener_close_) },
-    .{ .name = "17.6 listener close 3: a parked accept ends FileDescriptorNotASocket", .status = built(chk.close_wakes) },
-    .{ .name = "17.6 a queued endpoint keeps a FIN that lands on it (row 27)", .status = built(chk.closed_before_accept) },
-    .{ .name = "17.6 equal times: conn_id order, both creation orders", .status = built(chk.equalTime) },
-    .{ .name = "17.5 landings go by conn_id: fd number reused", .status = built(chk.fd_reuse_) },
-    .{ .name = "17.5 landings go by conn_id: listener port bound again", .status = built(chk.port_reuse_) },
-    .{ .name = "17.5 retirement: absent counts as dead", .status = built(chk.refused_) },
-    .{ .name = "17.5 TIME_WAIT: both active closers at one instant", .status = built(chk.both_close_) },
-    .{ .name = "17.5 TIME_WAIT rebind by profile (row 31), and rows 2, 12, 14, 32", .status = built(chk.parityBoth) },
-    .{ .name = "17.8 row 12 with no profile: panic", .status = built(chk.row12_none) },
-    .{ .name = "17.8 row 31 with no profile: panic", .status = built(chk.row31_none) },
-    .{ .name = "17.8 rows 15 and 30 with no profile: panic", .status = built(chk.lo2_none) },
-    .{ .name = "17.4 options: NODELAY, REUSEADDR, advisory REUSEPORT", .status = built(scenario(null, options.body)) },
-    .{ .name = "17.4 getsockopt SO_ERROR: refused", .status = built(chk.so_error) },
-    .{ .name = "17.4 IPv6 and AF_UNIX: refused", .status = built(chk.ipv6) },
-    .{ .name = "17.8 RST 1: a second RST: dropped and counted", .status = .{ .pending = 2 } },
-    .{ .name = "17.8 RST 2: dead endpoint: dropped", .status = built(chk.listener_close_) },
-    .{ .name = "17.8 RST 3: live S-prov: dies, capacity freed", .status = built(chk.cancel_after) },
-    .{ .name = "17.8 RST 5: S-queued or est: reset_received (the profile's pending error is slice 2)", .status = built(chk.listener_close_) },
-    .{ .name = "17.8 FIN 1: dead endpoint: dropped", .status = built(chk.handshake_) },
-    .{ .name = "17.8 FIN 2: recorded", .status = built(chk.handshake_) },
-    .{ .name = "17.15 teardown: an open socket never connected", .status = built(chk.teardown_open) },
-    .{ .name = "17.15 teardown: an empty listener", .status = built(chk.teardown_listener) },
-    .{ .name = "17.15 teardown: an unretired connection (entries on the wire)", .status = built(chk.teardown_wire) },
-    .{ .name = "17.7 admission, chunks, window, credit, conservation", .status = .{ .pending = 2 } },
-    .{ .name = "17.8 NetRecv list (and its harvest list)", .status = .{ .pending = 2 } },
-    .{ .name = "17.8 NetSend list (and its harvest list)", .status = .{ .pending = 2 } },
-    .{ .name = "17.8 profiles: what an RST sets, reset reported once", .status = .{ .pending = 2 } },
-    .{ .name = "17.8 shutdown(.send) and shutdown(.both)", .status = .{ .pending = 2 } },
-    .{ .name = "17.8 close 1 and 2: after a reset; with unread bytes or SO_LINGER 0", .status = .{ .pending = 2 } },
-    .{ .name = "17.8 data landing 1 to 5", .status = .{ .pending = 2 } },
-    .{ .name = "17.8 credit landing 1 and 2", .status = .{ .pending = 2 } },
-    .{ .name = "17.4 getpeername and bytesReadable (FIONREAD)", .status = .{ .pending = 2 } },
-    .{ .name = "17.7 setStreamWindow and setStreamChunking", .status = .{ .pending = 2 } },
-    .{ .name = "17.9 .tcp rules: delay, jitter, holding", .status = .{ .pending = 3 } },
-    .{ .name = "17.9 failStream", .status = .{ .pending = 3 } },
-    .{ .name = "17.9 the connect with no answer (a held SYN past its deadline)", .status = .{ .pending = 3 } },
-    .{ .name = "17.16 slice 4: starh2's dst-conn accept step; hotseat's tests", .status = .{ .pending = 4 } },
+/// The rules of design 17.5 to 17.9 and 17.15 that the surface table
+/// covers: one identity each, apart from the rows, so a row cannot vanish.
+/// `ruleSlice` gives each its slice (an exhaustive switch: a new tag needs
+/// one), and the comptime check requires exactly one row per tag, built if
+/// its slice is built and pending otherwise. Removing a rule takes an edit
+/// here, which a reviewer sees.
+const Rule = enum {
+    connect_refused_kind_or_bound,
+    connect_local_address,
+    connect_parks,
+    connect_harvest_ok,
+    connect_harvest_refused,
+    syn_dead_client,
+    syn_listener_room,
+    syn_listener_full,
+    syn_no_listener,
+    synack_failed_client,
+    synack_dead_client,
+    synack_c_syn,
+    ack_dead_server,
+    ack_s_prov,
+    rst_c_syn,
+    connect_cancel_parked,
+    connect_cancel_woken,
+    close_client_open_or_failed,
+    close_client_syn_in_flight,
+    close_client_syn_landed,
+    close_est_fin,
+    accept_not_listener,
+    accept_second,
+    accept_queued,
+    accept_parks,
+    accept_harvest_generation,
+    accept_harvest_generation_reused,
+    accept_harvest_claims,
+    accept_cancel_woken,
+    listener_close_kills,
+    listener_close_accepted_untouched,
+    listener_close_parked_accept,
+    queued_keeps_fin,
+    equal_times,
+    landing_fd_reused,
+    landing_port_reused,
+    retire_absent,
+    time_wait_both_active,
+    time_wait_rebind_parity,
+    row12_no_profile,
+    row31_no_profile,
+    rows15_30_no_profile,
+    options,
+    so_error_refused,
+    ipv6_unix_refused,
+    rst_second,
+    rst_dead,
+    rst_s_prov,
+    rst_est,
+    fin_dead,
+    fin_recorded,
+    teardown_open,
+    teardown_listener,
+    teardown_unretired,
+    bytes_window_credit,
+    recv_lists,
+    send_lists,
+    profiles_reset,
+    shutdown,
+    close_reset_or_unread,
+    data_landing,
+    credit_landing,
+    getpeername_bytes_readable,
+    window_chunking_settings,
+    tcp_rules,
+    fail_stream,
+    connect_no_answer,
+    slice4_users,
+    connect_close_parked,
+    syn_listener_closed_in_flight,
+    syn_replacement_listener,
+    syn_bound_not_listening,
+    accept_second_woken,
+    empty_buffer_lists,
+    limit_wire_time,
+    limit_conn_id,
+};
+
+fn ruleSlice(r: Rule) u8 {
+    return switch (r) {
+        .connect_refused_kind_or_bound, .connect_local_address, .connect_parks, .connect_harvest_ok, .connect_harvest_refused, .syn_dead_client, .syn_listener_room, .syn_listener_full, .syn_no_listener, .synack_dead_client, .synack_c_syn, .ack_dead_server, .ack_s_prov, .rst_c_syn, .connect_cancel_parked, .connect_cancel_woken, .close_client_open_or_failed, .close_client_syn_in_flight, .close_client_syn_landed, .close_est_fin, .accept_not_listener, .accept_second, .accept_queued, .accept_parks, .accept_harvest_generation, .accept_harvest_generation_reused, .accept_harvest_claims, .accept_cancel_woken, .listener_close_kills, .listener_close_accepted_untouched, .listener_close_parked_accept, .queued_keeps_fin, .equal_times, .landing_fd_reused, .landing_port_reused, .retire_absent, .time_wait_both_active, .time_wait_rebind_parity, .row12_no_profile, .row31_no_profile, .rows15_30_no_profile, .options, .so_error_refused, .ipv6_unix_refused, .rst_dead, .rst_s_prov, .rst_est, .fin_dead, .fin_recorded, .teardown_open, .teardown_listener, .teardown_unretired, .connect_close_parked, .syn_listener_closed_in_flight, .syn_replacement_listener, .syn_bound_not_listening, .accept_second_woken, .empty_buffer_lists, .limit_wire_time, .limit_conn_id => 1,
+        .rst_second, .bytes_window_credit, .recv_lists, .send_lists, .profiles_reset, .shutdown, .close_reset_or_unread, .data_landing, .credit_landing, .getpeername_bytes_readable, .window_chunking_settings => 2,
+        .synack_failed_client, .tcp_rules, .fail_stream, .connect_no_answer => 3,
+        .slice4_users => 4,
+    };
+}
+
+const RuleRow = struct { id: Rule, name: []const u8, status: Status };
+
+/// One row per `Rule`; the later slices' rows are pending.
+const rule_rows = [_]RuleRow{
+    .{ .id = .connect_refused_kind_or_bound, .name = "17.6 NetConnect 1: not an open stream socket, or bound by the program: refused", .status = built(chk.connect_bound) },
+    .{ .id = .connect_local_address, .name = "17.6 NetConnect 1: local_address refused in the adapter, before a socket opens", .status = built(chk.local_address) },
+    .{ .id = .connect_parks, .name = "17.6 NetConnect 2: conn_id, C-syn, SYN, parks", .status = built(chk.handshake_) },
+    .{ .id = .connect_harvest_ok, .name = "17.6 NetConnect harvest: generation, then ok at the SYN-ACK", .status = built(chk.handshake_) },
+    .{ .id = .connect_harvest_refused, .name = "17.6 NetConnect harvest: ConnectionRefused at the RST", .status = built(chk.refused_) },
+    .{ .id = .syn_dead_client, .name = "17.6 SYN 1: dead client: dropped, server stays absent", .status = built(chk.cancel_before) },
+    .{ .id = .syn_listener_room, .name = "17.6 SYN 2: listener with room: S-prov, SYN-ACK (exact address, then 0.0.0.0)", .status = built(chk.other_lo) },
+    .{ .id = .syn_listener_full, .name = "17.6 SYN 3: full listener: panic", .status = built(chk.backlog) },
+    .{ .id = .syn_no_listener, .name = "17.6 SYN 4: no listener: RST, server absent", .status = built(chk.refused_) },
+    .{ .id = .synack_failed_client, .name = "17.6 SYN-ACK 1: failed client (failStream)", .status = .{ .pending = 3 } },
+    .{ .id = .synack_dead_client, .name = "17.6 SYN-ACK 2: dead client: RST back", .status = built(chk.cancel_after) },
+    .{ .id = .synack_c_syn, .name = "17.6 SYN-ACK 3: C-syn: est, connect ok, ACK", .status = built(chk.handshake_) },
+    .{ .id = .ack_dead_server, .name = "17.6 ACK 1: dead server endpoint: dropped", .status = built(chk.port_reuse_) },
+    .{ .id = .ack_s_prov, .name = "17.6 ACK 2: S-prov: queued, accept woken", .status = built(chk.handshake_) },
+    .{ .id = .rst_c_syn, .name = "17.6 RST at C-syn: C-failed, ConnectionRefused", .status = built(chk.refused_) },
+    .{ .id = .connect_cancel_parked, .name = "17.6 cancel of a parked connect, the socket left open: Canceled, endpoint stays C-syn, the later SYN-ACK establishes it and completes nothing", .status = built(chk.cancelParkedConnect) },
+    .{ .id = .connect_cancel_woken, .name = "17.6 cancel of a woken connect: Canceled, endpoint est", .status = built(chk.wokenCancel) },
+    .{ .id = .close_client_open_or_failed, .name = "17.6 close of a client 1: C-open or C-failed: nothing on the wire", .status = built(chk.refused_) },
+    .{ .id = .close_client_syn_in_flight, .name = "17.6 close of a client 2: C-syn, SYN not landed", .status = built(chk.cancel_before) },
+    .{ .id = .close_client_syn_landed, .name = "17.6 close of a client 3: C-syn, SYN landed", .status = built(chk.cancel_after) },
+    .{ .id = .close_est_fin, .name = "17.6 close of a client 4 and 17.8 close 3: est: FIN, active closer reserved", .status = built(chk.handshake_) },
+    .{ .id = .accept_not_listener, .name = "17.6 NetAccept 1: not a listener: refused", .status = built(chk.accept_kind) },
+    .{ .id = .accept_second, .name = "17.6 NetAccept 2: a second unresolved accept: refused", .status = built(chk.accept_second) },
+    .{ .id = .accept_queued, .name = "17.6 NetAccept 3: queue not empty: claimed at the call", .status = built(chk.closed_before_accept) },
+    .{ .id = .accept_parks, .name = "17.6 NetAccept 4: parks; a wake claims nothing", .status = built(chk.wokenCancel) },
+    .{ .id = .accept_harvest_generation, .name = "17.6 NetAccept harvest 1: generation: FileDescriptorNotASocket", .status = built(chk.close_wakes) },
+    .{ .id = .accept_harvest_generation_reused, .name = "17.6 NetAccept harvest 1: generation, the number reused inside the batch", .status = built(chk.batchReopen) },
+    .{ .id = .accept_harvest_claims, .name = "17.6 NetAccept harvest 2: claims the head", .status = built(chk.handshake_) },
+    .{ .id = .accept_cancel_woken, .name = "17.6 cancel of a woken accept: the connection stays queued", .status = built(chk.wokenCancel) },
+    .{ .id = .listener_close_kills, .name = "17.6 listener close 1: S-prov and S-queued die, RST to each client", .status = built(chk.listener_close_) },
+    .{ .id = .listener_close_accepted_untouched, .name = "17.6 listener close 2: accepted connections not affected (row 29)", .status = built(chk.listener_close_) },
+    .{ .id = .listener_close_parked_accept, .name = "17.6 listener close 3: a parked accept ends FileDescriptorNotASocket", .status = built(chk.close_wakes) },
+    .{ .id = .queued_keeps_fin, .name = "17.6 a queued endpoint keeps a FIN that lands on it (row 27)", .status = built(chk.closed_before_accept) },
+    .{ .id = .equal_times, .name = "17.6 equal times: conn_id order, both creation orders", .status = built(chk.equalTime) },
+    .{ .id = .landing_fd_reused, .name = "17.5 landings go by conn_id: fd number reused", .status = built(chk.fd_reuse_) },
+    .{ .id = .landing_port_reused, .name = "17.5 landings go by conn_id: listener port bound again", .status = built(chk.port_reuse_) },
+    .{ .id = .retire_absent, .name = "17.5 retirement: absent counts as dead", .status = built(chk.refused_) },
+    .{ .id = .time_wait_both_active, .name = "17.5 TIME_WAIT: both active closers at one instant", .status = built(chk.both_close_) },
+    .{ .id = .time_wait_rebind_parity, .name = "17.5 TIME_WAIT rebind by profile (row 31), and rows 2, 12, 14, 32", .status = built(chk.parityBoth) },
+    .{ .id = .row12_no_profile, .name = "17.8 row 12 with no profile: panic", .status = built(chk.row12_none) },
+    .{ .id = .row31_no_profile, .name = "17.8 row 31 with no profile: panic", .status = built(chk.row31_none) },
+    .{ .id = .rows15_30_no_profile, .name = "17.8 rows 15 and 30 with no profile: panic", .status = built(chk.lo2_none) },
+    .{ .id = .options, .name = "17.4 options: NODELAY, REUSEADDR, advisory REUSEPORT", .status = built(scenario(null, options.body)) },
+    .{ .id = .so_error_refused, .name = "17.4 getsockopt SO_ERROR: refused", .status = built(chk.so_error) },
+    .{ .id = .ipv6_unix_refused, .name = "17.4 IPv6 and AF_UNIX: refused", .status = built(chk.ipv6) },
+    .{ .id = .rst_second, .name = "17.8 RST 1: a second RST: dropped and counted", .status = .{ .pending = 2 } },
+    .{ .id = .rst_dead, .name = "17.8 RST 2: dead endpoint: dropped", .status = built(chk.listener_close_) },
+    .{ .id = .rst_s_prov, .name = "17.8 RST 3: live S-prov: dies, capacity freed", .status = built(chk.cancel_after) },
+    .{ .id = .rst_est, .name = "17.8 RST 5: S-queued or est: reset_received (the profile's pending error is slice 2)", .status = built(chk.listener_close_) },
+    .{ .id = .fin_dead, .name = "17.8 FIN 1: dead endpoint: dropped", .status = built(chk.handshake_) },
+    .{ .id = .fin_recorded, .name = "17.8 FIN 2: recorded", .status = built(chk.handshake_) },
+    .{ .id = .teardown_open, .name = "17.15 teardown: an open socket never connected", .status = built(chk.teardown_open) },
+    .{ .id = .teardown_listener, .name = "17.15 teardown: an empty listener", .status = built(chk.teardown_listener) },
+    .{ .id = .teardown_unretired, .name = "17.15 teardown: an unretired connection (entries on the wire)", .status = built(chk.teardown_wire) },
+    .{ .id = .bytes_window_credit, .name = "17.7 admission, chunks, window, credit, conservation", .status = .{ .pending = 2 } },
+    .{ .id = .recv_lists, .name = "17.8 NetRecv list (and its harvest list)", .status = .{ .pending = 2 } },
+    .{ .id = .send_lists, .name = "17.8 NetSend list (and its harvest list)", .status = .{ .pending = 2 } },
+    .{ .id = .profiles_reset, .name = "17.8 profiles: what an RST sets, reset reported once", .status = .{ .pending = 2 } },
+    .{ .id = .shutdown, .name = "17.8 shutdown(.send) and shutdown(.both)", .status = .{ .pending = 2 } },
+    .{ .id = .close_reset_or_unread, .name = "17.8 close 1 and 2: after a reset; with unread bytes or SO_LINGER 0", .status = .{ .pending = 2 } },
+    .{ .id = .data_landing, .name = "17.8 data landing 1 to 5", .status = .{ .pending = 2 } },
+    .{ .id = .credit_landing, .name = "17.8 credit landing 1 and 2", .status = .{ .pending = 2 } },
+    .{ .id = .getpeername_bytes_readable, .name = "17.4 getpeername and bytesReadable (FIONREAD)", .status = .{ .pending = 2 } },
+    .{ .id = .window_chunking_settings, .name = "17.7 setStreamWindow and setStreamChunking", .status = .{ .pending = 2 } },
+    .{ .id = .tcp_rules, .name = "17.9 .tcp rules: delay, jitter, holding", .status = .{ .pending = 3 } },
+    .{ .id = .fail_stream, .name = "17.9 failStream", .status = .{ .pending = 3 } },
+    .{ .id = .connect_no_answer, .name = "17.9 the connect with no answer (a held SYN past its deadline)", .status = .{ .pending = 3 } },
+    .{ .id = .slice4_users, .name = "17.16 slice 4: starh2's dst-conn accept step; hotseat's tests", .status = .{ .pending = 4 } },
+    .{ .id = .connect_close_parked, .name = "17.6 close of a client while its connect is parked: the op ends FileDescriptorNotASocket (before and after the SYN lands)", .status = built(chk.closeParkedConnect) },
+    .{ .id = .syn_listener_closed_in_flight, .name = "17.6 SYN in flight when its listener closes, no replacement: RST, ConnectionRefused", .status = built(chk.synInFlightNoListener) },
+    .{ .id = .syn_replacement_listener, .name = "17.6 SYN in flight when its listener closes, a replacement bound there: the replacement gets it", .status = built(chk.synInFlightReplacement) },
+    .{ .id = .syn_bound_not_listening, .name = "17.6 SYN to a socket bound but not listening: RST, the bound socket untouched", .status = built(chk.boundNotListening) },
+    .{ .id = .accept_second_woken, .name = "17.6 NetAccept 2: a second accept while the first is woken and not yet harvested: refused", .status = built(chk.accept_second_woken) },
+    .{ .id = .empty_buffer_lists, .name = "17.4 empty buffer lists on a stream socket, in the layer and std.Io's read: refused, never 0", .status = built(chk.emptyLists) },
+    .{ .id = .limit_wire_time, .name = "17.5 a TCP landing time past maxInt(u64): a named panic before any state moves", .status = built(chk.limit_time) },
+    .{ .id = .limit_conn_id, .name = "17.5 the last conn_id a u32 holds: a named panic before any state moves", .status = built(chk.limit_conn_id) },
 };
 
 fn findRow(comptime rows: []const Row, comptime name: []const u8) usize {
@@ -1460,16 +1599,35 @@ fn checkRows() void {
     for (vtable_rows) |r| {
         if (!@hasField(std.Io.VTable, r.name)) @compileError("surface table: no std.Io vtable field " ++ r.name);
     }
-    for (op_rows ++ vtable_rows ++ rule_rows) |r| switch (r.status) {
+    for (op_rows ++ vtable_rows) |r| switch (r.status) {
         .built => |b| if (b.slice > built_slice) @compileError("surface table: row of slice > built_slice marked built: " ++ r.name),
         .pending => |s| if (s <= built_slice) @compileError("surface table: row of a built slice marked pending: " ++ r.name),
         .outside => {},
     };
+    // Each rule has exactly one row, of the slice `ruleSlice` gives it:
+    // built if that slice is built, pending if not, never outside.
+    for (@typeInfo(Rule).@"enum".field_names) |tag| {
+        var n: usize = 0;
+        for (rule_rows) |r| {
+            if (std.mem.eql(u8, @tagName(r.id), tag)) n += 1;
+        }
+        if (n != 1) @compileError(std.fmt.comptimePrint("surface table: rule .{s} has {d} rows, not 1", .{ tag, n }));
+    }
+    for (rule_rows) |r| {
+        const want = ruleSlice(r.id);
+        switch (r.status) {
+            .built => |b| if (want > built_slice or b.slice != want) @compileError("surface table: rule ." ++ @tagName(r.id) ++ " is built, but its slice is not a built one"),
+            .pending => |s| if (want <= built_slice or s != want) @compileError("surface table: rule ." ++ @tagName(r.id) ++ " is pending, but its slice is built, or is another"),
+            .outside => @compileError("surface table: rule ." ++ @tagName(r.id) ++ " cannot be outside"),
+        }
+    }
 }
 
 test "sim: stream surface table: every built row's check passes; pending rows are exactly the later slices' rows, printed, never passed" {
     if (comptime skip) return error.SkipZigTest;
-    const all = op_rows ++ vtable_rows ++ rule_rows;
+    var all: [op_rows.len + vtable_rows.len + rule_rows.len]Row = undefined;
+    for (op_rows ++ vtable_rows, 0..) |r, i| all[i] = r;
+    for (rule_rows, op_rows.len + vtable_rows.len..) |r, i| all[i] = .{ .name = r.name, .status = r.status };
     var passed: usize = 0;
     var pending: usize = 0;
     var outside: usize = 0;
@@ -1498,4 +1656,403 @@ test "sim: stream surface table: every built row's check passes; pending rows ar
     // a built row of a later slice, or a pending row of a built one, does
     // not compile. Here: the run did the work.
     try expect(passed > 0 and pending > 0);
+}
+
+// ---- Outside review 5 of the stream track (gpt-simnet12.md) ----
+
+/// Finding 1: an empty buffer list on a stream socket. Each call returned
+/// 0 before any sim check, so a receive looked like end of stream.
+const empty_lists = struct {
+    var none_in: [0]os_net.iovec = .{};
+    var none_out: [0]os_net.iovec_const = .{};
+    var to: os_net.sockaddr.in = undefined;
+
+    fn open() !i32 {
+        to = sockaddr(lo, 9);
+        return os_net.socket(.ipv4, .stream, .ip, .{ .nonblocking = true });
+    }
+    fn recv() !void {
+        _ = try os_net.recv(try open(), &none_in, .{});
+    }
+    fn send() !void {
+        _ = try os_net.send(try open(), &none_out, .{});
+    }
+    fn recvfrom() !void {
+        _ = try os_net.recvfrom(try open(), &none_in, .{}, null, null);
+    }
+    fn sendto() !void {
+        const fd = try open();
+        _ = try os_net.sendto(fd, &none_out, .{}, @ptrCast(&to), @sizeOf(os_net.sockaddr.in));
+    }
+    fn recvmsg() !void {
+        _ = try os_net.recvmsg(try open(), &none_in, .{}, null, null, null);
+    }
+    fn sendmsg() !void {
+        _ = try os_net.sendmsg(try open(), &none_out, .{}, null, 0, null);
+    }
+    fn recvDatagram() !void {
+        _ = try os_net.recvDatagram(try open(), &none_in, .{}, null);
+    }
+    fn sendDatagram() !void {
+        const fd = try open();
+        _ = try os_net.sendDatagram(fd, &none_out, .{}, &to, null);
+    }
+    fn stdRead() !void {
+        _, const c, _ = try pair();
+        var none: [0][]u8 = .{};
+        _ = try runtime.io().operate(.{ .net_read = .{ .socket_handle = c.socket.handle, .data = &none } });
+    }
+};
+
+test "sim: stream refuses: an empty list: the layer's recv" {
+    try refusal("sim: stream refuses: an empty list: the layer's recv", "sim: the socket layer's receive on sim stream socket 100032 is not simulated yet", null, empty_lists.recv);
+}
+test "sim: stream refuses: an empty list: the layer's send" {
+    try refusal("sim: stream refuses: an empty list: the layer's send", "sim: the socket layer's send on sim stream socket 100032 is not simulated yet", null, empty_lists.send);
+}
+test "sim: stream refuses: an empty list: the layer's recvfrom" {
+    try refusal("sim: stream refuses: an empty list: the layer's recvfrom", "sim: the socket layer's recvfrom on sim stream socket 100032 is not simulated yet", null, empty_lists.recvfrom);
+}
+test "sim: stream refuses: an empty list: the layer's sendto" {
+    try refusal("sim: stream refuses: an empty list: the layer's sendto", "sim: the socket layer's sendto on sim stream socket 100032 is not simulated yet", null, empty_lists.sendto);
+}
+test "sim: stream refuses: an empty list: the layer's recvmsg" {
+    try refusal("sim: stream refuses: an empty list: the layer's recvmsg", "sim: the socket layer's recvmsg on sim stream socket 100032 is not simulated yet", null, empty_lists.recvmsg);
+}
+test "sim: stream refuses: an empty list: the layer's sendmsg" {
+    try refusal("sim: stream refuses: an empty list: the layer's sendmsg", "sim: the socket layer's sendmsg on sim stream socket 100032 is not simulated yet", null, empty_lists.sendmsg);
+}
+test "sim: stream refuses: an empty list: the layer's recvDatagram" {
+    try refusal("sim: stream refuses: an empty list: the layer's recvDatagram", "sim: the socket layer's recvDatagram on sim stream socket 100032 is not simulated yet", null, empty_lists.recvDatagram);
+}
+test "sim: stream refuses: an empty list: the layer's sendDatagram" {
+    try refusal("sim: stream refuses: an empty list: the layer's sendDatagram", "sim: the socket layer's sendDatagram on sim stream socket 100032 is not simulated yet", null, empty_lists.sendDatagram);
+}
+test "sim: stream refuses: an empty list: std.Io's netRead" {
+    try refusal("sim: stream refuses: an empty list: std.Io's netRead", "sim: std.Io's netRead with no buffers on sim stream socket 100033 is not simulated yet", null, empty_lists.stdRead);
+}
+
+/// Finding 2: each op row's own refusal (they borrowed NetSendTo's).
+const other_ops = struct {
+    var buf: [4]u8 = undefined;
+    var iov: [1]os_net.iovec = undefined;
+    var iov_out: [1]os_net.iovec_const = undefined;
+    var slots: [1]ev.NetRecvMmsg.Slot = undefined;
+    var out_slots: [1]ev.NetSendMmsg.Slot = undefined;
+
+    fn submit(c: *ev.Completion) !void {
+        try io_common.waitForIo(c);
+    }
+    fn recvfrom() !void {
+        _, const c, _ = try pair();
+        var op = ev.NetRecvFrom.init(c.socket.handle, .fromSlice(&buf, &iov), .{}, null, null);
+        try submit(&op.c);
+    }
+    fn recvmsg() !void {
+        _, const c, _ = try pair();
+        var op = ev.NetRecvMsg.init(c.socket.handle, .fromSlice(&buf, &iov), .{}, null, null, null);
+        try submit(&op.c);
+    }
+    fn recvmmsg() !void {
+        _, const c, _ = try pair();
+        slots = .{.{ .data = &buf }};
+        var op = ev.NetRecvMmsg.init(c.socket.handle, &slots, .{});
+        try submit(&op.c);
+    }
+    fn sendmsg() !void {
+        _, const c, _ = try pair();
+        var op = ev.NetSendMsg.init(c.socket.handle, .fromSlice(&buf, &iov_out), .{}, null, 0, null);
+        try submit(&op.c);
+    }
+    fn sendmmsg() !void {
+        _, const c, _ = try pair();
+        out_slots = .{.{ .data = &buf }};
+        var op = ev.NetSendMmsg.init(c.socket.handle, &out_slots, .{});
+        try submit(&op.c);
+    }
+};
+
+test "sim: stream refuses: NetRecvFrom on a stream socket" {
+    try refusal("sim: stream refuses: NetRecvFrom on a stream socket", "sim: net_recvfrom on sim stream socket 100033 is not simulated", null, other_ops.recvfrom);
+}
+test "sim: stream refuses: NetRecvMsg on a stream socket" {
+    try refusal("sim: stream refuses: NetRecvMsg on a stream socket", "sim: net_recvmsg on sim stream socket 100033 is not simulated", null, other_ops.recvmsg);
+}
+test "sim: stream refuses: NetRecvMmsg on a stream socket" {
+    try refusal("sim: stream refuses: NetRecvMmsg on a stream socket", "sim: net_recvmmsg on sim stream socket 100033 is not simulated", null, other_ops.recvmmsg);
+}
+test "sim: stream refuses: NetSendMsg on a stream socket" {
+    try refusal("sim: stream refuses: NetSendMsg on a stream socket", "sim: net_sendmsg on sim stream socket 100033 is not simulated", null, other_ops.sendmsg);
+}
+test "sim: stream refuses: NetSendMmsg on a stream socket" {
+    try refusal("sim: stream refuses: NetSendMmsg on a stream socket", "sim: net_sendmmsg on sim stream socket 100033 is not simulated", null, other_ops.sendmmsg);
+}
+
+/// Finding 2: a parked connect cancelled with its socket left open (no
+/// wrapper closes it), before the SYN lands and after. Cancelling the wait
+/// does not abort the connect (17.6): the endpoint stays C-syn, the later
+/// SYN-ACK establishes it and sends the ACK, and the cancelled op does not
+/// complete a second time.
+const cancel_parked = struct {
+    var at_us: u64 = 50;
+    var op: ev.NetConnect = undefined;
+    var to: os_net.sockaddr.in = undefined;
+    var calls: u32 = 0;
+
+    fn onDone(_: *ev.Loop, _: *ev.Completion) void {
+        calls += 1;
+    }
+
+    fn body() !void {
+        calls = 0;
+        const server = try listen(lo, 0, .{});
+        to = sockaddr(lo, portOf(server));
+        const fd = try evOpen();
+        const loop = &rt_mod.getCurrentExecutor().loop;
+        op = ev.NetConnect.init(fd, @ptrCast(&to), @sizeOf(os_net.sockaddr.in));
+        op.c.callback = onDone;
+        op.c.flags.defer_callback = false;
+        loop.add(&op.c);
+        try rt_mod.sleep(.fromMicroseconds(at_us));
+        loop.cancel(&op.c);
+        try expectEqual(sim.StreamPhase.c_syn, sim.testStreamEnd(fd).phase);
+        try expectEqual(@as(usize, if (at_us < L / 1000) 0 else 1), sim.testListenerCount(server.socket.handle));
+        // To 2L: the SYN-ACK lands.
+        try rt_mod.sleep(.fromMicroseconds(2 * L / 1000 - at_us));
+        try expectEqual(@as(u64, 2 * L), sim.clockNs());
+        try expectEqual(sim.StreamPhase.est, sim.testStreamEnd(fd).phase);
+        try expectEqual(@as(u32, 1), calls);
+        try expectError(error.Canceled, op.getResult());
+        // The ACK lands at 3L: the connection is queued and accepted.
+        const s = try server.accept(.{});
+        try expectEqual(@as(u64, 3 * L), sim.clockNs());
+        try expectEqual((try localOf(fd)).port, s.socket.address.ip.getPort());
+        try expectEqual(@as(u32, 1), calls);
+        evClose(fd);
+        s.close();
+        server.close();
+        try drain();
+    }
+};
+
+test "sim: stream: a parked connect cancelled with its socket open stays C-syn, and the later SYN-ACK establishes it without completing the cancelled op" {
+    if (comptime skip) return error.SkipZigTest;
+    for ([_]u64{ 50, 150 }) |us| {
+        cancel_parked.at_us = us;
+        try run(1, null, cancel_parked.body);
+    }
+}
+
+/// Missing test: the socket of a parked connect closed directly, before the
+/// SYN lands and after. The op ends FileDescriptorNotASocket (the
+/// generation); the SYN is dropped at landing, or its SYN-ACK is answered
+/// with an RST that kills the provisional endpoint.
+const close_parked = struct {
+    var at_us: u64 = 50;
+    var op: ev.NetConnect = undefined;
+    var to: os_net.sockaddr.in = undefined;
+    var calls: u32 = 0;
+
+    fn onDone(_: *ev.Loop, _: *ev.Completion) void {
+        calls += 1;
+    }
+
+    fn body() !void {
+        calls = 0;
+        const server = try listen(lo, 0, .{});
+        to = sockaddr(lo, portOf(server));
+        const fd = try evOpen();
+        const loop = &rt_mod.getCurrentExecutor().loop;
+        op = ev.NetConnect.init(fd, @ptrCast(&to), @sizeOf(os_net.sockaddr.in));
+        op.c.callback = onDone;
+        op.c.flags.defer_callback = false;
+        loop.add(&op.c);
+        try rt_mod.sleep(.fromMicroseconds(at_us));
+        evClose(fd);
+        try expectEqual(@as(u32, 1), calls);
+        try expectError(error.FileDescriptorNotASocket, op.getResult());
+        try drain();
+        try expectEqual(@as(usize, 0), sim.testListenerCount(server.socket.handle));
+        const st = sim.streamStats();
+        if (at_us < L / 1000) {
+            try expectEqual(sim.StreamStats{ .syn_dropped_dead = 1, .retired = 1 }, st);
+        } else {
+            // The SYN-ACK at the dead client; its RST killed S-prov.
+            try expectEqual(sim.StreamStats{ .dropped_dead = 1, .retired = 1 }, st);
+        }
+        try expectError(error.Timeout, server.accept(.{ .timeout = .fromMilliseconds(1) }));
+        try expectEqual(@as(u32, 1), calls);
+        server.close();
+    }
+};
+
+test "sim: stream: closing the socket of a parked connect ends it FileDescriptorNotASocket, before the SYN lands and after" {
+    if (comptime skip) return error.SkipZigTest;
+    for ([_]u64{ 50, 150 }) |us| {
+        close_parked.at_us = us;
+        try run(1, null, close_parked.body);
+    }
+}
+
+/// Missing test: the listener closed while a SYN to it is on the wire. The
+/// SYN looks up a listener at its landing: with none it is refused; with a
+/// replacement bound at that address, the replacement gets it.
+const syn_in_flight = struct {
+    var replace = false;
+    var result: anyerror!zio_net.Stream = error.NotRun;
+
+    fn connector() void {
+        result = connect(lo, 7001, .none);
+    }
+
+    fn body() !void {
+        result = error.NotRun;
+        const first = try listen(lo, 7001, .{});
+        var h = try rt_mod.spawn(connector, .{});
+        try rt_mod.sleep(.fromMicroseconds(L / 2000));
+        first.close();
+        if (!replace) {
+            h.join();
+            try expectError(error.ConnectionRefused, result);
+            try expectEqual(@as(u64, 2 * L), sim.clockNs());
+            try drain();
+            try expectEqual(sim.StreamStats{ .refused = 1, .retired = 1 }, sim.streamStats());
+            return;
+        }
+        const second = try listen(lo, 7001, .{});
+        h.join();
+        const c = try result;
+        try expectEqual(@as(u64, 2 * L), sim.clockNs());
+        const s = try second.accept(.{});
+        try expectEqual((try localOf(c.socket.handle)).port, s.socket.address.ip.getPort());
+        c.close();
+        s.close();
+        second.close();
+        try drain();
+        try expectEqual(@as(u64, 0), sim.streamStats().refused);
+    }
+};
+
+test "sim: stream: a SYN in flight when its listener closes is refused, or reaches a replacement listener bound at that address" {
+    if (comptime skip) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |r| {
+        syn_in_flight.replace = r;
+        try run(1, null, syn_in_flight.body);
+    }
+    syn_in_flight.replace = false;
+}
+
+/// Missing test: a connect to a socket that is bound but not listening is
+/// refused, and leaves that socket as it was: it can still listen and
+/// accept.
+const bound_not_listening = struct {
+    fn body() !void {
+        var b = try zio_net.Socket.open(.stream, .ipv4, .ip);
+        try b.bind(.{ .ip = zio_net.IpAddress.initIp4(lo, 0) });
+        const port = b.address.ip.getPort();
+        try expectError(error.ConnectionRefused, connect(lo, port, .none));
+        try expectEqual(sim.Ip4{ .ip = lo, .port = port }, try localOf(b.handle));
+        try b.listen(8);
+        const server: zio_net.Server = .{ .socket = b };
+        const c = try connect(lo, port, .none);
+        const s = try server.accept(.{});
+        try expectEqual((try localOf(c.socket.handle)).port, s.socket.address.ip.getPort());
+        c.close();
+        s.close();
+        server.close();
+        try drain();
+        try expectEqual(@as(u64, 1), sim.streamStats().refused);
+    }
+};
+
+test "sim: stream: a connect to a socket bound but not listening is refused and leaves it able to listen" {
+    if (comptime skip) return error.SkipZigTest;
+    try run(1, null, bound_not_listening.body);
+}
+
+/// Missing test: a second accept submitted while the first is woken and not
+/// yet harvested. As in `woken_cancel`, an accept and a connect wake in one
+/// batch at 3L; when the connect's callback runs first, it submits a second
+/// accept on the listener, which must refuse. The batch order is the
+/// seed's, so the child tries seeds 1 to 16 and must die in one of them.
+const second_woken = struct {
+    var acc: ev.NetAccept = undefined;
+    var acc2: ev.NetAccept = undefined;
+    var con: ev.NetConnect = undefined;
+    var c0: ev.NetConnect = undefined;
+    var to: os_net.sockaddr.in = undefined;
+    var listener: i32 = -1;
+    var first: enum { none, accept, connect } = .none;
+
+    fn onAccept(_: *ev.Loop, _: *ev.Completion) void {
+        if (first == .none) first = .accept;
+    }
+
+    fn onConnect(l: *ev.Loop, _: *ev.Completion) void {
+        if (first != .none) return;
+        first = .connect;
+        acc2 = ev.NetAccept.init(listener, null, null);
+        acc2.c.callback = noop;
+        acc2.c.flags.defer_callback = false;
+        l.add(&acc2.c);
+    }
+
+    fn body() !void {
+        first = .none;
+        const server = try listen(lo, 0, .{});
+        listener = server.socket.handle;
+        to = sockaddr(lo, portOf(server));
+        const loop = &rt_mod.getCurrentExecutor().loop;
+        const fd0 = try evOpen();
+        const fd1 = try evOpen();
+        c0 = ev.NetConnect.init(fd0, @ptrCast(&to), @sizeOf(os_net.sockaddr.in));
+        c0.c.callback = noop;
+        c0.c.flags.defer_callback = false;
+        loop.add(&c0.c);
+        acc = ev.NetAccept.init(listener, null, null);
+        acc.c.callback = onAccept;
+        acc.c.flags.defer_callback = false;
+        loop.add(&acc.c);
+        try rt_mod.sleep(.fromMicroseconds(L / 1000));
+        con = ev.NetConnect.init(fd1, @ptrCast(&to), @sizeOf(os_net.sockaddr.in));
+        con.c.callback = onConnect;
+        con.c.flags.defer_callback = false;
+        loop.add(&con.c);
+        try rt_mod.sleep(.fromMilliseconds(1));
+        // Only reached when the accept was harvested first.
+        evClose(try acc.getResult());
+        evClose(fd0);
+        evClose(fd1);
+        server.close();
+        try drain();
+    }
+};
+
+test "sim: stream refuses: a second accept while the first is woken and not yet harvested" {
+    if (comptime skip) return error.SkipZigTest;
+    if (!sim.isDeathChild()) return sim.expectChildPanics("sim: stream refuses: a second accept while the first is woken", "sim: a second accept while one is woken and not yet harvested, on sim listener 100032");
+    sim.noCoreDump();
+    for (1..17) |s| try run(s, null, second_woken.body);
+    return error.NoSeedRanTheConnectFirst;
+}
+
+/// Finding 4: the arithmetic limits, each a named panic.
+const limits = struct {
+    fn time() !void {
+        _, const c, _ = try pair();
+        sim.advanceNs(std.math.maxInt(u64));
+        os_net.close(c.socket.handle);
+    }
+    fn connId() !void {
+        const s = try listen(lo, 0, .{});
+        sim.testSetNextConnId(std.math.maxInt(u32));
+        _ = try connect(lo, portOf(s), .none);
+    }
+};
+
+test "sim: stream refuses: a TCP landing time past maxInt(u64)" {
+    try refusal("sim: stream refuses: a TCP landing time past", "sim: a TCP entry sent at 18446744073709551615 ns would land after maxInt(u64) ns: the sim's time limit", null, limits.time);
+}
+test "sim: stream refuses: the last conn_id a u32 holds" {
+    try refusal("sim: stream refuses: the last conn_id a u32 holds", "sim: conn_id 4294967295 is the last a u32 holds", null, limits.connId);
 }

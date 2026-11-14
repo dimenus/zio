@@ -1179,9 +1179,14 @@ pub const RecvError = error{
 };
 
 pub fn recv(fd: fd_t, buffers: []iovec, flags: RecvFlags) RecvError!usize {
-    if (buffers.len == 0) return 0;
+    // Before the empty-list return: with no buffers a sim stream socket
+    // would otherwise succeed here, and a receive would look like end of
+    // stream (outside review 5 of the stream track, finding 1).
     if (comptime sim_layer) {
         if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's receive", fd);
+    }
+    if (buffers.len == 0) return 0;
+    if (comptime sim_layer) {
         if (sim.isDgramFd(fd)) return error.OperationNotSupported;
         sim.refuseSimFd(@src(), fd);
     }
@@ -1305,9 +1310,14 @@ pub const SendError = error{
 };
 
 pub fn send(fd: fd_t, buffers: []const iovec_const, flags: SendFlags) SendError!usize {
-    if (buffers.len == 0) return 0;
+    // Before the empty-list return: with no buffers a sim stream socket
+    // would otherwise succeed here, and a receive would look like end of
+    // stream (outside review 5 of the stream track, finding 1).
     if (comptime sim_layer) {
         if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's send", fd);
+    }
+    if (buffers.len == 0) return 0;
+    if (comptime sim_layer) {
         if (sim.isDgramFd(fd)) return error.OperationNotSupported;
         sim.refuseSimFd(@src(), fd);
     }
@@ -1381,6 +1391,12 @@ pub fn recvfrom(
     addr: ?*sockaddr,
     addr_len: ?*socklen_t,
 ) RecvError!usize {
+    // Before the empty-list return: with no buffers a sim stream socket
+    // would otherwise succeed here, and a receive would look like end of
+    // stream (outside review 5 of the stream track, finding 1).
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's recvfrom", fd);
+    }
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
         if (sim.isSimFd(fd)) {
@@ -1470,6 +1486,12 @@ pub fn sendto(
     addr: *const sockaddr,
     addr_len: socklen_t,
 ) SendError!usize {
+    // Before the empty-list return: with no buffers a sim stream socket
+    // would otherwise succeed here, and a receive would look like end of
+    // stream (outside review 5 of the stream track, finding 1).
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's sendto", fd);
+    }
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
         if (sim.isSimFd(fd)) return simSend(fd, buffers, flags, simAddr("sendto", addr, addr_len), null);
@@ -1560,6 +1582,12 @@ pub fn recvmsg(
     addr_len: ?*socklen_t,
     control: ?[]u8,
 ) RecvError!RecvMsgResult {
+    // Before the empty-list return: with no buffers a sim stream socket
+    // would otherwise succeed here, and a receive would look like end of
+    // stream (outside review 5 of the stream track, finding 1).
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's recvmsg", fd);
+    }
     if (buffers.len == 0) return .{ .len = 0, .flags = 0, .controllen = 0 };
     if (comptime sim_layer) {
         if (sim.isSimFd(fd)) {
@@ -1774,6 +1802,12 @@ pub fn sendmsg(
     addr_len: socklen_t,
     control: ?[]const u8,
 ) SendError!usize {
+    // Before the empty-list return: with no buffers a sim stream socket
+    // would otherwise succeed here, and a receive would look like end of
+    // stream (outside review 5 of the stream track, finding 1).
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's sendmsg", fd);
+    }
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
         if (sim.isSimFd(fd)) {
@@ -1906,6 +1940,12 @@ pub const DatagramInfo = struct {
 /// empty datagram, pass one empty buffer.
 pub fn recvDatagram(fd: fd_t, buffers: []iovec, flags: RecvFlags, from: ?*sockaddr.in) RecvError!DatagramInfo {
     if (comptime builtin.os.tag == .windows) @compileError("recvDatagram: not on Windows yet");
+    // Before the empty-list return: with no buffers a sim stream socket
+    // would otherwise succeed here, and a receive would look like end of
+    // stream (outside review 5 of the stream track, finding 1).
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's recvDatagram", fd);
+    }
     if (buffers.len == 0) return .{ .len = 0, .truncated = false, .to = null };
     if (comptime sim_layer) {
         if (sim.isSimFd(fd)) {
@@ -1935,6 +1975,12 @@ pub fn recvDatagram(fd: fd_t, buffers: []iovec, flags: RecvFlags, from: ?*sockad
 /// empty datagram, pass one empty buffer.
 pub fn sendDatagram(fd: fd_t, buffers: []const iovec_const, flags: SendFlags, to: *const sockaddr.in, from: ?[4]u8) SendError!usize {
     if (comptime builtin.os.tag == .windows) @compileError("sendDatagram: not on Windows yet");
+    // Before the empty-list return: with no buffers a sim stream socket
+    // would otherwise succeed here, and a receive would look like end of
+    // stream (outside review 5 of the stream track, finding 1).
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's sendDatagram", fd);
+    }
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
         if (sim.isSimFd(fd)) return simSend(fd, buffers, flags, simAddrIn("sendDatagram", to), from);

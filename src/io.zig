@@ -2642,7 +2642,16 @@ fn netReadOpImpl(
     timeout: time.Timeout,
     clock: time.Clock,
 ) (Io.Operation.NetRead.Error || Io.Cancelable || common.Timeoutable)!usize {
-    if (data.len == 0) return 0;
+    if (data.len == 0) {
+        // Under sim, this would report end of stream on a stream socket
+        // before any op reaches the sim: refused by name instead (design
+        // 17.4: a receive with no room is refused). Compiled out without sim.
+        if (comptime @import("sim.zig").compiled_in and builtin.os.tag != .windows) {
+            const sim = @import("sim.zig");
+            if (sim.isStreamFd(stdIoHandleToZio(handle))) sim.refuseStream("std.Io's netRead with no buffers", stdIoHandleToZio(handle));
+        }
+        return 0;
+    }
     var iovecs: [max_iovecs_len]os_net.iovec = undefined;
     var op = ev.NetRecv.init(stdIoHandleToZio(handle), ev.ReadBuf.fromSlices(data, &iovecs), .{});
     try timedWaitForIoClock(&op.c, timeout, clock);
