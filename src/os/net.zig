@@ -8,6 +8,12 @@ const thread = @import("thread.zig");
 const syscall_cancel = @import("syscall_cancel.zig");
 
 const log = @import("../common.zig").log;
+const sim = @import("../sim.zig");
+
+/// Whether this build has the sim branch of the socket layer (sim network
+/// design rev 3, section 3.1). Without sim, every `if (comptime sim_layer)`
+/// block is gone and each function is the syscall.
+const sim_layer = sim.compiled_in and builtin.os.tag != .windows;
 
 // Windows addrinfo definitions
 const windows_addrinfo = if (builtin.os.tag == .windows) extern struct {
@@ -151,6 +157,9 @@ pub fn poll(fds: []pollfd, timeout: i32) PollError!usize {
 }
 
 pub fn close(fd: fd_t) void {
+    if (comptime sim_layer) {
+        if (sim.isDgramFd(fd)) return sim.dgramClose(fd);
+    }
     switch (builtin.os.tag) {
         .windows => {
             _ = windows.closesocket(fd);
@@ -189,6 +198,10 @@ pub const ShutdownError = error{
 };
 
 pub fn shutdown(fd: fd_t, how: ShutdownHow) ShutdownError!void {
+    if (comptime sim_layer) {
+        // An unconnected UDP socket: ENOTCONN, as Linux answers.
+        if (sim.isDgramFd(fd)) return error.SocketUnconnected;
+    }
     switch (builtin.os.tag) {
         .windows => {
             const system_how: i32 = switch (how) {
@@ -325,6 +338,14 @@ fn disableUdpResetReports(sock: fd_t) void {
 }
 
 pub fn socket(domain: Domain, socket_type: Type, protocol: Protocol, flags: OpenFlags) OpenError!fd_t {
+    if (comptime sim_layer) {
+        if (sim.isRunning()) {
+            if (domain != .ipv4 or socket_type != .dgram or (protocol != .ip and protocol != .udp)) {
+                sim.panic("sim: socket({t}, {t}, {t}) during a sim run: only IPv4 datagram sockets are simulated", .{ domain, socket_type, protocol });
+            }
+            return sim.dgramOpen(flags.nonblocking);
+        }
+    }
     switch (builtin.os.tag) {
         .windows => {
             const sock = windows.WSASocketW(
@@ -522,6 +543,9 @@ pub fn errnoToBindError(err: E) BindError {
 }
 
 pub fn bind(fd: fd_t, addr: *const sockaddr, addr_len: socklen_t) BindError!void {
+    if (comptime sim_layer) {
+        if (sim.isSimFd(fd)) return sim.dgramBind(fd, simAddr("bind", addr, addr_len));
+    }
     switch (builtin.os.tag) {
         .windows => {
             const rc = windows.bind(fd, @ptrCast(addr), @intCast(addr_len));
@@ -583,6 +607,9 @@ pub fn errnoToListenError(err: E) ListenError {
 }
 
 pub fn listen(fd: fd_t, backlog: u31) ListenError!void {
+    if (comptime sim_layer) {
+        if (sim.isDgramFd(fd)) return error.OperationNotSupported;
+    }
     switch (builtin.os.tag) {
         .windows => {
             const rc = windows.listen(fd, backlog);
@@ -629,6 +656,9 @@ pub const ConnectError = error{
 };
 
 pub fn connect(fd: fd_t, addr: *const sockaddr, addr_len: socklen_t) ConnectError!void {
+    if (comptime sim_layer) {
+        if (sim.isDgramFd(fd)) sim.panic("sim: connect on sim datagram socket {d}: connected UDP is not simulated", .{fd});
+    }
     switch (builtin.os.tag) {
         .windows => {
             const rc = windows.connect(fd, @ptrCast(addr), @intCast(addr_len));
@@ -667,6 +697,9 @@ pub const AcceptError = error{
 };
 
 pub fn accept(fd: fd_t, addr: ?*sockaddr, addr_len: ?*socklen_t, flags: OpenFlags) AcceptError!fd_t {
+    if (comptime sim_layer) {
+        if (sim.isDgramFd(fd)) return error.OperationNotSupported;
+    }
     switch (builtin.os.tag) {
         .windows => {
             const sock = windows.accept(
@@ -744,6 +777,9 @@ pub fn accept(fd: fd_t, addr: ?*sockaddr, addr_len: ?*socklen_t, flags: OpenFlag
 pub const GetSockNameError = error{Unexpected};
 
 pub fn getsockname(fd: fd_t, addr: *sockaddr, addr_len: *socklen_t) GetSockNameError!void {
+    if (comptime sim_layer) {
+        if (sim.isSimFd(fd)) return writeSimAddr(sim.dgramLocal(fd), addr, addr_len);
+    }
     switch (builtin.os.tag) {
         .windows => {
             const rc = windows.getsockname(fd, @ptrCast(addr), @ptrCast(addr_len));
@@ -771,6 +807,9 @@ pub fn getSockError(fd: fd_t) GetSockErrorError!i32 {
 pub const SetsockoptError = error{ OptionNotSupported, Unexpected };
 
 pub fn setsockopt(fd: fd_t, level: i32, optname: u32, optval: []const u8) SetsockoptError!void {
+    if (comptime sim_layer) {
+        if (sim.isSimFd(fd)) sim.panic("sim: setsockopt(level {d}, option {d}) on sim fd {d}: socket options are not simulated yet", .{ level, optname, fd });
+    }
     switch (builtin.os.tag) {
         .windows => {
             const rc = windows.setsockopt(fd, level, optname, optval.ptr, @intCast(optval.len));
@@ -799,6 +838,9 @@ pub fn setNoDelay(fd: fd_t, enabled: bool) SetsockoptError!void {
 pub const GetsockoptError = error{Unexpected};
 
 pub fn getsockopt(fd: fd_t, level: i32, optname: u32, optval: []u8) GetsockoptError!void {
+    if (comptime sim_layer) {
+        if (sim.isSimFd(fd)) sim.panic("sim: getsockopt(level {d}, option {d}) on sim fd {d}: socket options are not simulated yet", .{ level, optname, fd });
+    }
     switch (builtin.os.tag) {
         .windows => {
             var len: i32 = @intCast(optval.len);
@@ -1115,6 +1157,9 @@ pub const RecvError = error{
 
 pub fn recv(fd: fd_t, buffers: []iovec, flags: RecvFlags) RecvError!usize {
     if (buffers.len == 0) return 0;
+    if (comptime sim_layer) {
+        if (sim.isDgramFd(fd)) return error.OperationNotSupported;
+    }
 
     const sys_flags = recvFlagsToSys(flags);
 
@@ -1236,6 +1281,9 @@ pub const SendError = error{
 
 pub fn send(fd: fd_t, buffers: []const iovec_const, flags: SendFlags) SendError!usize {
     if (buffers.len == 0) return 0;
+    if (comptime sim_layer) {
+        if (sim.isDgramFd(fd)) return error.OperationNotSupported;
+    }
 
     const sys_flags = sendFlagsToSys(flags);
 
@@ -1307,6 +1355,13 @@ pub fn recvfrom(
     addr_len: ?*socklen_t,
 ) RecvError!usize {
     if (buffers.len == 0) return 0;
+    if (comptime sim_layer) {
+        if (sim.isSimFd(fd)) {
+            const r = try simRecv(fd, buffers, flags);
+            if (addr) |a| writeSimAddr(r.from, a, addr_len orelse sim.panic("sim: recvfrom with an address but no length", .{}));
+            return simRecvLen(r, flags);
+        }
+    }
 
     var sys_flags = recvFlagsToSys(flags);
 
@@ -1389,6 +1444,9 @@ pub fn sendto(
     addr_len: socklen_t,
 ) SendError!usize {
     if (buffers.len == 0) return 0;
+    if (comptime sim_layer) {
+        if (sim.isSimFd(fd)) return simSend(fd, buffers, simAddr("sendto", addr, addr_len), null);
+    }
 
     const sys_flags = sendFlagsToSys(flags);
 
@@ -1476,6 +1534,22 @@ pub fn recvmsg(
     control: ?[]u8,
 ) RecvError!RecvMsgResult {
     if (buffers.len == 0) return .{ .len = 0, .flags = 0, .controllen = 0 };
+    if (comptime sim_layer) {
+        if (sim.isSimFd(fd)) {
+            // The sim does not write control messages: `recvDatagram`
+            // carries the destination address as a typed value instead.
+            if (control != null and sim.dgramDestinationAddressEnabled(fd)) {
+                sim.panic("sim: recvmsg with a control buffer on sim fd {d}, which asked for destination addresses: use recvDatagram", .{fd});
+            }
+            const r = try simRecv(fd, buffers, flags);
+            if (addr) |a| writeSimAddr(r.from, a, addr_len orelse sim.panic("sim: recvmsg with an address but no length", .{}));
+            return .{
+                .len = simRecvLen(r, flags),
+                .flags = if (r.copied < r.len) posix.system.MSG.TRUNC else 0,
+                .controllen = 0,
+            };
+        }
+    }
 
     const sys_flags = recvFlagsToSys(flags);
 
@@ -1666,6 +1740,15 @@ pub fn sendmsg(
     control: ?[]const u8,
 ) SendError!usize {
     if (buffers.len == 0) return 0;
+    if (comptime sim_layer) {
+        if (sim.isSimFd(fd)) {
+            if (control != null and control.?.len > 0) {
+                sim.panic("sim: sendmsg with control data on sim fd {d}: use sendDatagram for a source address", .{fd});
+            }
+            const a = addr orelse sim.panic("sim: sendmsg with no address on sim fd {d}: connected UDP is not simulated", .{fd});
+            return simSend(fd, buffers, simAddr("sendmsg", a, addr_len), null);
+        }
+    }
 
     const sys_flags = sendFlagsToSys(flags);
 
@@ -1704,6 +1787,218 @@ pub fn sendmsg(
             }
         },
     }
+}
+
+// ---- Datagram metadata, in every build (sim network design rev 3, 3.1) ----
+//
+// A consumer that needs a datagram's destination address, or must send from
+// a chosen source address (ENet's bridge in hotseat), uses these typed calls
+// instead of building control messages itself. They are the same calls in a
+// build with sim and without: under sim, during a run, a sim fd takes the sim
+// branch; any other fd is the syscall. POSIX only for now: on Windows each is
+// a compile error, so no untested Windows code ships.
+
+/// Sets or clears the socket's non-blocking mode (`O_NONBLOCK`).
+pub fn setNonBlocking(fd: fd_t, on: bool) error{Unexpected}!void {
+    if (comptime builtin.os.tag == .windows) @compileError("setNonBlocking: not on Windows yet");
+    if (comptime sim_layer) {
+        if (sim.isSimFd(fd)) return sim.dgramSetNonBlocking(fd, on);
+    }
+    const fl = posix.system.fcntl(fd, posix.system.F.GETFL, @as(c_int, 0));
+    switch (posix.errno(fl)) {
+        .SUCCESS => {},
+        else => |err| return unexpectedError(err),
+    }
+    // `fcntl` returns `c_int` through libc and `usize` as a raw Linux
+    // syscall: the bit takes whichever type it is.
+    const bit: @TypeOf(fl) = 1 << @bitOffsetOf(posix.system.O, "NONBLOCK");
+    const new_flags = if (on) fl | bit else fl & ~bit;
+    switch (posix.errno(posix.system.fcntl(fd, posix.system.F.SETFL, new_flags))) {
+        .SUCCESS => {},
+        else => |err| return unexpectedError(err),
+    }
+}
+
+/// Whether the socket is in non-blocking mode. POSIX only: Windows cannot
+/// read a socket's blocking mode back.
+pub fn isNonBlocking(fd: fd_t) error{Unexpected}!bool {
+    if (comptime builtin.os.tag == .windows) @compileError("isNonBlocking: Windows cannot read a socket's blocking mode back");
+    if (comptime sim_layer) {
+        if (sim.isSimFd(fd)) return sim.dgramIsNonBlocking(fd);
+    }
+    const fl = posix.system.fcntl(fd, posix.system.F.GETFL, @as(c_int, 0));
+    switch (posix.errno(fl)) {
+        .SUCCESS => {},
+        else => |err| return unexpectedError(err),
+    }
+    const bit: @TypeOf(fl) = 1 << @bitOffsetOf(posix.system.O, "NONBLOCK");
+    return fl & bit != 0;
+}
+
+/// Asks the kernel to report each datagram's destination address, which
+/// `recvDatagram` then returns as `to`: `IP_PKTINFO` on Linux,
+/// `IP_RECVDSTADDR` on macOS and the BSDs.
+pub fn enableDestinationAddress(fd: fd_t) SetsockoptError!void {
+    if (comptime builtin.os.tag == .windows) @compileError("enableDestinationAddress: not on Windows yet");
+    if (comptime sim_layer) {
+        if (sim.isSimFd(fd)) return sim.dgramEnableDestinationAddress(fd);
+    }
+    const one: c_int = 1;
+    return switch (builtin.os.tag) {
+        .linux => setsockopt(fd, IPPROTO.IP, posix.system.IP.PKTINFO, std.mem.asBytes(&one)),
+        else => setsockopt(fd, IPPROTO.IP, posix.system.IP.RECVDSTADDR, std.mem.asBytes(&one)),
+    };
+}
+
+pub const DatagramInfo = struct {
+    /// Bytes copied into the buffers. On Linux with `flags.trunc`, the
+    /// datagram's full length instead (other systems ignore that flag).
+    len: usize,
+    /// The datagram did not fit the buffers. The rest of it is gone: the next
+    /// receive is the next datagram.
+    truncated: bool,
+    /// The address the datagram was sent to, after `enableDestinationAddress`;
+    /// null otherwise.
+    to: ?[4]u8,
+};
+
+/// Receives one IPv4 datagram, with its source (`from`, if given) and its
+/// destination address (`DatagramInfo.to`). With no buffers it receives
+/// nothing and returns a zero length, as `recvmsg` here does: to take an
+/// empty datagram, pass one empty buffer.
+pub fn recvDatagram(fd: fd_t, buffers: []iovec, flags: RecvFlags, from: ?*sockaddr.in) RecvError!DatagramInfo {
+    if (comptime builtin.os.tag == .windows) @compileError("recvDatagram: not on Windows yet");
+    if (buffers.len == 0) return .{ .len = 0, .truncated = false, .to = null };
+    if (comptime sim_layer) {
+        if (sim.isSimFd(fd)) {
+            const r = try simRecv(fd, buffers, flags);
+            if (from) |f| f.* = simSockaddr(r.from);
+            return .{ .len = simRecvLen(r, flags), .truncated = r.copied < r.len, .to = r.to };
+        }
+    }
+    var control: [128]u8 align(@alignOf(posix.system.cmsghdr)) = undefined;
+    var name: sockaddr.in = undefined;
+    var name_len: socklen_t = @sizeOf(sockaddr.in);
+    const r = try recvmsg(fd, buffers, flags, @ptrCast(&name), &name_len, &control);
+    if (from) |f| f.* = name;
+    return .{
+        .len = r.len,
+        .truncated = r.flags & posix.system.MSG.TRUNC != 0,
+        .to = destinationFromControl(control[0..r.controllen]),
+    };
+}
+
+/// Sends one IPv4 datagram to `to`. With `from`, it leaves from that
+/// address (`IP_PKTINFO`'s `ipi_spec_dst` on Linux and macOS). An address
+/// the host does not have fails: `error.AddressUnavailable` on macOS,
+/// `error.NetworkUnreachable` on Linux. Linux sends from any address it has,
+/// even one the socket is not bound to. With no
+/// buffers it sends nothing and returns 0, as `sendto` here does: to send an
+/// empty datagram, pass one empty buffer.
+pub fn sendDatagram(fd: fd_t, buffers: []const iovec_const, flags: SendFlags, to: *const sockaddr.in, from: ?[4]u8) SendError!usize {
+    if (comptime builtin.os.tag == .windows) @compileError("sendDatagram: not on Windows yet");
+    if (buffers.len == 0) return 0;
+    if (comptime sim_layer) {
+        if (sim.isSimFd(fd)) return simSend(fd, buffers, simAddrIn("sendDatagram", to), from);
+    }
+    const f = from orelse return sendto(fd, buffers, flags, @ptrCast(to), @sizeOf(sockaddr.in));
+    var control: [64]u8 align(@alignOf(posix.system.cmsghdr)) = @splat(0);
+    const used = sourceAddressControl(&control, f);
+    return sendmsg(fd, buffers, flags, @ptrCast(to), @sizeOf(sockaddr.in), control[0..used]);
+}
+
+/// `struct in_pktinfo` as Linux and macOS lay it out.
+const InPktinfo = extern struct {
+    ifindex: u32,
+    spec_dst: [4]u8,
+    addr: [4]u8,
+};
+
+/// Writes one `IP_PKTINFO` control message asking for source address `from`;
+/// returns its space.
+fn sourceAddressControl(buf: []align(@alignOf(posix.system.cmsghdr)) u8, from: [4]u8) usize {
+    const info: InPktinfo = .{ .ifindex = 0, .spec_dst = from, .addr = @splat(0) };
+    const hdr: posix.system.cmsghdr = .{
+        .len = @intCast(cmsg_data_offset + @sizeOf(InPktinfo)),
+        .level = IPPROTO.IP,
+        .type = posix.system.IP.PKTINFO,
+    };
+    @memcpy(buf[0..@sizeOf(posix.system.cmsghdr)], std.mem.asBytes(&hdr));
+    @memcpy(buf[cmsg_data_offset..][0..@sizeOf(InPktinfo)], std.mem.asBytes(&info));
+    return std.mem.alignForward(usize, cmsg_data_offset + @sizeOf(InPktinfo), cmsg_align);
+}
+
+/// The destination address in a received control message, if one is there:
+/// `IP_PKTINFO`'s `ipi_addr`, or `IP_RECVDSTADDR`'s address.
+fn destinationFromControl(control: []const u8) ?[4]u8 {
+    const cmsghdr = posix.system.cmsghdr;
+    var offset: usize = 0;
+    while (offset + @sizeOf(cmsghdr) <= control.len) {
+        const hdr = std.mem.bytesToValue(cmsghdr, control[offset..][0..@sizeOf(cmsghdr)]);
+        if (hdr.len < cmsg_data_offset or hdr.len > control.len - offset) return null;
+        const data = control[offset + cmsg_data_offset .. offset + hdr.len];
+        if (hdr.level == IPPROTO.IP) {
+            if (hdr.type == posix.system.IP.PKTINFO and data.len >= @sizeOf(InPktinfo)) {
+                return std.mem.bytesToValue(InPktinfo, data[0..@sizeOf(InPktinfo)]).addr;
+            }
+            if (builtin.os.tag != .linux and hdr.type == posix.system.IP.RECVDSTADDR and data.len >= 4) {
+                return data[0..4].*;
+            }
+        }
+        offset += std.mem.alignForward(usize, hdr.len, cmsg_align);
+    }
+    return null;
+}
+
+// ---- The sim branch's helpers (only with sim, never on Windows) ----
+
+const sim_max_iovecs = 16;
+
+fn simAddr(comptime what: []const u8, addr: *const sockaddr, len: socklen_t) sim.Ip4 {
+    // The family is checked once, in `simAddrIn`, before anything else reads
+    // the address as IPv4.
+    if (len < @sizeOf(sockaddr.in)) sim.panic("sim: " ++ what ++ " with an address of {d} bytes", .{len});
+    return simAddrIn(what, @ptrCast(@alignCast(addr)));
+}
+
+fn simAddrIn(comptime what: []const u8, a: *const sockaddr.in) sim.Ip4 {
+    if (a.family != AF.INET) sim.panic("sim: " ++ what ++ " with address family {d}: only IPv4 is simulated", .{a.family});
+    return .{ .ip = @bitCast(a.addr), .port = std.mem.bigToNative(u16, a.port) };
+}
+
+fn simSockaddr(a: sim.Ip4) sockaddr.in {
+    return .{ .port = std.mem.nativeToBig(u16, a.port), .addr = @bitCast(a.ip) };
+}
+
+/// As the kernel does: copies as much of the address as fits, and sets the
+/// length to the address's full size.
+fn writeSimAddr(a: sim.Ip4, out: *sockaddr, out_len: *socklen_t) void {
+    const in = simSockaddr(a);
+    const n = @min(@as(usize, @intCast(out_len.*)), @sizeOf(sockaddr.in));
+    @memcpy(@as([*]u8, @ptrCast(out))[0..n], std.mem.asBytes(&in)[0..n]);
+    out_len.* = @sizeOf(sockaddr.in);
+}
+
+fn simRecv(fd: fd_t, buffers: []iovec, flags: RecvFlags) RecvError!sim.Received {
+    if (flags.peek) sim.panic("sim: MSG_PEEK on sim fd {d} is not simulated", .{fd});
+    if (flags.waitall or flags.oob) sim.panic("sim: MSG_WAITALL or MSG_OOB on sim fd {d} is not simulated", .{fd});
+    if (buffers.len > sim_max_iovecs) sim.panic("sim: a receive with {d} buffers (max {d})", .{ buffers.len, sim_max_iovecs });
+    var sl: [sim_max_iovecs][]u8 = undefined;
+    for (buffers, 0..) |b, i| sl[i] = b.base[0..b.len];
+    return sim.dgramRecv(fd, sl[0..buffers.len], flags.dontwait);
+}
+
+/// The length a receive reports, as the host's kernel does: Linux gives the
+/// full datagram length for `MSG_TRUNC`; other systems ignore that flag.
+fn simRecvLen(r: sim.Received, flags: RecvFlags) usize {
+    return if (flags.trunc and builtin.os.tag == .linux) r.len else r.copied;
+}
+
+fn simSend(fd: fd_t, buffers: []const iovec_const, to: sim.Ip4, from: ?[4]u8) SendError!usize {
+    if (buffers.len > sim_max_iovecs) sim.panic("sim: a send with {d} buffers (max {d})", .{ buffers.len, sim_max_iovecs });
+    var sl: [sim_max_iovecs][]const u8 = undefined;
+    for (buffers, 0..) |b, i| sl[i] = b.base[0..b.len];
+    return sim.dgramSend(fd, sl[0..buffers.len], to, from);
 }
 
 /// Creates a connected socket pair using loopback connection (for Windows async wakeup)
@@ -2030,4 +2325,171 @@ test "recv on non-blocking socket without data returns WouldBlock" {
 test "a send that fails with EADDRNOTAVAIL is AddressUnavailable, not Unexpected" {
     const e: E = if (builtin.os.tag == .windows) .EADDRNOTAVAIL else .ADDRNOTAVAIL;
     try std.testing.expectEqual(error.AddressUnavailable, errnoToSendError(e));
+}
+
+const real_dgram = struct {
+    fn open() !fd_t {
+        return socket(.ipv4, .dgram, .ip, .{ .nonblocking = true });
+    }
+
+    fn in4(ip: [4]u8, port: u16) sockaddr.in {
+        return .{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(ip) };
+    }
+
+    fn bindAt(fd: fd_t, ip: [4]u8) !u16 {
+        const a = in4(ip, 0);
+        try bind(fd, @ptrCast(&a), @sizeOf(sockaddr.in));
+        var got: sockaddr.in = undefined;
+        var len: socklen_t = @sizeOf(sockaddr.in);
+        try getsockname(fd, @ptrCast(&got), &len);
+        return std.mem.bigToNative(u16, got.port);
+    }
+
+    /// Waits up to a second for `fd` to be readable.
+    fn waitReadable(fd: fd_t) !void {
+        var fds = [1]pollfd{.{ .fd = fd, .events = POLL.IN, .revents = 0 }};
+        if (try poll(&fds, 1000) != 1) return error.NothingArrived;
+    }
+
+    fn send1(fd: fd_t, to: sockaddr.in, from: ?[4]u8, data: []const u8) !usize {
+        var iov = [1]iovec_const{iovecConstFromSlice(data)};
+        return sendDatagram(fd, &iov, .{}, &to, from);
+    }
+
+    fn recv1(fd: fd_t, buf: []u8, flags: RecvFlags, from: *sockaddr.in) !DatagramInfo {
+        try waitReadable(fd);
+        var iov = [1]iovec{iovecFromSlice(buf)};
+        return recvDatagram(fd, &iov, flags, from);
+    }
+};
+
+test "datagram metadata: a wildcard receiver gets the destination address and the sender's source" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const rx = try real_dgram.open();
+    defer close(rx);
+    const tx = try real_dgram.open();
+    defer close(tx);
+    const rx_port = try real_dgram.bindAt(rx, .{ 0, 0, 0, 0 });
+    const tx_port = try real_dgram.bindAt(tx, .{ 127, 0, 0, 1 });
+    try enableDestinationAddress(rx);
+    try std.testing.expectEqual(@as(usize, 3), try real_dgram.send1(tx, real_dgram.in4(.{ 127, 0, 0, 1 }, rx_port), null, "abc"));
+    var buf: [16]u8 = undefined;
+    var from: sockaddr.in = undefined;
+    const info = try real_dgram.recv1(rx, &buf, .{}, &from);
+    try std.testing.expectEqual(@as(usize, 3), info.len);
+    try std.testing.expect(!info.truncated);
+    try std.testing.expectEqualStrings("abc", buf[0..3]);
+    try std.testing.expectEqual(@as(?[4]u8, .{ 127, 0, 0, 1 }), info.to);
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, @as([4]u8, @bitCast(from.addr)));
+    try std.testing.expectEqual(tx_port, std.mem.bigToNative(u16, from.port));
+}
+
+test "datagram metadata: without enableDestinationAddress there is no destination" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const rx = try real_dgram.open();
+    defer close(rx);
+    const tx = try real_dgram.open();
+    defer close(tx);
+    const rx_port = try real_dgram.bindAt(rx, .{ 127, 0, 0, 1 });
+    _ = try real_dgram.send1(tx, real_dgram.in4(.{ 127, 0, 0, 1 }, rx_port), null, "x");
+    var buf: [4]u8 = undefined;
+    var from: sockaddr.in = undefined;
+    const info = try real_dgram.recv1(rx, &buf, .{}, &from);
+    try std.testing.expectEqual(@as(?[4]u8, null), info.to);
+}
+
+test "datagram metadata: a send from a chosen source address leaves from it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const rx = try real_dgram.open();
+    defer close(rx);
+    const tx = try real_dgram.open();
+    defer close(tx);
+    const rx_port = try real_dgram.bindAt(rx, .{ 127, 0, 0, 1 });
+    const tx_port = try real_dgram.bindAt(tx, .{ 0, 0, 0, 0 });
+    _ = try real_dgram.send1(tx, real_dgram.in4(.{ 127, 0, 0, 1 }, rx_port), .{ 127, 0, 0, 1 }, "hi");
+    var buf: [4]u8 = undefined;
+    var from: sockaddr.in = undefined;
+    _ = try real_dgram.recv1(rx, &buf, .{}, &from);
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, @as([4]u8, @bitCast(from.addr)));
+    try std.testing.expectEqual(tx_port, std.mem.bigToNative(u16, from.port));
+}
+
+// The kernels answer differently, and the sim models macOS's answer (see
+// `sim.dgramSend`): macOS refuses with EADDRNOTAVAIL; Linux 6.8 looks for a
+// route from that source and answers ENETUNREACH.
+test "datagram metadata: a send from an address the host does not have fails: AddressUnavailable on macOS, NetworkUnreachable on Linux" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const tx = try real_dgram.open();
+    defer close(tx);
+    _ = try real_dgram.bindAt(tx, .{ 0, 0, 0, 0 });
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737): no host has it.
+    const want = if (builtin.os.tag == .linux) error.NetworkUnreachable else error.AddressUnavailable;
+    try std.testing.expectError(want, real_dgram.send1(tx, real_dgram.in4(.{ 127, 0, 0, 1 }, 9), .{ 192, 0, 2, 1 }, "x"));
+}
+
+// Linux has all of 127/8 on its loopback, so a second loopback address shows
+// the source address is used. macOS has only 127.0.0.1 there.
+test "datagram metadata: on Linux a send from 127.0.0.2 leaves from 127.0.0.2" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const rx = try real_dgram.open();
+    defer close(rx);
+    const tx = try real_dgram.open();
+    defer close(tx);
+    const rx_port = try real_dgram.bindAt(rx, .{ 0, 0, 0, 0 });
+    _ = try real_dgram.bindAt(tx, .{ 0, 0, 0, 0 });
+    _ = try real_dgram.send1(tx, real_dgram.in4(.{ 127, 0, 0, 1 }, rx_port), .{ 127, 0, 0, 2 }, "hi");
+    var buf: [4]u8 = undefined;
+    var from: sockaddr.in = undefined;
+    _ = try real_dgram.recv1(rx, &buf, .{}, &from);
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 2 }, @as([4]u8, @bitCast(from.addr)));
+}
+
+test "datagram metadata: truncation is reported, and the rest of the datagram is gone" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const rx = try real_dgram.open();
+    defer close(rx);
+    const tx = try real_dgram.open();
+    defer close(tx);
+    const rx_port = try real_dgram.bindAt(rx, .{ 127, 0, 0, 1 });
+    const to = real_dgram.in4(.{ 127, 0, 0, 1 }, rx_port);
+    _ = try real_dgram.send1(tx, to, null, "0123456789");
+    _ = try real_dgram.send1(tx, to, null, "next");
+    var buf: [4]u8 = undefined;
+    var from: sockaddr.in = undefined;
+    const info = try real_dgram.recv1(rx, &buf, .{ .trunc = true }, &from);
+    try std.testing.expect(info.truncated);
+    try std.testing.expectEqual(@as(usize, if (builtin.os.tag == .linux) 10 else 4), info.len);
+    try std.testing.expectEqualStrings("0123", &buf);
+    const next = try real_dgram.recv1(rx, &buf, .{}, &from);
+    try std.testing.expect(!next.truncated);
+    try std.testing.expectEqualStrings("next", buf[0..next.len]);
+}
+
+test "datagram metadata: an empty datagram arrives as a datagram of length 0" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const rx = try real_dgram.open();
+    defer close(rx);
+    const tx = try real_dgram.open();
+    defer close(tx);
+    const rx_port = try real_dgram.bindAt(rx, .{ 127, 0, 0, 1 });
+    try std.testing.expectEqual(@as(usize, 0), try real_dgram.send1(tx, real_dgram.in4(.{ 127, 0, 0, 1 }, rx_port), null, ""));
+    var buf: [4]u8 = undefined;
+    var from: sockaddr.in = undefined;
+    const info = try real_dgram.recv1(rx, &buf, .{}, &from);
+    try std.testing.expectEqual(@as(usize, 0), info.len);
+    try std.testing.expect(!info.truncated);
+}
+
+test "setNonBlocking and isNonBlocking agree with each other and with socket's flag" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const fd = try socket(.ipv4, .dgram, .ip, .{ .nonblocking = false });
+    defer close(fd);
+    try std.testing.expect(!try isNonBlocking(fd));
+    try setNonBlocking(fd, true);
+    try std.testing.expect(try isNonBlocking(fd));
+    try setNonBlocking(fd, false);
+    try std.testing.expect(!try isNonBlocking(fd));
+    const nb = try real_dgram.open();
+    defer close(nb);
+    try std.testing.expect(try isNonBlocking(nb));
 }
