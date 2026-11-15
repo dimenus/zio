@@ -1126,25 +1126,45 @@ the mutants in its commits.
     model alone does not kill the stale fence; its generator never makes
     the case (t-4148, with the steering numbers measured, and the model's
     other mirrored variables).
-  - **Next, in this order:**
-    1. t-4148: the op model's generator reaches a release right after a
-       pull, and checks for its other mirrored variables.
-    2. t-4142: close the datagram sockets in zio's 75 tests, then make the
-       refusal the default (t-4138).
-    3. Slice 4 (17.16): the users. starh2's `dst-conn` accept step;
+  - **Sitting 35 (two seats; report 35, `zio-sim36/` beside it).**
+    - add1e96 (t-4148, t-4154): seeds 33 to 40 with their own weights and
+      two scripted steps (`train`, `late_credit`) reach the pull cases;
+      four counts with floors of 10 per profile. The op model alone now
+      kills the stale fence (K-01) and t-4154's mutant, each with both
+      landing times in its reason; a scenario test kills t-4154's too.
+      Seeds 1 to 32 keep c557d8f's digest and no-profile lines.
+    - ee61929 (t-4148): the mirrored variables (`last_credit_at`,
+      `owed_at`, `next_seq`, `data_send_index`) and the second look
+      (landing order, chunk draw, chunk spacing): a sim-only mutant of
+      each is killed by the model; the comments beside them say which
+      check, and that a rule both read wrong from the design passes.
+    - t-4149: the skip is upstream's `AutoCancel: re-armed while the
+      previous arm is still live on another executor`
+      (`src/autocancel.zig`): it skips when no worker migrated, 1 to 3
+      runs in 100 on this Mac. Not changed; filed t-4160.
+    - d461504 (t-4142): `sim.end` refuses open datagram sockets by
+      default; `refuseOpenDatagramsAtEnd` is gone, with no opt-out. 46
+      tests and two children's tests close their sockets; every run's
+      seed, events, clock, trace, wire digest and RNG are the same as at
+      add1e96 (an end-of-run log compared run by run). Pipe ends are not
+      the same shape: a pipe close draws from the RNG (t-4143 stays).
+  - **Next:**
+    1. Slice 4 (17.16): the users. starh2's `dst-conn` accept step;
        hotseat's tests (17.15 item 7), after t-4110 and t-4111; then an
        outside review. Through std.Io, hotseat's "host dies" test sees
        `ConnectionResetByPeer` (t-4139's test).
   - **Open, filed:** t-4126 (macOS row 41g's answer varied in 1 run of 3),
     t-4127 (what stays open after the ruling: whether zio's readiness
     backends' `SO_ERROR` read is a defect, the parked cells no row
-    measures, the gap as a fidelity limit), t-4138 and t-4142 (the
-    datagram refusal as the default), t-4139 (whether std.Io's mapping of
-    `ConnectionTimedOut` should change: upstream's file, the owner's
-    decision), t-4143 (pipe ends at `end`), t-4148 (sitting 34's
-    model follow-up). Queued for the sim seat, not
+    measures, the gap as a fidelity limit), t-4139 (whether std.Io's
+    mapping of `ConnectionTimedOut` should change: upstream's file, the
+    owner's decision), t-4143 (pipe ends at `end`: a pipe close draws
+    from the RNG, so closing them moves digests; it needs a decision
+    first), t-4160 (upstream's AutoCancel test that skips when no worker
+    migrated; whether to report it). Queued for the sim seat, not
     started: t-4106, t-4115, t-4117. Closed: t-4132, t-4133 (sitting
-    32), t-4136 (sitting 33).
+    32), t-4136 (sitting 33), t-4138, t-4142, t-4148, t-4149, t-4154
+    (sitting 35).
   - **What I would change, with what I know now:**
     - The parity table prints every row's answer now; a row that passes
       silently was how a measured difference could hide.
@@ -1222,12 +1242,14 @@ the mutants in its commits.
 - **A run that spins at one virtual instant** panics past
   `sim.default_instant_poll_limit` (t-4133). A test whose correct run
   needs more raises it with `sim.setInstantPollLimit`, and says why.
-- **The stream op model:** the filter `sim: stream op model` (about a
-  minute and a half). The parent runs seeds 1 to 32 in a child per
+- **The stream op model:** the filter `sim: stream op model` (about
+  three minutes). The parent runs seeds 1 to 40 in a child per
   profile, twice (the digest lines must be equal), then one child per
   seed with no profile, which must panic where the profiled runs' shadow
   predicted. Seeds 1 to 16 have no fault step: their digest lines are
-  the check that a stream run with no fault did not change. Its header
+  the check that a stream run with no fault did not change; seeds 1 to
+  32 keep their digest and no-profile lines when a step is added (a new
+  step gets weight 0 in the older blocks). Its header
   comment says what it generates and checks. A replay: set
   `ZIO_STREAM_MODEL_SEED=S`, `ZIO_STREAM_MODEL_STEPS=N` or
   `ZIO_STREAM_MODEL_PROFILE=linux|macos|none` for `zig build test`; the
@@ -1236,6 +1258,16 @@ the mutants in its commits.
   counts: the test binary with `ZIO_SIM_DEATH_CHILD=1`,
   `ZIO_STREAM_MODEL_PROFILE=...` and `TEST_FILTER` set to the child's
   name.
+- **Every datagram socket is closed before `sim.end`** (t-4142): `end`
+  lists each open one and panics. In a test, `defer
+  dg.os_net.close(fd);` after the open, never inside a loop, a labelled
+  block or a helper that returns the fd.
+- **To check promise 1 for a change that should move no digest:** the
+  end-of-run log in `zio-sim36/j4/` beside report 35 (`instrument.py
+  <tree> <log> [nopanic]` on a scratch copy, `endlog.sh`, `attrib.py`,
+  `compare.py`) logs every run's seed, events, clock, trace, wire, RNG
+  and state digest at `end`, in children too, and compares two trees run
+  by run.
 - **The surface table needs the filter `sim: stream`:** its refusal rows
   run other tests in child processes, and a build filtered to the table
   alone does not contain them. To run the table by itself, build with
@@ -1472,6 +1504,18 @@ the mutants in its commits.
   at its landing is older than one sent later and held at its send. The
   op model's first copy appended, and the new landing-time check found
   it at seed 19.
+- **A sim child process gets a fresh environment** (`PATH`,
+  `TEST_FILTER`, the death-child flag, the heap shift): an environment
+  variable set for `zig build test` never reaches it. A probe that must
+  log from children writes its path into the code (sitting 35).
+- **A death child's first line of stderr starts with the runner's
+  progress clear** (`\r`, `ESC [0K`). `hasPanicLine` skips it since
+  d461504; before, a wanted line that was the child's first output never
+  matched.
+- **A random test's floor that only says "not 0" sits thin.** The pull
+  cases had floors of 1 and stayed at 1 per profile; the pull seeds'
+  counts have floors of 10. Steering old seeds moved their digests and
+  pushed another floor to 0 each time: add a seed block instead.
 
 ## 16. A run that spins while virtual time stands still (t-4133)
 
