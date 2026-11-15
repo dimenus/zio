@@ -231,7 +231,28 @@ const MDir = struct {
     read: u64 = 0,
     reclaimed: u64 = 0,
     discarded: [n_discard]u64 = @splat(0),
+    // The next three mirror a variable of the sim of the same name, and
+    // the model's predictions read them. The model moves each from its own
+    // events and the design text, never from the sim, and `checkStats`
+    // compares the sim's value with the model's after every step and
+    // poll, so a sim that moves one differently fails at the step where
+    // they part. What no check here can see is a rule that the model and
+    // the sim both read wrong from the design: the defence against that
+    // is that each rule below is written from 17.7's text, quoted.
+    //
+    // `data_send_index` (`admit`): "moves by one each time a send admits
+    // at least one byte, at admission, never at submission or at a retry".
+    // It is also the chunk draw's key, so a wrong value shows as chunk
+    // sizes that differ on the wire too.
     data_send_index: u64 = 0,
+    // `last_credit_at` and `owed_at` (`creditOwed`, `departCredit`,
+    // `departOwed`): "At most one credit departs per direction per L. A
+    // read inside that interval does not send a credit; it sets owed, and
+    // the owed credit departs at last departure + L with the count at that
+    // moment"; owed departures go "after the entries that land at that
+    // instant, in (conn_id, direction) order"; a credit is discarded when
+    // its direction is terminal at departure. A credit that leaves at
+    // another time also lands at another time, which the wire check sees.
     last_credit_at: ?u64 = null,
     owed_at: ?u64 = null,
     /// Bytes of data sent (the next chunk's `off`), and bytes appended to
@@ -253,7 +274,12 @@ const MConn = struct {
     chunking: sim.ChunkMode = .hashed,
     next_order: u64 = 0,
     /// Each direction's next sequence number: the client's SYN and ACK
-    /// were 0 and 1, the server's SYN-ACK 0.
+    /// were 0 and 1, the server's SYN-ACK 0. The rule is 17.10's "every
+    /// TCP entry kind ... has its own per-direction sequence number". It
+    /// mirrors the sim's `next_seq`, but every held and on-wire entry is
+    /// compared by identity with the sequence in it (`sameEntry`,
+    /// `checkHeld`), so a sim that skips or repeats a number fails at the
+    /// next entry it sends.
     next_seq: [2]u64 = .{ 2, 1 },
     /// Each direction's held entries, in send order (design 17.9).
     held: [2]std.ArrayList(MEntry) = .{ .empty, .empty },
@@ -581,6 +607,12 @@ fn report(e: *MEnd) void {
 
 // ---- The model's wire ----
 
+/// The landing order at one instant, from 17.10: "(landing time, conn_id,
+/// direction, sequence)". The last key is the model's own send order, not
+/// the sequence: within one direction both grow with each send, so they
+/// give the same order, and the rule is not a copy of the sim's
+/// `tcpBefore`. The wire is compared entry by entry in this order, so a
+/// sim that orders one instant differently fails there.
 fn entryBefore(a: MEntry, b: MEntry) bool {
     if (a.due != b.due) return a.due < b.due;
     if (a.conn_id != b.conn_id) return a.conn_id < b.conn_id;
@@ -954,7 +986,11 @@ fn creditOwed(ci: u8, data: u1) void {
 }
 
 /// The chunk-size draw, the model's own copy of the formula in the doc
-/// comment of `chunkDraw` in sim.zig.
+/// comment of `chunkDraw` in sim.zig. It has to be a copy: the formula is
+/// a convention that 17.7 fixes (`hash(seed, conn_id, direction,
+/// data_send_index, chunk_index, "chunk")`), not a behaviour with a second
+/// way to derive it. A sim that changes any input gives other chunk
+/// sizes, which the wire check sees by length.
 fn chunkDraw(conn_id: u32, dir: u1, send_index: u64, k: u64) u64 {
     var key: [16]u8 = @splat(0);
     std.mem.writeInt(u64, key[0..8], M.seed, .little);
@@ -991,6 +1027,7 @@ fn admit(ci: u8, side: u1, bytes: []const u8) void {
         };
         const size: usize = @intCast(@min(want, rest));
         const copy = M.arena.allocator().dupe(u8, bytes[off..][0..size]) catch @panic("oom");
+        // 17.7: "Chunk k lands at T0 + k × 1 µs".
         sendEntry(ci, side, .data, idx * us, copy, 0);
         off += size;
         rest -= size;
