@@ -232,7 +232,6 @@ const MConn = struct {
     ends: [2]MEnd = .{ .{}, .{} },
     dirs: [2]MDir = .{ .{}, .{} },
     chunking: sim.ChunkMode = .hashed,
-    last_due: [2]u64 = .{ 0, 0 },
     next_order: u64 = 0,
     /// Each direction's next sequence number: the client's SYN and ACK
     /// were 0 and 1, the server's SYN-ACK 0.
@@ -579,11 +578,21 @@ fn sendEntry(ci: u8, from: u1, kind: EKind, extra: u64, bytes: []const u8, count
     putOnWire(e);
 }
 
+/// Puts `e` on the model's wire. Its landing time is the design's rule,
+/// read from what is on the wire, with no stored fence (sitting 34: the
+/// model kept a `last_due` beside the sim's, the two went stale together
+/// after a pull, and the model accepted the sim's wrong times): L plus its
+/// extra time after now (17.7; 17.9 item 5 for a release), and not before
+/// any entry of its direction that is really on the wire, which are all
+/// sent before it.
 fn putOnWire(entry: MEntry) void {
     var e = entry;
-    const k = &M.conns[e.ci];
-    e.due = @max(now() + L + e.extra, k.last_due[e.dir]);
-    k.last_due[e.dir] = e.due;
+    e.due = now() + L + e.extra;
+    for (M.wire.items) |w| {
+        if (w.ci != e.ci or w.dir != e.dir) continue;
+        if (w.seq >= e.seq) fail("connection {d} direction {d}: sequence {d} goes on the wire behind sequence {d}, which is already there", .{ e.conn_id, e.dir, e.seq, w.seq });
+        e.due = @max(e.due, w.due);
+    }
     var pos = M.wire.items.len;
     while (pos > 0 and entryBefore(e, M.wire.items[pos - 1])) pos -= 1;
     M.wire.insert(M.arena.allocator(), pos, e) catch @panic("oom");

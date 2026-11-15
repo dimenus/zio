@@ -2319,7 +2319,12 @@ safe, and slice 1's timings stay as they are.)
 5. **Release time.** Each entry lands at `release time + L + its extra
    time` (its chunk spacing, delay and jitter, all fixed at its send),
    clamped behind the entry before it. Nothing is redrawn (17.9a, point
-   6: revision 3 left out the L).
+   6: revision 3 left out the L). "Behind" means behind an entry of the
+   direction that is on the wire, or has landed; an entry the pull of
+   item 2 took off the wire is neither, so it does not hold a release or
+   an RST back (sitting 34: the sim kept the pulled entries' times as the
+   fence, and a release right after a pull landed up to their old times
+   late; outside review of cb01515).
 6. **The same instant.** A landing at T takes the rule state at the
    moment `landDue` processes it. A rule that a task clears later in the
    same instant does not undo it. A rule set by a task that ran before

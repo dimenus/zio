@@ -2677,8 +2677,24 @@ const Conn = struct {
     ends: [2]StreamEnd = .{ .{}, .{} },
     /// The next sequence number of each direction, across entry kinds.
     next_seq: [2]u64 = .{ 0, 0 },
-    /// The landing time of each direction's last entry: no entry lands
-    /// before the one sent before it in its direction (design 17.7).
+    /// Each direction's fence: no entry put on the wire lands before it
+    /// (design 17.7: not before the entry sent before it). It is the landing
+    /// time of the direction's last entry put on the wire, and it must stay
+    /// a time of an entry that is on the wire or has landed, never of one
+    /// taken off it:
+    /// - `putOnWire` (a send, a release) moves it to the entry's time;
+    /// - a landing leaves it, at a time not after now;
+    /// - a hold at landing takes every later entry of the direction off the
+    ///   wire (the pull), so nothing of the direction is on the wire after
+    ///   it, and the fence becomes now (sitting 34; it kept the pulled
+    ///   entries' future times before, and a release or an abort's RST
+    ///   right after the pull was clamped behind them: outside review of
+    ///   cb01515). Now never constrains: every new time is at least
+    ///   now + `wire_latency_ns`.
+    /// No other path takes an entry off the wire (a discard at an abort,
+    /// `failStream` or a close takes held entries only). A release of
+    /// entries held at their send, with older entries of the direction
+    /// still on the wire, lands behind those: the fence is theirs.
     last_due: [2]u64 = .{ 0, 0 },
     syn_landed: bool = false,
     dirs: [2]StreamDir = .{ .{}, .{} },
@@ -4224,6 +4240,12 @@ fn holdAtLanding(e: TcpEntry) bool {
         stream_stats.held_behind += 1;
         holdTcp(w);
     }
+    // Nothing of the direction is on the wire now: its fence must not be
+    // a pulled entry's time (`Conn.last_due`).
+    for (tcp_wire.items) |w| {
+        if (w.conn == e.conn and w.dir == e.dir) panic("sim: connection {d}: sequence {d} of a direction that holds an entry is still on the wire after the pull (an invariant)", .{ k.id, w.seq });
+    }
+    k.last_due[@backingInt(e.dir)] = clock_ns;
     return true;
 }
 

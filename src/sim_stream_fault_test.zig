@@ -425,6 +425,74 @@ test "sim: stream faults: an entry held at its landing holds the later entries o
     }
 }
 
+// The outside review of cb01515 (gpt-simnet16, P2): the pull took the later
+// entries off the wire but left the landing time of the last of them as the
+// direction's fence, so a release (or an abort's RST) right after the pull
+// was clamped behind entries that were no longer on the wire. 256 one-byte
+// chunks land at t0 + L + k µs; a partition from t0 + L/2 holds the first
+// at t0 + L and pulls the other 255; the clear comes at once, at t0 + L.
+const stale_fence = struct {
+    var which: enum { release, abort } = .release;
+    var bytes: [256]u8 = undefined;
+
+    fn body() !void {
+        const srv, const c, const s = try pair();
+        sim.setStreamChunking(c.socket.handle, .{ .fixed = 1 });
+        for (&bytes, 0..) |*b, k| b.* = @truncate(k);
+        const t0 = sim.clockNs();
+        try expectEqual(@as(usize, 256), try c.write(&bytes, .none));
+        try sleepUntil(t0 + L / 2);
+        sim.setPartition(c2s);
+        try sleepUntil(t0 + L);
+        try expectEqual(@as(u32, 256), (try dir(true)).held_entries);
+        try expectEqual(@as(u64, 255), sim.streamStats().held_behind);
+        switch (which) {
+            .release => {
+                // Each lands L + its spacing after the release: the first
+                // at t0 + 2L, the last 255 µs after it, 1 µs apart.
+                _ = sim.healPartition(c2s);
+                var e: [256]sim.TestTcpEntry = undefined;
+                try expectEqual(@as(usize, 256), sim.testTcpEntries(false, &e));
+                for (e, 0..) |x, k| try expectEqual(t0 + 2 * L + k * 1000, x.due_at);
+                // What a reader with a deadline sees: the first byte by
+                // t0 + 2L, all of them by t0 + 2L + 255 µs.
+                try sleepUntil(t0 + 2 * L);
+                try expectEqual(@as(usize, 1), unread(s));
+                try sleepUntil(t0 + 2 * L + 255 * 1000);
+                try expectEqual(@as(usize, 256), unread(s));
+                var got: [256]u8 = undefined;
+                try expectEqual(@as(usize, 256), try s.read(&got, .none));
+                try expect(std.mem.eql(u8, &bytes, &got));
+                try t1.closeAll3(c, s, srv);
+            },
+            .abort => {
+                // The abort discards all 256; its RST, held by the
+                // partition, lands L after the clear.
+                try linger0(c);
+                c.close();
+                try expectEqual(@as(u32, 1), (try dir(true)).held_entries);
+                _ = sim.healPartition(c2s);
+                var e: [1]sim.TestTcpEntry = undefined;
+                try expectEqual(@as(usize, 1), sim.testTcpEntries(false, &e));
+                try expectEqual(sim.TcpKind.rst, e[0].kind);
+                try expectEqual(t0 + 2 * L, e[0].due_at);
+                try sleepUntil(t0 + 2 * L);
+                try expect(sim.testStreamEnd(s.socket.handle).reset_received);
+                try t1.closeAll2(s, srv);
+            },
+        }
+    }
+};
+
+test "sim: stream faults: a release, or an abort's RST, right after a pull lands L after the clear, not behind the pulled entries' old landing times" {
+    if (comptime skip) return error.SkipZigTest;
+    for ([_]@TypeOf(stale_fence.which){ .release, .abort }) |w| {
+        stale_fence.which = w;
+        try run(1, .linux, stale_fence.body);
+        try run(1, .macos, stale_fence.body);
+    }
+}
+
 test "sim: stream faults: a partition and a delay over one entry: the clear of the partition releases it, and it lands L plus its delay after the release" {
     if (comptime skip) return error.SkipZigTest;
     try run(1, .linux, partition_and_delay.body);
