@@ -1200,6 +1200,17 @@ const refuse3 = struct {
         const fd = try t1.evOpen();
         sim.failStream(fd, .reset);
     }
+    /// A release whose landing would pass maxInt(u64) ns: the held entry's
+    /// delay is fixed at its send, and the clock has moved to L + 500 ns
+    /// before the end of time, so `release + L` fits and `+ 1000` does not.
+    fn releaseAtLimit() !void {
+        _, const c, _ = try pair();
+        sim.setPartition(c2s);
+        sim.setImpairment(c2s, .{ .delay_ns = 1000 });
+        _ = try c.write("x", .none);
+        sim.advanceNs(std.math.maxInt(u64) - sim.clockNs() - L - 500);
+        _ = sim.healPartition(c2s);
+    }
     fn twice() !void {
         _, const c, _ = try pair();
         sim.failStream(c.socket.handle, .reset);
@@ -1235,6 +1246,9 @@ test "sim: stream faults refuse: failStream on a listener" {
 test "sim: stream faults refuse: failStream on an open socket" {
     try refusal("sim: stream faults refuse: failStream on an open socket", "sim: failStream on sim fd 100032, a stream socket that is not connected: only a connection's endpoint can fail", .linux, refuse3.openSock);
 }
+test "sim: stream faults refuse: a release whose landing would pass maxInt(u64) ns" {
+    try refusal("sim: stream faults refuse: a release whose landing would pass", "sim: a TCP entry sent at 18446744073709451115 ns would land after maxInt(u64) ns: the sim's time limit", .linux, refuse3.releaseAtLimit);
+}
 test "sim: stream faults refuse: failStream twice" {
     try refusal("sim: stream faults refuse: failStream twice", "sim: failStream on sim fd 100033, which already failed", .linux, refuse3.twice);
 }
@@ -1260,7 +1274,7 @@ test "sim: stream faults refuse: a path from a .tcp endpoint to a .udp one" {
 // ---- The connect with no answer (17.9 item 9; 17.9a point 13) ----
 
 const no_answer = struct {
-    var which: enum { deadline, cancel, close, release } = .deadline;
+    var which: enum { deadline, deadline_release, cancel, close, cancel_release } = .deadline;
     var op: ev.NetConnect = undefined;
     var to: os_net.sockaddr.in = undefined;
     var calls: u32 = 0;
@@ -1284,7 +1298,28 @@ const no_answer = struct {
                 try expectError(error.Timeout, t1.connect(lo, lport, .fromMilliseconds(1)));
                 try expectEqual(@as(u64, 1_000_000), sim.clockNs());
             },
-            .cancel, .close, .release => {
+            .deadline_release => {
+                // Held past its deadline, then released: a connect with a
+                // deadline on a socket that the caller keeps (zio's
+                // `Socket.connect` does not close it, unlike
+                // `IpAddress.connect`). The deadline ends the wait with
+                // Timeout and leaves the endpoint in C-syn (17.6); the
+                // release lands the SYN L later, and the handshake goes on
+                // with no op waiting.
+                var sock = try zio_net.Socket.open(.stream, .ipv4, .ip);
+                try expectError(error.Timeout, sock.connect(.{ .ip = zio_net.IpAddress.initIp4(lo, lport) }, .{ .timeout = .fromMilliseconds(1) }));
+                try expectEqual(@as(u64, 1_000_000), sim.clockNs());
+                try expectEqual(sim.StreamPhase.c_syn, sim.testStreamEnd(sock.handle).phase);
+                try expectEqual(@as(usize, 1), sim.streamEntriesInFlight());
+                const t_rel = sim.clockNs();
+                _ = sim.healPartition(p);
+                const s = try server.accept(.{});
+                try expectEqual(t_rel + 3 * L, sim.clockNs());
+                try expectEqual(sim.StreamPhase.est, sim.testStreamEnd(sock.handle).phase);
+                s.close();
+                sock.close();
+            },
+            .cancel, .close, .cancel_release => {
                 to = t1.sockaddr(lo, lport);
                 const fd = try t1.evOpen();
                 const loop = &rt_mod.getCurrentExecutor().loop;
@@ -1307,8 +1342,9 @@ const no_answer = struct {
                     try expectError(error.Canceled, op.getResult());
                     // Canceling the wait does not abort the connect.
                     try expectEqual(sim.StreamPhase.c_syn, sim.testStreamEnd(fd).phase);
-                    if (which == .release) {
-                        // Held past the deadline, then released: it lands L
+                    if (which == .cancel_release) {
+                        // A canceled wait, then released (the cancel is not
+                        // a deadline: the op had none): the SYN lands L
                         // after the release, and the handshake goes on with
                         // no op waiting (17.6).
                         const t_rel = sim.clockNs();
@@ -1323,7 +1359,7 @@ const no_answer = struct {
                 }
             },
         }
-        if (which != .release) {
+        if (which != .cancel_release and which != .deadline_release) {
             try expectEqual(@as(u64, 1), sim.streamStats().syn_dropped_dead);
             try expectEqual(@as(u64, 1), sim.streamStats().discarded_held);
             try expectEqual(@as(usize, 0), sim.streamEntriesInFlight());
@@ -1336,11 +1372,321 @@ const no_answer = struct {
     }
 };
 
-test "sim: stream faults: the connect with no answer: a held SYN ends at the deadline (Timeout), a cancel or a close, and the close discards it; held past its deadline and then released, it still connects" {
+test "sim: stream faults: the connect with no answer: a held SYN ends at the deadline (Timeout), a cancel or a close, and the close discards it; released after the deadline of a connect that keeps its socket, or after a canceled wait, it still connects" {
     if (comptime skip) return error.SkipZigTest;
-    for ([_]@TypeOf(no_answer.which){ .deadline, .cancel, .close, .release }) |w| {
+    for ([_]@TypeOf(no_answer.which){ .deadline, .deadline_release, .cancel, .close, .cancel_release }) |w| {
         no_answer.which = w;
         try run(1, .linux, no_answer.body);
+    }
+}
+
+// ---- The outside review of slice 3, section 8 and section 4: cases no
+// test had (sitting 33) ----
+
+/// A held credit goes when its sender aborts (17.9a point 9) or fails
+/// (17.9): it never lands, and the data's sender stays credited 0.
+const held_credit_gone = struct {
+    var which: enum { abort, fail } = .abort;
+
+    fn body() !void {
+        const srv, const c, const s = try pair();
+        chunksOff(c, s);
+        try expectEqual(@as(usize, 2), try c.write("ab", .none));
+        try rt_mod.sleep(.fromNanoseconds(L));
+        sim.setPartition(s2c);
+        var b: [1]u8 = undefined;
+        try expectEqual(@as(usize, 1), try s.read(&b, .none));
+        try expectEqual(@as(u32, 1), (try dir(false)).held_entries);
+        const before = sim.streamStats().discarded_held;
+        switch (which) {
+            // One byte unread: the close is an abort. Its RST is held by
+            // the partition, alone: the credit went first.
+            .abort => s.close(),
+            .fail => sim.failStream(s.socket.handle, .reset),
+        }
+        try expectEqual(before + 1, sim.streamStats().discarded_held);
+        try expectEqual(@as(u32, @intFromBool(which == .abort)), (try dir(false)).held_entries);
+        const t_rel = sim.clockNs();
+        _ = sim.healPartition(s2c);
+        try sleepUntil(t_rel + L);
+        try expectEqual(@as(u64, 0), (try dir(true)).credited);
+        try expectEqual(@as(u64, 0), sim.streamStats().credits_landed);
+        try expectEqual(which == .abort, sim.testStreamEnd(c.socket.handle).reset_received);
+        try checkConserved();
+        if (which == .fail) s.close();
+        try t1.closeAll2(c, srv);
+    }
+};
+
+test "sim: stream faults: a held credit is discarded when its sender aborts or fails, and never lands" {
+    if (comptime skip) return error.SkipZigTest;
+    for ([_]@TypeOf(held_credit_gone.which){ .abort, .fail }) |w| {
+        held_credit_gone.which = w;
+        try run(1, .linux, held_credit_gone.body);
+    }
+}
+
+/// Hold, release, hold again: an entry released onto the wire meets a new
+/// partition before it lands, is held at its landing, and a later send is
+/// held behind it; the second release lands both in order.
+const rehold = struct {
+    fn body() !void {
+        const srv, const c, const s = try pair();
+        chunksOff(c, s);
+        sim.setPartition(c2s);
+        _ = try c.write("x", .none);
+        try rt_mod.sleep(.fromNanoseconds(L));
+        const t1r = sim.clockNs();
+        _ = sim.healPartition(c2s);
+        try sleepUntil(t1r + L / 2);
+        try expectEqual(@as(u32, 0), (try dir(true)).held_entries);
+        sim.setPartition(c2s);
+        try sleepUntil(t1r + L);
+        try expectEqual(@as(usize, 0), unread(s));
+        try expectEqual(@as(u32, 1), (try dir(true)).held_entries);
+        _ = try c.write("y", .none);
+        try expectEqual(@as(u32, 2), (try dir(true)).held_entries);
+        const ss = sim.streamStats();
+        try expectEqual(@as(u64, 2), ss.held_at_send);
+        try expectEqual(@as(u64, 1), ss.held_at_landing);
+        try expectEqual(@as(u64, 1), ss.released);
+        try checkConserved();
+        try sleepUntil(t1r + 2 * L);
+        const t2 = sim.clockNs();
+        _ = sim.healPartition(c2s);
+        try sleepUntil(t2 + L - 1);
+        try expectEqual(@as(usize, 0), unread(s));
+        try sleepUntil(t2 + L);
+        var b: [2]u8 = undefined;
+        try expectEqual(@as(usize, 2), try s.read(&b, .none));
+        try expect(std.mem.eql(u8, "xy", &b));
+        try expectEqual(@as(u64, 3), sim.streamStats().released);
+        try t1.closeAll3(c, s, srv);
+    }
+};
+
+test "sim: stream faults: hold, release, hold again: a released entry held at its landing by a new partition, with a later send behind it, lands in order at the second release" {
+    if (comptime skip) return error.SkipZigTest;
+    try run(1, .linux, rehold.body);
+}
+
+/// `failStream` wakes a parked receive, and before the harvest the op is
+/// canceled or its socket closed: it ends Canceled or
+/// FileDescriptorNotASocket, and the failure is not reported by it. After
+/// a cancel, the next receive gets the failure once.
+const fail_unharvested = struct {
+    var which: enum { cancel, close } = .cancel;
+    var op: ev.NetRecv = undefined;
+    var storage: [1]os_net.iovec = undefined;
+    var buf: [4]u8 = undefined;
+    var calls: u32 = 0;
+
+    fn onDone(_: *ev.Loop, _: *ev.Completion) void {
+        calls += 1;
+    }
+
+    fn body() !void {
+        calls = 0;
+        const srv, const c, const s = try pair();
+        const loop = &rt_mod.getCurrentExecutor().loop;
+        op = ev.NetRecv.init(c.socket.handle, .fromSlices(&.{&buf}, &storage), .{});
+        op.c.callback = onDone;
+        op.c.flags.defer_callback = false;
+        loop.add(&op.c);
+        try rt_mod.sleep(.fromMicroseconds(1));
+        try expectEqual(@as(u32, 0), calls);
+        try expect(sim.testStreamParked(c.socket.handle).recv);
+        // Woken by the failure and not yet harvested: nothing yields
+        // between these lines.
+        sim.failStream(c.socket.handle, .reset);
+        try expect(!sim.testStreamParked(c.socket.handle).recv);
+        switch (which) {
+            .cancel => loop.cancel(&op.c),
+            .close => c.close(),
+        }
+        try rt_mod.sleep(.fromMicroseconds(1));
+        try expectEqual(@as(u32, 1), calls);
+        const end = sim.testConnEnd(1, false) orelse return error.ConnectionRetired;
+        try expect(!end.fail_reported);
+        switch (which) {
+            .cancel => {
+                try expectError(error.Canceled, op.getResult());
+                var b: [4]u8 = undefined;
+                try expectError(error.ConnectionResetByPeer, c.read(&b, .none));
+                try expect(sim.testStreamEnd(c.socket.handle).fail_reported);
+                try expectEqual(@as(usize, 0), try c.read(&b, .none));
+                try t1.closeAll3(c, s, srv);
+            },
+            .close => {
+                try expectError(error.FileDescriptorNotASocket, op.getResult());
+                try t1.closeAll2(s, srv);
+            },
+        }
+    }
+};
+
+test "sim: stream faults: a receive woken by failStream and canceled, or whose socket is closed, before its harvest does not report the failure; after a cancel the next receive does, once" {
+    if (comptime skip) return error.SkipZigTest;
+    for ([_]@TypeOf(fail_unharvested.which){ .cancel, .close }) |w| {
+        fail_unharvested.which = w;
+        try run(1, .linux, fail_unharvested.body);
+    }
+}
+
+/// A held SYN-ACK (the server's answer held) and a held ACK (the client's
+/// last handshake entry held), each with what can end the wait meanwhile.
+/// The op model keeps the handshake out of its rules (17.9a point 15), so
+/// these are scenario tests.
+const held_handshake = struct {
+    var which: enum { synack_deadline, synack_cancel, synack_close, ack_accept_deadline, ack_client_close, ack_listener_close } = .synack_deadline;
+    var op: ev.NetConnect = undefined;
+    var to: os_net.sockaddr.in = undefined;
+    var calls: u32 = 0;
+
+    fn onDone(_: *ev.Loop, _: *ev.Completion) void {
+        calls += 1;
+    }
+
+    fn body() !void {
+        calls = 0;
+        const server = try t1.listen(lo, 0, .{});
+        const lport = t1.portOf(server);
+        const back: sim.Path = .{ .from = ep(lport), .to = .{ .protocol = .tcp } };
+        const fwd: sim.Path = .{ .from = .{ .protocol = .tcp }, .to = ep(lport) };
+        const t0 = sim.clockNs();
+        switch (which) {
+            .synack_deadline => {
+                // The SYN lands; its SYN-ACK is held. zio's connect times
+                // out and closes its socket: the client is dead with
+                // nothing of its own held. The release lands the SYN-ACK
+                // at the dead client, which answers one RST; that kills
+                // the provisional server endpoint.
+                sim.setPartition(back);
+                try expectError(error.Timeout, t1.connect(lo, lport, .fromMilliseconds(1)));
+                try expectEqual(@as(usize, 1), sim.testListenerCount(server.socket.handle));
+                try expectEqual(@as(usize, 1), sim.streamEntriesInFlight());
+                const t_rel = sim.clockNs();
+                _ = sim.healPartition(back);
+                try sleepUntil(t_rel + 2 * L);
+                try expectEqual(@as(usize, 0), sim.testListenerCount(server.socket.handle));
+                try expectEqual(@as(usize, 0), sim.streamEntriesInFlight());
+            },
+            .synack_cancel, .synack_close => {
+                sim.setPartition(back);
+                to = t1.sockaddr(lo, lport);
+                const fd = try t1.evOpen();
+                const loop = &rt_mod.getCurrentExecutor().loop;
+                op = ev.NetConnect.init(fd, @ptrCast(&to), @sizeOf(os_net.sockaddr.in));
+                op.c.callback = onDone;
+                op.c.flags.defer_callback = false;
+                loop.add(&op.c);
+                try rt_mod.sleep(.fromMilliseconds(1));
+                try expectEqual(@as(u32, 0), calls);
+                try expectEqual(@as(usize, 1), sim.testListenerCount(server.socket.handle));
+                if (which == .synack_cancel) {
+                    // The wait ends; the connect goes on: the release lands
+                    // the SYN-ACK and the client is established with no op
+                    // waiting.
+                    loop.cancel(&op.c);
+                    try rt_mod.sleep(.fromMicroseconds(1));
+                    try expectError(error.Canceled, op.getResult());
+                    try expectEqual(sim.StreamPhase.c_syn, sim.testStreamEnd(fd).phase);
+                    const t_rel = sim.clockNs();
+                    _ = sim.healPartition(back);
+                    const s = try server.accept(.{});
+                    try expectEqual(t_rel + 2 * L, sim.clockNs());
+                    try expectEqual(sim.StreamPhase.est, sim.testStreamEnd(fd).phase);
+                    s.close();
+                } else {
+                    t1.evClose(fd);
+                    try rt_mod.sleep(.fromMicroseconds(1));
+                    try expectError(error.FileDescriptorNotASocket, op.getResult());
+                    const t_rel = sim.clockNs();
+                    _ = sim.healPartition(back);
+                    try sleepUntil(t_rel + 2 * L);
+                    try expectEqual(@as(usize, 0), sim.testListenerCount(server.socket.handle));
+                }
+                try expectEqual(@as(u32, 1), calls);
+                if (which == .synack_cancel) t1.evClose(fd);
+            },
+            .ack_accept_deadline, .ack_client_close, .ack_listener_close => {
+                // The SYN and the SYN-ACK pass; the partition starts before
+                // the SYN-ACK lands, so the client's ACK is held at its
+                // send. The client is established; the server endpoint
+                // stays provisional and no accept completes.
+                to = t1.sockaddr(lo, lport);
+                const fd = try t1.evOpen();
+                const loop = &rt_mod.getCurrentExecutor().loop;
+                op = ev.NetConnect.init(fd, @ptrCast(&to), @sizeOf(os_net.sockaddr.in));
+                op.c.callback = onDone;
+                op.c.flags.defer_callback = false;
+                loop.add(&op.c);
+                try sleepUntil(t0 + 3 * L / 2);
+                sim.setPartition(fwd);
+                try sleepUntil(t0 + 2 * L);
+                try expectEqual(@as(u32, 1), calls);
+                try op.getResult();
+                try expectEqual(sim.StreamPhase.est, sim.testStreamEnd(fd).phase);
+                const cs = sim.testConnEnd(1, true) orelse return error.ConnectionRetired;
+                try expectEqual(sim.StreamPhase.s_prov, cs.phase);
+                try expectEqual(@as(u32, 1), (try dir(true)).held_entries);
+                switch (which) {
+                    .ack_accept_deadline => {
+                        try expectError(error.Timeout, server.accept(.{ .timeout = .fromMilliseconds(1) }));
+                        const t_rel = sim.clockNs();
+                        _ = sim.healPartition(fwd);
+                        const s = try server.accept(.{});
+                        try expectEqual(t_rel + L, sim.clockNs());
+                        s.close();
+                        t1.evClose(fd);
+                    },
+                    .ack_client_close => {
+                        // The client's FIN is held behind its ACK (17.9a
+                        // point 9: handshake entries stay held, and
+                        // everything after them).
+                        t1.evClose(fd);
+                        try expectEqual(@as(u32, 2), (try dir(true)).held_entries);
+                        const t_rel = sim.clockNs();
+                        _ = sim.healPartition(fwd);
+                        const s = try server.accept(.{});
+                        try expectEqual(t_rel + L, sim.clockNs());
+                        var b: [1]u8 = undefined;
+                        try expectEqual(@as(usize, 0), try s.read(&b, .none));
+                        s.close();
+                    },
+                    .ack_listener_close => {
+                        // The provisional endpoint dies with its listener
+                        // and answers the client with an RST, which is not
+                        // held (the partition is the other way). The ACK,
+                        // released later, lands at a dead endpoint.
+                        server.close();
+                        try rt_mod.sleep(.fromNanoseconds(L));
+                        try expect(sim.testStreamEnd(fd).reset_received);
+                        const dead0 = sim.streamStats().dropped_dead;
+                        const t_rel = sim.clockNs();
+                        _ = sim.healPartition(fwd);
+                        try sleepUntil(t_rel + L);
+                        try expectEqual(dead0 + 1, sim.streamStats().dropped_dead);
+                        t1.evClose(fd);
+                        try drain();
+                        try expectEqual(@as(usize, 0), sim.testConnsLive());
+                        return;
+                    },
+                    else => unreachable,
+                }
+            },
+        }
+        server.close();
+        try drain();
+        try expectEqual(@as(usize, 0), sim.testConnsLive());
+    }
+};
+
+test "sim: stream faults: a held SYN-ACK past a connect's deadline, cancel or close, and a held ACK past an accept's deadline, a client close or a listener close: each ends as the handshake rules say once released" {
+    if (comptime skip) return error.SkipZigTest;
+    for ([_]@TypeOf(held_handshake.which){ .synack_deadline, .synack_cancel, .synack_close, .ack_accept_deadline, .ack_client_close, .ack_listener_close }) |w| {
+        held_handshake.which = w;
+        try run(1, .linux, held_handshake.body);
     }
 }
 
@@ -1528,6 +1874,13 @@ const snap = struct {
             },
             8 => sim.failStream(c.socket.handle, .reset),
             9 => sim.failStream(c.socket.handle, .timed_out),
+            // The same byte and the same rule as 4, but the byte left
+            // before the partition was set: it is on the wire, not held,
+            // when the snapshot is taken (it lands L later).
+            14 => {
+                _ = try c.write("x", .none);
+                sim.setPartition(c2s);
+            },
             // A .tcp rule against the same rule as .udp, matching nothing.
             // Both runs set another .tcp rule first, so only the rule's
             // protocol differs.
@@ -1539,7 +1892,7 @@ const snap = struct {
         }
         digest = sim.stateDigest();
         switch (which) {
-            4, 5 => _ = sim.healPartition(c2s),
+            4, 5, 14 => _ = sim.healPartition(c2s),
             6, 7 => _ = sim.healPartition(c2s),
             10, 11 => {
                 _ = sim.healPartition(.{ .from = ep(3), .to = ep(4) });
@@ -1560,7 +1913,7 @@ const snap = struct {
     }
 };
 
-test "sim: stream faults: sensitivity: two runs equal but for one setting give two state digests: chunking .off and .fixed = 1, the default window, the profile, the backlog, a held byte, a held entry's delay, the failure's kind, a .tcp rule and a .udp one" {
+test "sim: stream faults: sensitivity: two runs equal but for one setting give two state digests: chunking .off and .fixed = 1, the default window, the profile, the backlog, a held byte, a held entry's delay, the failure's kind, held against on the wire, failed against not, a .tcp rule and a .udp one" {
     if (comptime skip) return error.SkipZigTest;
     const pairs = [_]struct { u8, u8, sim.StreamProfile, sim.StreamProfile, []const u8 }{
         .{ 0, 1, .linux, .linux, "chunking .off against .fixed = 1" },
@@ -1570,6 +1923,12 @@ test "sim: stream faults: sensitivity: two runs equal but for one setting give t
         .{ 4, 5, .linux, .linux, "a held byte" },
         .{ 6, 7, .linux, .linux, "a held entry's delay, 1 ns apart" },
         .{ 8, 9, .linux, .linux, "the failure's kind" },
+        // 17.9a point 14's two distinctions (outside review of slice 3,
+        // P3: the pairs above vary a held byte and a failure's kind, never
+        // held against on the wire or failed against not). 12 is a run with
+        // no setting.
+        .{ 4, 14, .linux, .linux, "an entry held against the same entry on the wire" },
+        .{ 12, 8, .linux, .linux, "a failed endpoint against one not failed" },
         .{ 10, 11, .linux, .linux, "a .tcp rule against a .udp one" },
     };
     for (pairs) |pr| {
@@ -1694,9 +2053,10 @@ pub const chk3 = struct {
         try run(1, .linux, fail_peer.body);
     }
 
-    /// 17.9 the connect with no answer: deadline, cancel, close, release.
+    /// 17.9 the connect with no answer: deadline, a release after the
+    /// deadline, cancel, close, a release after a cancel.
     pub fn connectNoAnswer() anyerror!void {
-        for ([_]@TypeOf(no_answer.which){ .deadline, .cancel, .close, .release }) |w| {
+        for ([_]@TypeOf(no_answer.which){ .deadline, .deadline_release, .cancel, .close, .cancel_release }) |w| {
             no_answer.which = w;
             try run(1, .linux, no_answer.body);
         }

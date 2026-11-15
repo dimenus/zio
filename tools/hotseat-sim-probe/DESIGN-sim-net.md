@@ -2403,7 +2403,16 @@ when it is built.
     it `C-failed` with nothing to report.
 12. **`failStream(.timed_out)` in `est`** gives `ConnectionTimedOut` to
     the first receive or send (both error sets have it: `src/os/net.zig`
-    maps `ETIMEDOUT` there); in `C-syn`, `Timeout` (17.9).
+    maps `ETIMEDOUT` there); in `C-syn`, `Timeout` (17.9). `Timeout` is
+    what zio gives when a kernel gives up a connect: `errnoToConnectError`
+    maps `ETIMEDOUT` to it (read: `src/os/net.zig`, the POSIX branch), and
+    measured in sitting 33: on Linux 6.8 in colima with
+    `net.ipv4.tcp_syn_retries=1`, `zio.net`'s connect to 10.255.255.1:9
+    (no answer) ended `error.Timeout` after about 3 s, with io_uring and
+    with epoll, 3 runs of 3 each (a scratch probe, not a committed test:
+    it needs that sysctl and a route that drops). The outside review of
+    slice 3 asked whether `ConnectionTimedOut` was meant there; it is
+    not, and code, design and test agree.
 13. **The connect with no answer is a held SYN.** A partition or silence
     that matches the SYN holds it; the connect stays parked until its
     deadline (`Timeout`), a cancel (`Canceled`), or the release (then

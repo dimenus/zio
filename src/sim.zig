@@ -4523,6 +4523,15 @@ pub fn testTcpWireDues(out: []u64) usize {
     return tcp_wire.items.len;
 }
 
+/// Whether a receive and a send are parked on stream socket `fd`: waiting
+/// on it, not yet woken. A woken op is due and no longer parked, so a test
+/// can tell "woken, not harvested" from "still waiting".
+pub fn testStreamParked(fd: i32) struct { recv: bool, send: bool } {
+    if (comptime !builtin.is_test) @compileError("testStreamParked is for tests");
+    const s = streams[sockIndex(fd)];
+    return .{ .recv = s.parked_recv != null, .send = s.parked_send != null };
+}
+
 /// One TCP entry as a test sees it (`testTcpEntries`).
 pub const TestTcpEntry = struct {
     conn_id: u32,

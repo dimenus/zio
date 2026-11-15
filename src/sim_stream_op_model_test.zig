@@ -276,6 +276,8 @@ const MEntry = struct {
     /// A data chunk's place in its direction's byte stream: the bytes of
     /// data sent before it.
     off: u64 = 0,
+    /// It was held and released (`released_to_dead` counts at its landing).
+    released: bool = false,
 };
 
 const Counts = struct {
@@ -364,19 +366,24 @@ const Counts = struct {
     held_credit: u64 = 0,
     /// Steps after which some data was held (conservation checked then).
     held_data_steps: u64 = 0,
-    /// An abort that discarded held entries, and a failStream that did.
+    /// An abort that discarded held data, and a failStream that did; and
+    /// each of them discarding a held credit.
     abort_discards: u64 = 0,
     fail_discards: u64 = 0,
+    abort_held_credit: u64 = 0,
+    fail_held_credit: u64 = 0,
     /// A close step on an endpoint whose outbound direction held entries.
     close_while_held: u64 = 0,
     /// A release whose direction held a credit while its data's sender had
     /// a send parked: the reverse partition that stalled a sender.
     stall_released: u64 = 0,
-    /// A held entry with a delay of its own, released.
+    /// A held entry with a delay of its own, released while a delay rule
+    /// that matches its path is still in force.
     held_delayed_released: u64 = 0,
     /// An impairment cleared while an entry it delayed was on the wire.
     clear_delay_in_flight: u64 = 0,
-    /// A release that lands data at an endpoint that closed meanwhile.
+    /// Released data that lands at an endpoint that closed meanwhile,
+    /// counted at that landing.
     released_to_dead: u64 = 0,
     delayed: u64 = 0,
     jitter_draws: u64 = 0,
@@ -716,12 +723,16 @@ fn release() void {
             const fp, const tp = ports(k, d);
             if (blocked(fp, tp)) continue;
             var has_credit = false;
-            var has_data = false;
+            // A delay rule that still matches does not stop the release,
+            // and the entry keeps the delay drawn at its send (17.9 item
+            // 4): counted only while such a rule is in force now.
+            const delay_now = actingImpairment(fp, tp) != null;
             for (k.held[d].items) |h| {
                 if (h.kind == .credit) has_credit = true;
-                if (h.kind == .data) has_data = true;
-                if (h.own_delay) M.c.held_delayed_released += 1;
-                putOnWire(h);
+                if (h.own_delay and delay_now) M.c.held_delayed_released += 1;
+                var x = h;
+                x.released = true;
+                putOnWire(x);
                 M.st.released += 1;
                 M.c.released += 1;
             }
@@ -730,17 +741,20 @@ fn release() void {
                     if (M.slots[i].state == .parked) M.c.stall_released += 1;
                 }
             }
-            if (has_data and !k.ends[other(d)].open) M.c.released_to_dead += 1;
             k.held[d].clearRetainingCapacity();
         }
     }
 }
 
+/// What `discardHeldOutbound` discarded, by kind: the floors count held
+/// data and held credits at an abort or a failStream apart, so a FIN alone
+/// does not stand in for them.
+const HeldDiscard = struct { data: usize = 0, credit: usize = 0 };
+
 /// Side `side`'s held data, FIN and credits go: an abort or a failStream.
-/// Returns how many entries went.
-fn discardHeldOutbound(ci: u8, side: u1, cause: sim.Discard) usize {
+fn discardHeldOutbound(ci: u8, side: u1, cause: sim.Discard) HeldDiscard {
     const list = &M.conns[ci].held[side];
-    var n: usize = 0;
+    var n: HeldDiscard = .{};
     var i: usize = 0;
     while (i < list.items.len) {
         const h = list.items[i];
@@ -749,11 +763,21 @@ fn discardHeldOutbound(ci: u8, side: u1, cause: sim.Discard) usize {
             continue;
         }
         _ = list.orderedRemove(i);
-        if (h.kind == .data) discard(ci, side, cause, h.bytes.len);
+        if (h.kind == .data) {
+            discard(ci, side, cause, h.bytes.len);
+            n.data += 1;
+        }
+        if (h.kind == .credit) n.credit += 1;
         M.st.discarded_held += 1;
-        n += 1;
     }
     return n;
+}
+
+/// An abort's held discards: data (17.15's "a reset with held data") and a
+/// credit (17.9a point 9), each its own count.
+fn countAbort(n: HeldDiscard) void {
+    if (n.data > 0) M.c.abort_discards += 1;
+    if (n.credit > 0) M.c.abort_held_credit += 1;
 }
 
 /// The next time something happens on the model's wire: a landing or an
@@ -947,6 +971,7 @@ fn land(w: MEntry) void {
             }
             if (!x.open) {
                 M.st.dropped_dead += 1;
+                if (w.released) M.c.released_to_dead += 1;
                 answerRst(ci, at);
                 return discard(ci, w.dir, .closed_receiver, n);
             }
@@ -958,7 +983,7 @@ fn land(w: MEntry) void {
                     x.reset_received = true;
                     x.fin_before_reset = false;
                     x.reset_parked_send = parkedSendSerial(x);
-                    if (discardHeldOutbound(ci, at, .abort) > 0) M.c.abort_discards += 1;
+                    countAbort(discardHeldOutbound(ci, at, .abort));
                     M.c.local_resets += 1;
                     M.st.local_resets += 1;
                     wakeRecv(ci, at, .local_reset);
@@ -1015,7 +1040,7 @@ fn land(w: MEntry) void {
             x.reset_received = true;
             x.fin_before_reset = x.fin_in;
             x.reset_parked_send = parkedSendSerial(x);
-            if (discardHeldOutbound(ci, at, .abort) > 0) M.c.abort_discards += 1;
+            countAbort(discardHeldOutbound(ci, at, .abort));
             const both = x.recv != null and x.send != null and M.slots[x.recv.?].state == .parked and M.slots[x.send.?].state == .parked;
             if (both) M.c.shared_reset += 1;
             wakeRecv(ci, at, .rst);
@@ -1646,7 +1671,9 @@ fn stepFail() bool {
     if (ways[0] and ways[1]) M.c.fail_both_ways += 1;
     // The model's table (design 17.9).
     e.failed = how;
-    if (discardHeldOutbound(ci, side, .failed_sender) > 0) M.c.fail_discards += 1;
+    const fd_n = discardHeldOutbound(ci, side, .failed_sender);
+    if (fd_n.data > 0) M.c.fail_discards += 1;
+    if (fd_n.credit > 0) M.c.fail_held_credit += 1;
     const din = &k.dirs[other(side)];
     if (din.owed_at != null) {
         din.owed_at = null;
@@ -1726,7 +1753,7 @@ fn close(abortive: bool) bool {
     if (rst) {
         e.rst_sent = true;
         M.c.close_rst += 1;
-        if (discardHeldOutbound(ci, side, .abort) > 0) M.c.abort_discards += 1;
+        countAbort(discardHeldOutbound(ci, side, .abort));
         sendEntry(ci, side, .rst, 0, &.{}, 0);
     } else if (fin) {
         e.fin_out = true;
@@ -2184,7 +2211,7 @@ fn closeEnd(k: *MConn, e: *MEnd) void {
         _ = discardUnread(@intCast(ci), side, .unread_at_close);
         if (rst) {
             e.rst_sent = true;
-            if (discardHeldOutbound(@intCast(ci), side, .abort) > 0) M.c.abort_discards += 1;
+            countAbort(discardHeldOutbound(@intCast(ci), side, .abort));
             sendEntry(@intCast(ci), side, .rst, 0, &.{}, 0);
         } else if (fin) {
             e.fin_out = true;
@@ -2305,7 +2332,8 @@ const fault_floor_names = .{
     "held_credit",           "held_data_steps",       "abort_discards",   "fail_discards",            "close_while_held", "stall_released",
     "held_delayed_released", "clear_delay_in_flight", "released_to_dead", "delayed",                  "jitter_draws",     "fail_recv_parked",
     "fail_send_parked",      "fail_both_parked",      "fail_none_parked", "fail_first_recv",          "fail_first_send",  "fail_both_ways",
-    "fail_timed_out",        "dropped_failed",        "rule_clears",      "older_credit_after_newer", "held_behind",
+    "fail_timed_out",        "dropped_failed",        "rule_clears",      "older_credit_after_newer", "held_behind",      "abort_held_credit",
+    "fail_held_credit",
 };
 
 fn floors(c: Counts, profile: Profile) void {
