@@ -1690,6 +1690,68 @@ test "sim: stream faults: a held SYN-ACK past a connect's deadline, cancel or cl
     }
 }
 
+// ---- t-4139: what std.Io's reader and writer see for failStream ----
+//
+// zio's ev layer and zio.net give `ConnectionTimedOut` for `.timed_out`
+// (the tests above). std.Io has no such read or write error, and zio's
+// src/io.zig maps it to `ConnectionResetByPeer` (`recvErrToReadErr`,
+// `sendErrToWriteErr`). So a std.Io program, hotseat's TestHost among them,
+// sees the same error for both kinds. After the failure is reported, a
+// read gives end of stream and a write `SocketUnconnected` (BrokenPipe,
+// mapped). This pins today's mapping; it does not judge it (the mapping is
+// upstream's file).
+
+const std_io_fail = struct {
+    var how: sim.StreamFailure = .timed_out;
+    var first: enum { read, write } = .read;
+
+    fn body() !void {
+        const io = t1.runtime.io();
+        const server = try t1.listen(lo, 0, .{});
+        const addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = lo, .port = t1.portOf(server) } };
+        const client = try std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+        const s = try server.accept(.{});
+        sim.failStream(client.socket.handle, how);
+        var rbuf: [64]u8 = undefined;
+        var r = std.Io.net.Stream.Reader.init(client, io, &rbuf);
+        var wbuf: [64]u8 = undefined;
+        var w = std.Io.net.Stream.Writer.init(client, io, &wbuf);
+        var b: [8]u8 = undefined;
+        switch (first) {
+            .read => {
+                try expectError(error.ReadFailed, r.interface.readSliceShort(&b));
+                try expectEqual(@as(?std.Io.net.Stream.Reader.Error, error.ConnectionResetByPeer), r.err);
+                try w.interface.writeAll("x");
+                try expectError(error.WriteFailed, w.interface.flush());
+                try expectEqual(@as(?std.Io.net.Stream.Writer.Error, error.SocketUnconnected), w.err);
+            },
+            .write => {
+                try w.interface.writeAll("x");
+                try expectError(error.WriteFailed, w.interface.flush());
+                try expectEqual(@as(?std.Io.net.Stream.Writer.Error, error.ConnectionResetByPeer), w.err);
+                try expectEqual(@as(usize, 0), try r.interface.readSliceShort(&b));
+            },
+        }
+        try expect(sim.testStreamEnd(client.socket.handle).fail_reported);
+        client.close(io);
+        s.close();
+        server.close();
+        try drain();
+    }
+};
+
+test "sim: stream faults: std.Io's reader and writer see ConnectionResetByPeer for failStream .timed_out and .reset alike, then end of stream and SocketUnconnected (t-4139: zio's io.zig mapping, pinned)" {
+    if (comptime skip) return error.SkipZigTest;
+    for ([_]sim.StreamFailure{ .timed_out, .reset }) |how| {
+        for ([_]@TypeOf(std_io_fail.first){ .read, .write }) |f| {
+            std_io_fail.how = how;
+            std_io_fail.first = f;
+            try run(1, .linux, std_io_fail.body);
+            try run(1, .macos, std_io_fail.body);
+        }
+    }
+}
+
 // ---- Parity: the faults a loopback kernel can show (17.15 item 5) ----
 //
 // A fault rule has no kernel switch on loopback, so a row runs the sim's
