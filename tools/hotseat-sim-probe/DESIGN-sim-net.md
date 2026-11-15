@@ -1116,10 +1116,22 @@ the mutants in its commits.
       `sim.refuseOpenDatagramsAtEnd()`. Not the default: 75 zio tests
       leave a datagram socket open at `end` (t-4142); starh2's steps
       leave none.
+  - **Sitting 34: the outside review of cb01515**
+    (`gpt-simnet16-for-seat.md`; report 34). 8730e8e: the pull left the
+    direction's landing fence at a pulled entry's future time, so a
+    release or an abort's RST right after a pull landed late (ran: 655000
+    ns instead of 500000). The fence now resets to now after the pull;
+    the rule is beside `Conn.last_due`, and in 17.9 item 5. The op model
+    keeps no fence any more (it reads its own wire). **Not done:** the
+    model alone does not kill the stale fence; its generator never makes
+    the case (t-4148, with the steering numbers measured, and the model's
+    other mirrored variables).
   - **Next, in this order:**
-    1. t-4142: close the datagram sockets in zio's 75 tests, then make the
+    1. t-4148: the op model's generator reaches a release right after a
+       pull, and checks for its other mirrored variables.
+    2. t-4142: close the datagram sockets in zio's 75 tests, then make the
        refusal the default (t-4138).
-    2. Slice 4 (17.16): the users. starh2's `dst-conn` accept step;
+    3. Slice 4 (17.16): the users. starh2's `dst-conn` accept step;
        hotseat's tests (17.15 item 7), after t-4110 and t-4111; then an
        outside review. Through std.Io, hotseat's "host dies" test sees
        `ConnectionResetByPeer` (t-4139's test).
@@ -1129,7 +1141,8 @@ the mutants in its commits.
     measures, the gap as a fidelity limit), t-4138 and t-4142 (the
     datagram refusal as the default), t-4139 (whether std.Io's mapping of
     `ConnectionTimedOut` should change: upstream's file, the owner's
-    decision), t-4143 (pipe ends at `end`). Queued for the sim seat, not
+    decision), t-4143 (pipe ends at `end`), t-4148 (sitting 34's
+    model follow-up). Queued for the sim seat, not
     started: t-4106, t-4115, t-4117. Closed: t-4132, t-4133 (sitting
     32), t-4136 (sitting 33).
   - **What I would change, with what I know now:**
