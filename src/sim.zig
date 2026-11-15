@@ -3047,13 +3047,47 @@ fn sendTcpAt(ci: u16, from: Side, kind: TcpKind, to: Ip4, extra_ns: u64, bytes: 
                 r.stats.delayed += 1;
             }
         }
-        if (k.held[d] > 0 or tcpBlocked(from_addr, to_addr)) {
+        if (heldAtSend(k, from)) {
             stream_stats.held_at_send += 1;
             holdTcp(e);
             return;
         }
     }
     putOnWire(e);
+}
+
+/// Whether an entry that side `from` of `k` sends now is held at its send
+/// (design 17.9 items 1 and 2): its direction already holds one, or a
+/// `.tcp` partition or silence matches its path. Only in a run that set a
+/// `.tcp` rule.
+fn heldAtSend(k: *const Conn, from: Side) bool {
+    if (!tcp_rule_set) return false;
+    if (k.held[@backingInt(from)] > 0) return true;
+    const from_addr, const to_addr = tcpPath(k, from);
+    return tcpBlocked(from_addr, to_addr);
+}
+
+/// Whether a held credit of direction `dir` of `ci` is there to be
+/// replaced by a credit held now (`holdTcp`).
+fn heldCredit(ci: u16, dir: Side) bool {
+    if (conns[ci].held[@backingInt(dir)] == 0) return false;
+    for (tcp_held.items) |h| {
+        if (h.conn == ci and h.dir == dir and h.kind == .credit) return true;
+    }
+    return false;
+}
+
+/// Side `side`'s held entries that an abort or `failStream` discards
+/// (`discardHeldOutbound`): its data, FIN and credits.
+fn heldOutbound(ci: u16, side: Side) usize {
+    if (conns[ci].held[@backingInt(side)] == 0) return 0;
+    var n: usize = 0;
+    for (tcp_held.items) |h| n += @intFromBool(h.conn == ci and h.dir == side and abortDiscards(h.kind));
+    return n;
+}
+
+fn abortDiscards(kind: TcpKind) bool {
+    return kind == .data or kind == .fin or kind == .credit;
 }
 
 /// Puts `e` on the wire, due `wire_latency_ns + e.extra_ns` from now and no
@@ -3192,7 +3226,7 @@ fn discardHeldOutbound(ci: u16, side: Side, cause: Discard) void {
     var i: usize = 0;
     while (k.held[d] > 0 and i < tcp_held.items.len) {
         const h = tcp_held.items[i];
-        if (h.conn != ci or h.dir != side or (h.kind != .data and h.kind != .fin and h.kind != .credit)) {
+        if (h.conn != ci or h.dir != side or !abortDiscards(h.kind)) {
             i += 1;
             continue;
         }
@@ -3227,13 +3261,19 @@ fn tcpLandingTime() u64 {
 
 /// Room for `n` more TCP entries, and a landing time for them: every path
 /// that sends calls this before it changes any state, so a limit panics
-/// with nothing half done. Out of memory panics: a landing that must answer
-/// has no error to return.
-fn reserveTcp(n: usize) void {
+/// with nothing half done. `freed` is the entries the same step removes
+/// before it adds its own (an abort's held entries, a held credit that the
+/// new one replaces): the limit is on the count after the step, so a step
+/// that does not raise the count past the limit is never refused (outside
+/// review of slice 3, second P2). Out of memory panics: a landing that
+/// must answer has no error to return.
+fn reserveTcp(n: usize, freed: usize) void {
     _ = tcpLandingTime();
     // Held entries count toward the limit (design 17.9 item 10). Room is
     // made in both lists: a send goes to one or the other.
-    if (tcp_wire.items.len + tcp_held.items.len + n > max_tcp_entries) panic("sim: {d} TCP entries on the wire: the limit is max_tcp_entries, {d}", .{ tcp_wire.items.len + tcp_held.items.len + n, max_tcp_entries });
+    const now_n = tcp_wire.items.len + tcp_held.items.len;
+    if (freed > now_n) panic("sim: a step frees {d} TCP entries of the {d} there are (an invariant)", .{ freed, now_n });
+    if (now_n - freed + n > max_tcp_entries) panic("sim: {d} TCP entries on the wire and held: the limit is max_tcp_entries, {d}", .{ now_n - freed + n, max_tcp_entries });
     tcp_wire.ensureUnusedCapacity(net_alloc, n) catch panic("sim: out of memory for a TCP wire entry", .{});
     tcp_held.ensureUnusedCapacity(net_alloc, n) catch panic("sim: out of memory for a held TCP entry", .{});
 }
@@ -3316,7 +3356,7 @@ pub fn streamConnect(fd: i32, to: Ip4, c: *anyopaque, id: u32) error{AddressInUs
     // (outside review 5, finding 4). Checked, with the time limit, before
     // the port counter or any table moves.
     const after_id = std.math.add(u32, next_conn_id, 1) catch panic("sim: conn_id {d} is the last a u32 holds: conn_ids are never reused in a run, so a run makes at most {d} connections", .{ next_conn_id, std.math.maxInt(u32) - 1 });
-    reserveTcp(1);
+    reserveTcp(1, 0);
     const here: [4]u8 = .{ 127, 0, 0, 1 };
     const port = try tcpEphemeral(here);
     const local: Ip4 = .{ .ip = here, .port = port };
@@ -3621,7 +3661,7 @@ fn admit(ci: u16, side: Side, bufs: anytype, n: usize) void {
     while (rest > 0) : (chunks += 1) rest -= chunkSize(k, side, chunks, rest);
     if (tcp_wire.items.len + chunks > max_tcp_entries) panic("sim: a send of {d} bytes on connection {d} needs {d} chunks: with {d} TCP entries on the wire that is past max_tcp_entries, {d} (design 17.7: a smaller window or a larger chunk mode)", .{ n, k.id, chunks, tcp_wire.items.len, max_tcp_entries });
     _ = tcpLandingAfter((chunks - 1) * chunk_spacing_ns);
-    reserveTcp(chunks);
+    reserveTcp(chunks, 0);
     const peer = k.ends[@backingInt(side)].peer;
     var cur: BufCursor = .{};
     rest = n;
@@ -3685,10 +3725,12 @@ fn departCredit(ci: u16, data: Side) void {
         stream_stats.stale_credit += 1;
         return;
     }
-    reserveTcp(1);
+    const r = otherSide(data);
+    // A credit held now replaces a held one of its direction: one in, one
+    // out (`holdTcp`; it is the newest, so it is the one kept).
+    reserveTcp(1, @intFromBool(heldAtSend(k, r) and heldCredit(ci, r)));
     d.owed_at = null;
     d.last_credit_at = clock_ns;
-    const r = otherSide(data);
     sendTcpAt(ci, r, .credit, k.ends[@backingInt(r)].peer, 0, &.{}, d.read + d.reclaimed);
 }
 
@@ -3779,8 +3821,12 @@ pub fn streamShutdown(fd: i32, how: ShutdownHow) error{SocketUnconnected}!void {
     const releases = discards and p == .macos;
     // Only what leaves now: the FIN, and the release's credit if it
     // departs now rather than joining one already owed or paced.
-    const leaving = @as(usize, @intFromBool(!e.fin_out)) + @intFromBool(releases and creditPlan(ci, otherSide(s.side)) == .departs);
-    if (leaving > 0) reserveTcp(leaving);
+    const credit_now = releases and creditPlan(ci, otherSide(s.side)) == .departs;
+    const leaving = @as(usize, @intFromBool(!e.fin_out)) + @intFromBool(credit_now);
+    // The FIN and the credit go the same way: the credit is held exactly
+    // when the FIN is (`heldAtSend` before either), and then it replaces a
+    // held credit of that direction, which leaves the count.
+    if (leaving > 0) reserveTcp(leaving, @intFromBool(credit_now and heldAtSend(&conns[ci], s.side) and heldCredit(ci, s.side)));
     if (!e.fin_out) {
         e.fin_out = true;
         sendTcp(ci, s.side, .fin, e.peer);
@@ -3998,7 +4044,7 @@ fn closeListener(j: usize) void {
         if (e.phase != .s_prov and e.phase != .s_queued) continue;
         if (e.listener_slot != j or e.listener_gen != dgram_gen[j]) continue;
         const answer = !e.reset_received and !e.rst_sent;
-        if (answer) reserveTcp(1);
+        if (answer) reserveTcp(1, 0);
         _ = discardUnread(@intCast(ci), .server, .listener_closed);
         e.phase = .dead;
         if (answer) {
@@ -4024,7 +4070,9 @@ fn closeEndpoint(ci: u16, side: Side, reuse: bool, linger0: bool) void {
             const quiet = e.reset_received or e.rst_sent or e.failed != null;
             const rst = !quiet and (e.unreadLen() > 0 or linger0);
             const fin = !quiet and !rst and !e.fin_out;
-            if (rst or fin) reserveTcp(1);
+            // An RST first discards the held data, FIN and credits it
+            // goes behind (line 3 below): those leave the count.
+            if (rst or fin) reserveTcp(1, if (rst) heldOutbound(ci, side) else 0);
             // Line 1, always (review 3, finding 6).
             _ = discardUnread(ci, side, .unread_at_close);
             if (rst) {
@@ -4185,7 +4233,7 @@ fn recordStream(e: TcpEntry, outcome: StreamOutcome) void {
 fn landSyn(e: TcpEntry) StreamOutcome {
     const k = &conns[e.conn];
     const cl = &k.ends[@backingInt(Side.client)];
-    if (cl.phase != .dead) reserveTcp(1);
+    if (cl.phase != .dead) reserveTcp(1, 0);
     k.syn_landed = true;
     if (cl.phase == .dead) return .dropped_dead_client;
     const j = listenerAt(e.to) orelse {
@@ -4208,14 +4256,14 @@ fn landSynAck(ci: u16) StreamOutcome {
     switch (cl.phase) {
         .dead => {
             if (!cl.rst_sent) {
-                reserveTcp(1);
+                reserveTcp(1, 0);
                 cl.rst_sent = true;
                 sendTcp(ci, .client, .rst, cl.peer);
             }
             return .dropped_dead;
         },
         .c_syn => {
-            reserveTcp(1);
+            reserveTcp(1, 0);
             cl.phase = .est;
             wakeStream(cl.slot);
             sendTcp(ci, .client, .ack, cl.peer);
@@ -4296,7 +4344,7 @@ fn landRst(ci: u16, at: Side) StreamOutcome {
 fn answerRst(ci: u16, at: Side) void {
     const x = &conns[ci].ends[@backingInt(at)];
     if (x.rst_sent) return;
-    reserveTcp(1);
+    reserveTcp(1, 0);
     x.rst_sent = true;
     sendTcp(ci, at, .rst, x.peer);
 }

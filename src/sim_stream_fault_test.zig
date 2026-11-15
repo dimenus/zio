@@ -680,6 +680,119 @@ test "sim: stream faults: held data inbound to an endpoint that closed lands at 
     try run(1, .linux, dead_inbound.body);
 }
 
+// The outside review of slice 3, second P2: the entry-limit check ran
+// before the discards and the coalescing that free entries, so a step that
+// would not pass the limit panicked. Both sequences are the review's.
+const max_e = sim.max_tcp_entries;
+var limit_bytes: [max_e]u8 = @splat('x');
+
+/// Every entry of the run held on one connection, then an aborting close:
+/// it discards all of them and holds one RST.
+const abort_at_limit = struct {
+    fn body() !void {
+        const srv, const c, const s = try pair();
+        sim.setStreamChunking(c.socket.handle, .{ .fixed = 1 });
+        sim.setPartition(c2s);
+        try expectEqual(@as(usize, max_e), try c.write(&limit_bytes, .none));
+        try expectEqual(@as(usize, max_e), sim.streamEntriesInFlight());
+        try expectEqual(@as(u32, max_e), (try dir(true)).held_entries);
+        try linger0(c);
+        c.close();
+        try expectEqual(@as(usize, 1), sim.streamEntriesInFlight());
+        try expectEqual(@as(u64, max_e), (try dir(true)).discarded[@backingInt(sim.Discard.abort)]);
+        try expectEqual(@as(u32, 1), (try dir(true)).held_entries);
+        const t_rel = sim.clockNs();
+        _ = sim.healPartition(c2s);
+        try sleepUntil(t_rel + L);
+        try expect(sim.testStreamEnd(s.socket.handle).reset_received);
+        try t1.closeAll2(s, srv);
+    }
+};
+
+test "sim: stream faults: an aborting close with max_tcp_entries held discards them and holds its RST, under the limit" {
+    if (comptime skip) return error.SkipZigTest;
+    try run(1, .linux, abort_at_limit.body);
+}
+
+/// One held credit and `max_tcp_entries - 1` held data entries, then a
+/// read whose credit is held and coalesces with the first: the count stays
+/// at the limit.
+const credit_at_limit = struct {
+    fn body() !void {
+        const srv, const c, const s = try pair();
+        sim.setStreamChunking(c.socket.handle, .{ .fixed = 1 });
+        try expectEqual(@as(usize, 2), try c.write("ab", .none));
+        try rt_mod.sleep(.fromNanoseconds(L + 1000));
+        try expectEqual(@as(usize, 2), unread(s));
+        sim.setPartition(s2c);
+        var b: [1]u8 = undefined;
+        try expectEqual(@as(usize, 1), try s.read(&b, .none));
+        sim.setPartition(c2s);
+        try expectEqual(@as(usize, max_e - 1), try c.write(limit_bytes[0 .. max_e - 1], .none));
+        try expectEqual(@as(usize, max_e), sim.streamEntriesInFlight());
+        // L after the first credit left, the second leaves at the read and
+        // is held: it replaces the first.
+        try rt_mod.sleep(.fromNanoseconds(L));
+        try expectEqual(@as(usize, 1), try s.read(&b, .none));
+        try expectEqual(@as(usize, max_e), sim.streamEntriesInFlight());
+        try expectEqual(@as(u64, 1), sim.streamStats().credits_coalesced);
+        try expectEqual(@as(u32, 1), (try dir(false)).held_entries);
+        const t_rel = sim.clockNs();
+        _ = sim.healPartition(s2c);
+        try sleepUntil(t_rel + L);
+        try expectEqual(@as(u64, 2), (try dir(true)).credited);
+        // The held data goes with an abort, so nothing has to land.
+        try linger0(c);
+        c.close();
+        _ = sim.healPartition(c2s);
+        try t1.closeAll2(s, srv);
+    }
+};
+
+test "sim: stream faults: a credit that coalesces with a held one when max_tcp_entries are in flight leaves the count at the limit" {
+    if (comptime skip) return error.SkipZigTest;
+    try run(1, .linux, credit_at_limit.body);
+}
+
+/// The same shape at `shutdown(.both)` under `.macos`: its FIN is held,
+/// and its window release's credit is held and replaces the held credit.
+/// One short of the limit before, at the limit after.
+const both_at_limit = struct {
+    fn body() !void {
+        const srv, const c, const s = try pair();
+        chunksOff(c, s);
+        try expectEqual(@as(usize, 3), try c.write("abc", .none));
+        try rt_mod.sleep(.fromNanoseconds(L));
+        sim.setPartition(s2c);
+        var b: [1]u8 = undefined;
+        try expectEqual(@as(usize, 1), try s.read(&b, .none));
+        sim.setPartition(c2s);
+        sim.setStreamChunking(c.socket.handle, .{ .fixed = 1 });
+        try expectEqual(@as(usize, max_e - 2), try c.write(limit_bytes[0 .. max_e - 2], .none));
+        try expectEqual(@as(usize, max_e - 1), sim.streamEntriesInFlight());
+        try rt_mod.sleep(.fromNanoseconds(L));
+        try s.shutdown(.both);
+        try expectEqual(@as(usize, max_e), sim.streamEntriesInFlight());
+        try expectEqual(@as(u64, 1), sim.streamStats().credits_coalesced);
+        try expectEqual(@as(u32, 2), (try dir(false)).held_entries);
+        try expectEqual(@as(u64, 2), (try dir(true)).reclaimed);
+        const t_rel = sim.clockNs();
+        _ = sim.healPartition(s2c);
+        try sleepUntil(t_rel + L);
+        try expectEqual(@as(u64, 3), (try dir(true)).credited);
+        try expect(sim.testStreamEnd(c.socket.handle).fin_in);
+        try linger0(c);
+        c.close();
+        _ = sim.healPartition(c2s);
+        try t1.closeAll2(s, srv);
+    }
+};
+
+test "sim: stream faults: under .macos, shutdown(.both) one short of max_tcp_entries holds its FIN and a release credit that replaces a held one, at the limit" {
+    if (comptime skip) return error.SkipZigTest;
+    try run(1, .macos, both_at_limit.body);
+}
+
 const drain_needs_clear = struct {
     fn body() !void {
         const srv, const c, const s = try pair();

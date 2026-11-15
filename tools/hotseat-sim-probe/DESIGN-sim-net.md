@@ -2292,7 +2292,13 @@ safe, and slice 1's timings stay as they are.)
    clock stop. A connect's deadline is reached normally. A SYN held past
    the deadline is discarded when the wrapper closes the socket (17.6).
 10. **Bounds.** Held entries count toward the 65536-entry limit, and
-    connections toward `max_conns`. Both panic and name the limit.
+    connections toward `max_conns`. Both panic and name the limit. The
+    limit is on the count after the step: entries the same step discards
+    (an abort's held data, FIN and credits) or replaces (a held credit
+    that a new held credit coalesces with) leave the count first. The
+    check still runs before anything changes (sitting 33; before, it
+    counted only what the step added, so an abort or a coalescing credit
+    at the limit panicked: outside review of slice 3, second P2).
 
 **`sim.failStream(fd, .reset | .timed_out)`**: a local transport death at
 the virtual time of the call. It puts nothing on the wire.
