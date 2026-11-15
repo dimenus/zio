@@ -1910,7 +1910,8 @@ not ACKed separately.
   one, so each count is larger than the one before. A count that is not
   larger is an invariant panic (sitting 30; revision 3 said `max`, which
   would hide a broken order). If room appears, a parked send is woken.
-- Held credits of one direction coalesce to the newest. That is
+- Held credits of one direction coalesce to the newest by sequence,
+  whichever reached the held list first (17.9a point 8). That is
   equivalent: both are cumulative, and they would land in order.
 - A partition of the reverse direction holds the credits, so the sender
   stalls.
@@ -2354,9 +2355,20 @@ when it is built.
    (`conn_id`, direction, sequence) order. It counts in
    `streamEntriesInFlight`, blocks retirement and is in the state digest
    (17.11); it does not move the clock (17.9 item 9).
-8. **Held credits coalesce (17.9 item 3):** a credit that is about to be
-   held, in a direction that already holds one, replaces it (the newer
-   count). Counted (`credits_coalesced`).
+8. **Held credits coalesce (17.9 item 3):** when a credit is about to be
+   held in a direction that already holds one, the two become one: the
+   one with the larger sequence stays, and the other goes. Counted
+   (`credits_coalesced`). The arriving credit is not always the newer one:
+   a credit on the wire that is held at its landing left before a credit
+   held at its send (sitting 33; the first text said the arriving one
+   replaces the held one, and an older credit then replaced a newer one,
+   so the sender was credited short for ever: outside review of slice 3,
+   first P2). The sequence decides because every other order rule of a
+   direction (the wire, the held list, the release) is the sequence. The
+   count gives the same answer: a credit carries the receiver's cumulative
+   `read + reclaimed` at its departure, and one leaves only after a read
+   or a release since the last, so a larger sequence has a larger count;
+   a newer credit whose count is not larger is an invariant panic.
 9. **What an abort discards (fixes 17.9 item 7).** Item 7 named held
    data and FIN. An aborting endpoint also discards its held credits:
    its peer's direction toward it is over, so they could only land stale.

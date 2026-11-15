@@ -51,12 +51,21 @@
 //   connection is retired exactly when the model says it can be; the
 //   entries in flight (`sim.streamEntriesInFlight`) equal the model's; every
 //   field of `sim.streamStats()` equals the model's own count (by
-//   reflection, so a new field is compared from its first run); and on each
+//   reflection, so a new field is compared from its first run); every
+//   entry on the wire and every held entry is the model's by what it is
+//   (kind, sequence, a credit's count, a chunk's length), so a sim that
+//   kept the wrong entry is named at the step that kept it; a live
+//   direction with nothing of its credit in flight, held or owed has been
+//   credited all its receiver read or released (`checkCreditLive`, on the
+//   sim's counts alone: a lost credit, which conservation cannot see);
+//   and on each
 //   open endpoint the layer's `bytesReadable` is its unread bytes and
 //   `getpeername` its peer, or `SocketUnconnected` after a reset.
 // - after every poll: the clock did not pass the model's next landing or
 //   owed credit, nor the poll's cap.
-// - at the end: each op still parked is given what it waits for (a byte
+// - at the end, with every rule cleared and the wire drained: no send is
+//   parked while its receiver has room (a stranded sender); then each op
+//   still parked is given what it waits for (a byte
 //   from its peer, or one more byte of window) and must complete, one at a
 //   time; then every socket closes, the wire drains, and every connection
 //   retires.
@@ -325,6 +334,17 @@ const Counts = struct {
     held_landing: u64 = 0,
     released: u64 = 0,
     coalesced: u64 = 0,
+    /// A credit that reached the held list after a newer credit of its
+    /// direction was held (it left first, and was held at its landing):
+    /// the case of the outside review of slice 3, first P2.
+    older_credit_after_newer: u64 = 0,
+    /// `checkCreditLive` ran on a direction with nothing of its credit in
+    /// flight; the end's stranded-sender check ran on a parked send.
+    live_checks: u64 = 0,
+    end_live_checks: u64 = 0,
+    /// A partition step that chose the direction of a credit landing more
+    /// than L from now (`lateCredit`).
+    partition_late_credit: u64 = 0,
     /// A FIN, an RST or a credit held (at its send or landing).
     held_fin: u64 = 0,
     held_rst: u64 = 0,
@@ -590,19 +610,29 @@ fn jitterDraw(conn_id: u32, dir: u1, seq: u64) u64 {
     return std.hash.SipHash64(2, 4).toInt(&m, &key);
 }
 
-/// Holds `e` behind its direction's held entries; a credit replaces a held
-/// credit of its direction.
+/// Holds `e` behind its direction's held entries. Two held credits of a
+/// direction coalesce to the one that carries the larger count (design
+/// 17.9a point 8): a credit's count is the receiver's cumulative read, so
+/// the larger one says everything the smaller one says. Which of the two
+/// came to the list first does not matter: a credit held at its landing
+/// left before one held at its send.
 fn hold(e: MEntry) void {
     const list = &M.conns[e.ci].held[e.dir];
     if (e.kind == .credit) {
+        M.c.held_credit += 1;
         for (list.items, 0..) |h, i| {
             if (h.kind != .credit) continue;
-            _ = list.orderedRemove(i);
+            if (h.count == e.count) fail("two held credits of connection {d} carry the same count {d}", .{ e.conn_id, e.count });
             M.st.credits_coalesced += 1;
             M.c.coalesced += 1;
+            if (h.count > e.count) {
+                // The arriving one is older: it goes, the held one stays.
+                M.c.older_credit_after_newer += 1;
+                return;
+            }
+            _ = list.orderedRemove(i);
             break;
         }
-        M.c.held_credit += 1;
     }
     if (e.kind == .fin) M.c.held_fin += 1;
     if (e.kind == .rst) M.c.held_rst += 1;
@@ -1453,8 +1483,30 @@ fn ruleRoom() bool {
     return M.n_rules < max_model_rules and M.rule_keys < max_rule_keys;
 }
 
+/// A credit on the wire that lands more than L from now (a delay rule on
+/// its direction): a partition of its direction now lets a newer credit be
+/// held at its send before this one lands and is held (the outside review
+/// of slice 3, first P2: `older_credit_after_newer`).
+fn lateCredit() ?MEntry {
+    for (M.wire.items) |w| {
+        if (w.kind == .credit and w.due > now() + L) return w;
+    }
+    return null;
+}
+
 fn stepPartition() bool {
     if (!ruleRoom()) return skip(.rule_limit);
+    if (chance(50)) {
+        if (lateCredit()) |w| {
+            const fp, const tp = ports(&M.conns[w.ci], w.dir);
+            if (findModelRule(.partition, fp, tp) == null) {
+                sim.setPartition(tcpPath(fp, tp));
+                addModelRule(.{ .kind = .partition, .from = fp, .to = tp });
+                M.c.partition_late_credit += 1;
+                return true;
+            }
+        }
+    }
     const ci = pickConn() orelse return skip(.no_endpoint);
     const fp, const tp = ports(&M.conns[ci], @intCast(rand(2)));
     if (findModelRule(.partition, fp, tp) != null) return skip(.rule_exists);
@@ -1885,6 +1937,8 @@ fn checkState() void {
             for (k.held[s].items) |w| {
                 if (w.kind == .data) hb += w.bytes.len;
             }
+            checkHeld(k, s);
+            checkCreditLive(k, @intCast(ci), s, g);
             if (g.held != hb or g.held_entries != k.held[s].items.len) fail("connection {d} direction from side {d}: held sim {d} bytes in {d} entries, model {d} in {d}", .{ k.id, s, g.held, g.held_entries, hb, k.held[s].items.len });
             if (hb > 0) held_data = true;
             if (g.window != d.window or g.admitted != d.admitted or g.credited != d.credited or g.read != d.read or g.reclaimed != d.reclaimed or
@@ -1899,16 +1953,67 @@ fn checkState() void {
     }
     const sim_n = sim.streamEntriesInFlight();
     if (sim_n != in_flight) fail("TCP entries in flight: sim {d}, model {d}", .{ sim_n, in_flight });
-    // Every landing time on the wire, in landing order (design 17.15 item
-    // 2): a delay, a jitter or a release that the model times otherwise
-    // fails here at the step that made it.
-    var dues: [4096]u64 = undefined;
-    const nd = sim.testTcpWireDues(&dues);
+    // Every entry on the wire, in landing order (design 17.15 item 2): what
+    // it is, then when it lands. A delay, a jitter or a release that the
+    // model times otherwise fails here at the step that made it, and an
+    // entry the sim kept in place of another is named.
+    const nd = sim.testTcpEntries(false, &entry_buf);
     if (nd != M.wire.items.len) fail("TCP entries on the wire: sim {d}, model {d}", .{ nd, M.wire.items.len });
-    for (M.wire.items, dues[0..nd], 0..) |w, d, i| {
-        if (w.due != d) fail("wire entry {d} (connection {d}, direction {d}, {t}, sequence {d}): sim lands it at {d} ns, model at {d} ns", .{ i, w.conn_id, w.dir, w.kind, w.seq, d, w.due });
+    for (M.wire.items, entry_buf[0..nd], 0..) |w, t, i| {
+        if (!sameEntry(w, t)) fail("wire entry {d}: sim has connection {d} direction {d} {t} sequence {d} count {d} length {d}, model connection {d} direction {d} {t} sequence {d} count {d} length {d}", .{ i, t.conn_id, @intFromBool(!t.from_client), t.kind, t.seq, t.count, t.len, w.conn_id, w.dir, w.kind, w.seq, w.count, w.bytes.len });
+        if (w.due != t.due_at) fail("wire entry {d} (connection {d}, direction {d}, {t}, sequence {d}): sim lands it at {d} ns, model at {d} ns", .{ i, w.conn_id, w.dir, w.kind, w.seq, t.due_at, w.due });
     }
     checkStats();
+}
+
+var entry_buf: [8192]sim.TestTcpEntry = undefined;
+var held_buf: [8192]sim.TestTcpEntry = undefined;
+
+fn sameEntry(w: MEntry, t: sim.TestTcpEntry) bool {
+    return w.conn_id == t.conn_id and w.dir == @intFromBool(!t.from_client) and w.seq == t.seq and std.mem.eql(u8, @tagName(w.kind), @tagName(t.kind)) and w.count == t.count and w.bytes.len == t.len;
+}
+
+/// Each held entry of connection `k`'s direction from side `s`, by what it
+/// is: kind, sequence, a credit's count, a chunk's length. Coalesced
+/// credits that kept the wrong one fail here, at the step that held them,
+/// naming both.
+fn checkHeld(k: *const MConn, s: u1) void {
+    const n = sim.testTcpEntries(true, &held_buf);
+    var i: usize = 0;
+    for (held_buf[0..n]) |t| {
+        if (t.conn_id != k.id or @intFromBool(!t.from_client) != s) continue;
+        if (i >= k.held[s].items.len) fail("connection {d} direction {d}: the sim holds {t} sequence {d} count {d}, which the model does not", .{ k.id, s, t.kind, t.seq, t.count });
+        const w = k.held[s].items[i];
+        if (!sameEntry(w, t)) fail("connection {d} direction {d}: held entry {d}: sim {t} sequence {d} count {d} length {d}, model {t} sequence {d} count {d} length {d}", .{ k.id, s, i, t.kind, t.seq, t.count, t.len, w.kind, w.seq, w.count, w.bytes.len });
+        i += 1;
+    }
+    if (i != k.held[s].items.len) fail("connection {d} direction {d}: the sim holds {d} entries, the model {d}", .{ k.id, s, i, k.held[s].items.len });
+}
+
+/// Liveness of the window, checked on the sim's own counts before they are
+/// compared with the model's: a live direction with no credit of its own in
+/// flight, held or owed has been credited every byte its receiver read or
+/// released (design 17.7: each read or release sends a credit or owes one,
+/// and a credit carries the cumulative count). If not, a credit was lost
+/// and nothing will ever bring it, so a sender on a full window parks for
+/// ever. Conservation of bytes cannot see this: no byte is lost. The
+/// model's own wire and held lists say what is in flight, so a model that
+/// coalesced held credits the same wrong way as the sim still fails here.
+/// Not checked: a direction whose sender is terminal, or whose receiver is
+/// closed, failed or reset (its credits are discarded or stale by design).
+fn checkCreditLive(k: *const MConn, ci: u8, s: u1, g: sim.TestStreamDir) void {
+    const r = other(s);
+    const rx = k.ends[r];
+    if (dirTerminal(k, s) or !rx.open or rx.failed != null or rx.rst_sent or rx.reset_received) return;
+    if (k.dirs[s].owed_at != null) return;
+    for (M.wire.items) |w| {
+        if (w.ci == ci and w.dir == r and w.kind == .credit) return;
+    }
+    for (k.held[r].items) |w| {
+        if (w.kind == .credit) return;
+    }
+    M.c.live_checks += 1;
+    if (g.credited != g.read + g.reclaimed) fail("connection {d} direction from side {d}: a credit was lost: credited {d}, but its receiver read {d} and released {d}, and no credit is in flight, held or owed", .{ k.id, s, g.credited, g.read, g.reclaimed });
 }
 
 /// The layer's `bytesReadable` (FIONREAD) and `getpeername` on an open
@@ -1955,6 +2060,19 @@ fn endProofs() void {
     while (nextEvent() != null) : (n += 1) {
         if (n > 100000) fail("the wire did not drain", .{});
         pollOnce(10 * L);
+    }
+    // With no rule and nothing in flight, held or owed: no send is parked
+    // while its receiver has room to take more (window minus unread). A
+    // lost credit leaves exactly that, and the proofs below would hide it,
+    // because they grow the window of a parked send.
+    for (M.slots) |s| {
+        if (!s.used or s.state != .parked or s.kind != .send) continue;
+        const k = &M.conns[s.ci];
+        const rx = k.ends[other(s.side)];
+        if (!rx.open or rx.failed != null or rx.shut_rd or rx.rst_sent or rx.reset_received) continue;
+        const g = sim.testStreamDir(k.id, s.side == 0) orelse fail("connection {d} retired with a send parked", .{k.id});
+        M.c.end_live_checks += 1;
+        if (g.unread < g.window) fail("the end: send #{d} on connection {d} is parked while its receiver has room for {d} more bytes (window {d}, unread {d}, credited {d}, read {d}, released {d}): a stranded sender", .{ s.serial, k.id, g.window - g.unread, g.window, g.unread, g.credited, g.read, g.reclaimed });
     }
     // Each op still parked, alone: give it what it waits for.
     for (&M.slots, 0..) |*s, i| {
@@ -2143,11 +2261,11 @@ fn printCounts(c: Counts, profile: Profile, seeds: usize, steps: usize) void {
 /// is 0 did not test what it claims.
 /// Slice 3's counts, each of its own case (seeds 17 to 32).
 const fault_floor_names = .{
-    "held_send",             "held_landing",          "released",         "coalesced",       "held_fin",         "held_rst",
-    "held_credit",           "held_data_steps",       "abort_discards",   "fail_discards",   "close_while_held", "stall_released",
-    "held_delayed_released", "clear_delay_in_flight", "released_to_dead", "delayed",         "jitter_draws",     "fail_recv_parked",
-    "fail_send_parked",      "fail_both_parked",      "fail_none_parked", "fail_first_recv", "fail_first_send",  "fail_both_ways",
-    "fail_timed_out",        "dropped_failed",        "rule_clears",
+    "held_send",             "held_landing",          "released",         "coalesced",                "held_fin",         "held_rst",
+    "held_credit",           "held_data_steps",       "abort_discards",   "fail_discards",            "close_while_held", "stall_released",
+    "held_delayed_released", "clear_delay_in_flight", "released_to_dead", "delayed",                  "jitter_draws",     "fail_recv_parked",
+    "fail_send_parked",      "fail_both_parked",      "fail_none_parked", "fail_first_recv",          "fail_first_send",  "fail_both_ways",
+    "fail_timed_out",        "dropped_failed",        "rule_clears",      "older_credit_after_newer",
 };
 
 fn floors(c: Counts, profile: Profile) void {
@@ -2167,7 +2285,7 @@ fn floors(c: Counts, profile: Profile) void {
         "cancel_send",      "shut_unconnected", "close_fin",     "close_rst",        "close_quiet",      "rst_answers",
         "stale_departed",   "stale_landed",     "owed_departed", "credits_landed",   "shrink_below_use", "shared_reset",
         "batches",          "end_proofs",       "line3a_no_fin", "line3a_after_fin", "owed_close",       "peer_checks",
-        "peer_unconnected", "readable_checks",
+        "peer_unconnected", "readable_checks",  "live_checks",   "end_live_checks",
     };
     inline for (req) |name| {
         if (@field(c, name) == 0) fail("count {s} is 0 over the seeds of profile {t}: the run did not test it", .{ name, profile });

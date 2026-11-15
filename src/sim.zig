@@ -2417,8 +2417,9 @@ fn isFlowHead(rest: []const WireDatagram, k: usize) bool {
 // - A `.tcp` partition or silence holds entries, never loses them. An entry
 //   is held if one matches at its send or at its landing, or if its
 //   direction already holds one (order). Held data stays charged to the
-//   window, so a held credit stalls the sender; a held credit is replaced
-//   by a newer one of its direction. When a clear leaves a held direction
+//   window, so a held credit stalls the sender. Two held credits of one
+//   direction become one: the one with the larger sequence, whichever was
+//   held first (`holdTcp`). When a clear leaves a held direction
 //   with no matching partition or silence, it is released, in (`conn_id`,
 //   direction) order: each entry lands `wire_latency_ns` + its extra time
 //   after the release, in order. Held entries never stop the clock, count
@@ -3100,20 +3101,28 @@ fn heldBefore(a: TcpEntry, b: TcpEntry) bool {
     return a.seq < b.seq;
 }
 
-/// Holds `e` (design 17.9 items 2 and 3). A credit replaces a credit its
-/// direction already holds: counts only grow, so the newer one carries the
-/// older's news. Capacity was reserved.
+/// Holds `e` (design 17.9 items 2 and 3). Two held credits of one
+/// direction coalesce to the one with the larger sequence, whichever came
+/// to the list first: an entry held at its landing left before one held at
+/// its send, so arriving later does not make a credit newer (outside review
+/// of slice 3, first P2). The newer one's count includes the older's,
+/// because a credit carries the receiver's cumulative `read + reclaimed`
+/// at its departure; a newer credit whose count is not larger is an
+/// invariant panic. Capacity was reserved.
 fn holdTcp(e: TcpEntry) void {
     const k = &conns[e.conn];
     const d = @backingInt(e.dir);
     if (e.kind == .credit) {
         for (tcp_held.items, 0..) |h, i| {
-            if (h.conn == e.conn and h.dir == e.dir and h.kind == .credit) {
-                _ = tcp_held.orderedRemove(i);
-                k.held[d] -= 1;
-                stream_stats.credits_coalesced += 1;
-                break;
-            }
+            if (h.conn != e.conn or h.dir != e.dir or h.kind != .credit) continue;
+            const newer, const older = if (e.seq > h.seq) .{ e, h } else .{ h, e };
+            if (newer.count <= older.count) panic("sim: held credits of connection {d}: sequence {d} carries {d}, not more than sequence {d}'s {d} (an invariant: counts grow with the sequence)", .{ k.id, newer.seq, newer.count, older.seq, older.count });
+            stream_stats.credits_coalesced += 1;
+            // The held one is newer: the arriving one is dropped.
+            if (h.seq > e.seq) return;
+            _ = tcp_held.orderedRemove(i);
+            k.held[d] -= 1;
+            break;
         }
     }
     var pos = tcp_held.items.len;
@@ -4431,6 +4440,32 @@ pub fn testTcpWireDues(out: []u64) usize {
     if (tcp_wire.items.len > out.len) panic("sim: testTcpWireDues: {d} entries on the wire, room for {d}", .{ tcp_wire.items.len, out.len });
     for (tcp_wire.items, 0..) |w, i| out[i] = w.due_at;
     return tcp_wire.items.len;
+}
+
+/// One TCP entry as a test sees it (`testTcpEntries`).
+pub const TestTcpEntry = struct {
+    conn_id: u32,
+    from_client: bool,
+    seq: u64,
+    kind: TcpKind,
+    /// A credit's count; 0 for other kinds.
+    count: u64,
+    /// A data chunk's length; 0 for other kinds.
+    len: usize,
+    /// Its landing time on the wire; 0 for a held entry (it has none until
+    /// it is released).
+    due_at: u64,
+};
+
+/// The TCP entries on the wire (in landing order) or held (in (`conn_id`,
+/// direction, sequence) order), for a test that keeps its own copy of
+/// them: it can name the entry that differs, not only a time or a count.
+pub fn testTcpEntries(held: bool, out: []TestTcpEntry) usize {
+    if (comptime !builtin.is_test) @compileError("testTcpEntries is for tests");
+    const list = if (held) tcp_held.items else tcp_wire.items;
+    if (list.len > out.len) panic("sim: testTcpEntries: {d} entries, room for {d}", .{ list.len, out.len });
+    for (list, 0..) |w, i| out[i] = .{ .conn_id = w.conn_id, .from_client = w.dir == .client, .seq = w.seq, .kind = w.kind, .count = w.count, .len = w.bytes.len, .due_at = if (held) 0 else w.due_at };
+    return list.len;
 }
 
 /// Moves the next `conn_id` of this run, to reach its limit in a test.

@@ -429,6 +429,57 @@ test "sim: stream faults: two credits held in one direction coalesce to the newe
     try run(1, .linux, coalesce.body);
 }
 
+// The outside review of slice 3 (gpt-simnet15.md, section 1, first P2): an
+// older credit that was on the wire reaches the held list after a newer one
+// was held at its send. Arriving is not being newer.
+const older_credit = struct {
+    fn body() !void {
+        const srv, const c, const s = try pair();
+        chunksOff(c, s);
+        sim.setStreamWindow(s.socket.handle, 2);
+        try expectEqual(@as(usize, 2), try c.write("ab", .none));
+        try rt_mod.sleep(.fromNanoseconds(L));
+        try expectEqual(@as(usize, 2), unread(s));
+        // C1 (count 1) leaves at t1 with a delay of 2L: it lands at t1 + 3L.
+        sim.setImpairment(s2c, .{ .delay_ns = 2 * L });
+        const t1_ = sim.clockNs();
+        var b: [1]u8 = undefined;
+        try expectEqual(@as(usize, 1), try s.read(&b, .none));
+        // C2 (count 2) is owed for t1 + L, and the partition holds it at
+        // its send.
+        sim.setPartition(s2c);
+        try expectEqual(@as(usize, 1), try s.read(&b, .none));
+        try sleepUntil(t1_ + L);
+        try expectEqual(@as(u32, 1), (try dir(false)).held_entries);
+        // C1 reaches its landing and is held there, after C2: the two
+        // coalesce to C2, the newer by sequence, whose count is 2.
+        try sleepUntil(t1_ + 3 * L);
+        try expectEqual(@as(u32, 1), (try dir(false)).held_entries);
+        try expectEqual(@as(u64, 1), sim.streamStats().credits_coalesced);
+        try expectEqual(@as(u64, 0), (try dir(true)).credited);
+        // With a window of 1, a credit that is 1 short leaves the sender
+        // no room for ever: nothing is unread, owed or held to fix it.
+        sim.setStreamWindow(s.socket.handle, 1);
+        _ = sim.clearImpairment(s2c);
+        const t_rel = sim.clockNs();
+        _ = sim.healPartition(s2c);
+        try sleepUntil(t_rel + 3 * L);
+        try expectEqual(@as(u64, 2), (try dir(true)).credited);
+        try expectEqual(@as(u64, 1), sim.streamStats().credits_landed);
+        try expectEqual(@as(usize, 1), try c.write("c", .none));
+        try rt_mod.sleep(.fromNanoseconds(L));
+        try expectEqual(@as(usize, 1), try s.read(&b, .none));
+        try expectEqual(@as(u8, 'c'), b[0]);
+        try t1.closeAll3(c, s, srv);
+    }
+};
+
+test "sim: stream faults: an older credit that reaches the held list after a newer one was held at its send coalesces to the newer, and the sender is not left short" {
+    if (comptime skip) return error.SkipZigTest;
+    try run(1, .linux, older_credit.body);
+    try run(1, .macos, older_credit.body);
+}
+
 const fin_held = struct {
     var which: enum { shutdown, close } = .shutdown;
 
