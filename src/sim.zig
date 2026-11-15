@@ -2416,7 +2416,9 @@ fn isFlowHead(rest: []const WireDatagram, k: usize) bool {
 //   its direction. `loss_ppm`, `burst`, `dup_ppm` and `reorder` refuse.
 // - A `.tcp` partition or silence holds entries, never loses them. An entry
 //   is held if one matches at its send or at its landing, or if its
-//   direction already holds one (order). Held data stays charged to the
+//   direction already holds one (order). When one is held at its landing,
+//   the later entries of its direction still on the wire are held behind
+//   it at once (`held_behind`). Held data stays charged to the
 //   window, so a held credit stalls the sender. Two held credits of one
 //   direction become one: the one with the larger sequence, whichever was
 //   held first (`holdTcp`). When a clear leaves a held direction
@@ -2433,7 +2435,8 @@ fn isFlowHead(rest: []const WireDatagram, k: usize) bool {
 // - The connect with no answer is a held SYN: the connect stays parked
 //   until its deadline (`Timeout`), a cancel, a close, or the release.
 // - `failStream(fd, .reset | .timed_out)`: its doc comment.
-// - Counts: `streamStats()` (`held_at_send`, `held_at_landing`, `released`,
+// - Counts: `streamStats()` (`held_at_send`, `held_at_landing`,
+//   `held_behind`, `released`,
 //   `credits_coalesced`, `discarded_held`, `delayed`, `dropped_failed`),
 //   each rule's `matched` and `delayed`, `streamFaultDraws()`.
 //
@@ -2724,6 +2727,9 @@ pub const StreamStats = struct {
     /// direction was cleared (design 17.9).
     held_at_send: u64 = 0,
     held_at_landing: u64 = 0,
+    /// Entries taken off the wire because an earlier entry of their
+    /// direction was held at its landing (design 17.9 item 2).
+    held_behind: u64 = 0,
     released: u64 = 0,
     /// Held credits replaced by a newer one of their direction.
     credits_coalesced: u64 = 0,
@@ -3152,6 +3158,13 @@ fn releaseHeld() void {
             if (k.held[d] == 0) continue;
             const from_addr, const to_addr = tcpPath(k, dir);
             if (tcpBlocked(from_addr, to_addr)) continue;
+            for (tcp_wire.items) |w| {
+                if (w.conn == ci and w.dir == dir) {
+                    for (tcp_held.items) |h| {
+                        if (h.conn == ci and h.dir == dir and h.seq < w.seq) panic("sim: connection {d} releases sequence {d} while sequence {d} of its direction is on the wire (an invariant: a held entry has nothing behind it on the wire)", .{ k.id, h.seq, w.seq });
+                    }
+                }
+            }
             _ = tcpLandingTime();
             tcp_wire.ensureUnusedCapacity(net_alloc, k.held[d]) catch panic("sim: out of memory for a TCP wire entry", .{});
             var i: usize = 0;
@@ -4091,9 +4104,29 @@ fn holdAtLanding(e: TcpEntry) bool {
         }
     }
     if (!matched and k.held[@backingInt(e.dir)] == 0) return false;
-    tcp_held.ensureUnusedCapacity(net_alloc, 1) catch panic("sim: out of memory for a held TCP entry", .{});
+    // The later entries of its direction that are still on the wire are
+    // held behind it now (design 17.9 item 2), not at their own landing: a
+    // release before they land would put them ahead of it, and an abort
+    // would discard it and leave them to be delivered after a hole (sitting
+    // 33). So a direction that holds an entry has none on the wire behind
+    // it (`releaseHeld` checks this).
+    var later: usize = 0;
+    for (tcp_wire.items) |w| later += @intFromBool(w.conn == e.conn and w.dir == e.dir);
+    tcp_held.ensureUnusedCapacity(net_alloc, 1 + later) catch panic("sim: out of memory for a held TCP entry", .{});
     stream_stats.held_at_landing += 1;
     holdTcp(e);
+    var i: usize = 0;
+    while (later > 0 and i < tcp_wire.items.len) {
+        const w = tcp_wire.items[i];
+        if (w.conn != e.conn or w.dir != e.dir) {
+            i += 1;
+            continue;
+        }
+        _ = tcp_wire.orderedRemove(i);
+        later -= 1;
+        stream_stats.held_behind += 1;
+        holdTcp(w);
+    }
     return true;
 }
 
@@ -4683,7 +4716,7 @@ fn digestStreams(h: *std.hash.Wyhash) void {
             std.mem.writeInt(u64, &b, (@as(u64, k.held[0]) << 32) | k.held[1], .little);
             h.update(&b);
         }
-        for ([_]u64{ stream_fault_draws, stream_stats.held_at_send, stream_stats.held_at_landing, stream_stats.released, stream_stats.credits_coalesced, stream_stats.discarded_held, stream_stats.delayed, stream_stats.dropped_failed }) |v| {
+        for ([_]u64{ stream_fault_draws, stream_stats.held_at_send, stream_stats.held_at_landing, stream_stats.held_behind, stream_stats.released, stream_stats.credits_coalesced, stream_stats.discarded_held, stream_stats.delayed, stream_stats.dropped_failed }) |v| {
             std.mem.writeInt(u64, &b, v, .little);
             h.update(&b);
         }

@@ -296,14 +296,20 @@ const held_at_landing = struct {
         sim.setStreamChunking(c.socket.handle, .{ .fixed = 2 });
         const t0 = sim.clockNs();
         _ = try c.write("abcd", .none);
-        // The partition starts while the entries are in flight: each is
-        // held at its landing (t0 + L, t0 + L + 1 µs), not lost.
+        // The partition starts while the entries are in flight: "ab" is
+        // held at its landing (t0 + L), not lost, and "cd", still on the
+        // wire behind it, is held behind it then (sitting 33: before, "cd"
+        // was held at its own landing, 1 µs later, and these counts were
+        // 2 at landing and none behind).
         try sleepUntil(t0 + L / 2);
         sim.setPartition(c2s);
+        try sleepUntil(t0 + L);
+        try expectEqual(@as(u64, 4), (try dir(true)).held);
+        try expectEqual(@as(u64, 1), sim.streamStats().held_at_landing);
+        try expectEqual(@as(u64, 1), sim.streamStats().held_behind);
         try sleepUntil(t0 + L + 1000);
         try expectEqual(@as(usize, 0), unread(s));
         try expectEqual(@as(u64, 4), (try dir(true)).held);
-        try expectEqual(@as(u64, 2), sim.streamStats().held_at_landing);
         try checkConserved();
         // A later send in the direction is held behind them; it is newer,
         // with less extra time than "cd" (no spacing), so a release in any
@@ -311,8 +317,10 @@ const held_at_landing = struct {
         _ = try c.write("ef", .none);
         try expectEqual(@as(u32, 3), (try dir(true)).held_entries);
         try sleepUntil(t0 + 2 * L);
-        // It matched all three: two at their landing, one at its send.
-        try expectEqual(@as(u64, 3), sim.healPartition(c2s).matched);
+        // It matched two: "ab" at its landing and "ef" at its send. "cd"
+        // was held behind "ab" and never met the rule (it was 3 before
+        // sitting 33, when "cd" met it at its own landing).
+        try expectEqual(@as(u64, 2), sim.healPartition(c2s).matched);
         // "ab" at t0 + 3L, "cd" 1 µs later, "ef" behind "cd".
         try sleepUntil(t0 + 3 * L + 1000);
         try expectEqual(@as(usize, 6), unread(s));
@@ -349,6 +357,73 @@ const partition_and_delay = struct {
         try t1.closeAll3(c, s, srv);
     }
 };
+
+// An entry held at its landing, while a later entry of its direction is
+// still on the wire (design 17.9 item 2: every later entry is held behind
+// it). Two ways the later one could otherwise get out of order: a release
+// before it lands, and an abort that discards the held one.
+const later_on_wire = struct {
+    var which: enum { release, abort } = .release;
+
+    fn body() !void {
+        const srv, const c, const s = try pair();
+        chunksOff(c, s);
+        const t0 = sim.clockNs();
+        // A lands at t0 + L, B at t0 + 3L/2.
+        try expectEqual(@as(usize, 1), try c.write("a", .none));
+        try sleepUntil(t0 + L / 2);
+        try expectEqual(@as(usize, 1), try c.write("b", .none));
+        try sleepUntil(t0 + 3 * L / 4);
+        sim.setPartition(c2s);
+        try sleepUntil(t0 + L);
+        try expectEqual(@as(usize, 0), unread(s));
+        switch (which) {
+            .release => {
+                // The clear comes after A was held and before B's landing
+                // time. A lands L after the release; B must not land first.
+                try sleepUntil(t0 + 5 * L / 4);
+                const t_rel = sim.clockNs();
+                _ = sim.healPartition(c2s);
+                try sleepUntil(t0 + 3 * L / 2);
+                try expectEqual(@as(usize, 0), unread(s));
+                try sleepUntil(t_rel + L);
+                var b: [2]u8 = undefined;
+                try expectEqual(@as(usize, 2), try s.read(&b, .none));
+                try expect(std.mem.eql(u8, "ab", &b));
+            },
+            .abort => {
+                // The sender aborts while A is held: A and B both go, as
+                // `abort`. If B stayed on the wire it would be held at its
+                // landing and then delivered without A: a hole in the
+                // stream.
+                try linger0(c);
+                c.close();
+                try sleepUntil(t0 + 2 * L);
+                const t_rel = sim.clockNs();
+                _ = sim.healPartition(c2s);
+                try sleepUntil(t_rel + L);
+                try expect(sim.testStreamEnd(s.socket.handle).reset_received);
+                try expectEqual(@as(usize, 0), unread(s));
+                try expectEqual(@as(u64, 2), (try dir(true)).discarded[@backingInt(sim.Discard.abort)]);
+                try checkConserved();
+                s.close();
+                try t1.closeAll1(srv);
+                return;
+            },
+        }
+        try checkConserved();
+        try t1.closeAll3(c, s, srv);
+    }
+};
+
+test "sim: stream faults: an entry held at its landing holds the later entries of its direction still on the wire: a release before their landing keeps the order, and an abort discards them with it" {
+    if (comptime skip) return error.SkipZigTest;
+    for ([_]@TypeOf(later_on_wire.which){ .release, .abort }) |w| {
+        later_on_wire.which = w;
+        try run(1, .linux, later_on_wire.body);
+        try run(1, .macos, later_on_wire.body);
+    }
+}
 
 test "sim: stream faults: a partition and a delay over one entry: the clear of the partition releases it, and it lands L plus its delay after the release" {
     if (comptime skip) return error.SkipZigTest;

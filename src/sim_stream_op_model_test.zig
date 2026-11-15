@@ -41,7 +41,11 @@
 //
 // What it checks:
 // - every op's result: the count, the error, and every byte a receive
-//   returns (the model's own copy of what was sent). A result decided at the
+//   returns (the model's own copy of what was sent). Apart from how the
+//   wire and the held list order entries, every chunk that reaches a
+//   receiver's buffer must be the next bytes of its stream (its offset
+//   equals the bytes delivered before it), so a chunk out of order, or
+//   one delivered after a discarded one, fails at its landing. A result decided at the
 //   call must come back unchanged. An op that parked must not complete
 //   until the model woke it; once woken it must complete in that poll, with
 //   the model's result at its harvest, in the order the loop harvests.
@@ -211,6 +215,10 @@ const MDir = struct {
     data_send_index: u64 = 0,
     last_credit_at: ?u64 = null,
     owed_at: ?u64 = null,
+    /// Bytes of data sent (the next chunk's `off`), and bytes appended to
+    /// the receiver's buffer.
+    sent_off: u64 = 0,
+    delivered: u64 = 0,
 
     fn room(d: MDir) u64 {
         const used = d.admitted - d.credited;
@@ -265,6 +273,9 @@ const MEntry = struct {
     extra: u64 = 0,
     /// A `.tcp` impairment added time to it.
     own_delay: bool = false,
+    /// A data chunk's place in its direction's byte stream: the bytes of
+    /// data sent before it.
+    off: u64 = 0,
 };
 
 const Counts = struct {
@@ -338,6 +349,8 @@ const Counts = struct {
     /// direction was held (it left first, and was held at its landing):
     /// the case of the outside review of slice 3, first P2.
     older_credit_after_newer: u64 = 0,
+    /// Entries taken off the wire behind one held at its landing.
+    held_behind: u64 = 0,
     /// `checkCreditLive` ran on a direction with nothing of its credit in
     /// flight; the end's stranded-sender check ran on a parked send.
     live_checks: u64 = 0,
@@ -525,6 +538,10 @@ fn sendEntry(ci: u8, from: u1, kind: EKind, extra: u64, bytes: []const u8, count
     var e: MEntry = .{ .due = 0, .conn_id = k.id, .ci = ci, .dir = from, .order = M.next_order, .kind = kind, .bytes = bytes, .count = count, .seq = k.next_seq[from], .extra = extra };
     M.next_order += 1;
     k.next_seq[from] += 1;
+    if (kind == .data) {
+        e.off = k.dirs[from].sent_off;
+        k.dirs[from].sent_off += bytes.len;
+    }
     if (M.rules_ever) {
         const fp, const tp = ports(k, from);
         for (M.rules[0..M.n_rules]) |*r| {
@@ -659,6 +676,22 @@ fn holdAtLanding(w: MEntry) bool {
     M.st.held_at_landing += 1;
     M.c.held_landing += 1;
     hold(w);
+    // Design 17.9 item 2: once a direction holds an entry, every later
+    // entry of it is held behind it, matching or not. Those still on the
+    // wire are later (an earlier one would have landed first), so they are
+    // held now.
+    var i: usize = 0;
+    while (i < M.wire.items.len) {
+        const x = M.wire.items[i];
+        if (x.ci != w.ci or x.dir != w.dir) {
+            i += 1;
+            continue;
+        }
+        _ = M.wire.orderedRemove(i);
+        M.st.held_behind += 1;
+        M.c.held_behind += 1;
+        hold(x);
+    }
     return true;
 }
 
@@ -933,6 +966,13 @@ fn land(w: MEntry) void {
                 }
                 return;
             }
+            // The stream's own rule, apart from how the wire and the held
+            // list order entries: a chunk that reaches the buffer is the
+            // next bytes of the stream. A chunk out of order, or one after
+            // a chunk that was discarded (a hole), fails here.
+            const dd = &k.dirs[w.dir];
+            if (w.off != dd.delivered) fail("connection {d} direction from side {d}: a chunk of {d} bytes at stream offset {d} reached the buffer, but {d} bytes were delivered before it", .{ k.id, w.dir, n, w.off, dd.delivered });
+            dd.delivered += n;
             x.unread.appendSlice(M.arena.allocator(), w.bytes) catch @panic("oom");
             M.st.chunks_landed += 1;
             wakeRecv(ci, at, .data);
@@ -2265,7 +2305,7 @@ const fault_floor_names = .{
     "held_credit",           "held_data_steps",       "abort_discards",   "fail_discards",            "close_while_held", "stall_released",
     "held_delayed_released", "clear_delay_in_flight", "released_to_dead", "delayed",                  "jitter_draws",     "fail_recv_parked",
     "fail_send_parked",      "fail_both_parked",      "fail_none_parked", "fail_first_recv",          "fail_first_send",  "fail_both_ways",
-    "fail_timed_out",        "dropped_failed",        "rule_clears",      "older_credit_after_newer",
+    "fail_timed_out",        "dropped_failed",        "rule_clears",      "older_credit_after_newer", "held_behind",
 };
 
 fn floors(c: Counts, profile: Profile) void {

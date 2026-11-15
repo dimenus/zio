@@ -2254,6 +2254,14 @@ safe, and slice 1's timings stay as they are.)
    never blockers.
 2. **Order.** Once a direction has a held entry, every later entry of
    that direction is held behind it, matching or not, in sequence order.
+   The later entries still on the wire are held at that moment, not at
+   their own landing (sitting 33). Holding them only when they landed
+   broke two things, both measured: a release before their landing put
+   the released (older) entries behind them, so bytes arrived out of
+   order; and an abort discarded the held entry while they stayed on the
+   wire, so they were delivered after a hole (the op model's seed 17 did
+   this at 93b1037: 247 bytes at stream offset 269 after 258 delivered).
+   So a direction that holds an entry has nothing on the wire behind it.
 3. **Window.** Held payload stays charged to the window. A held credit
    stalls the sender. Held credits coalesce to the newest (17.7).
 4. **Release.** When a rule is cleared, each held direction with no
