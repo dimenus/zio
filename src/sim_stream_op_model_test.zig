@@ -19,7 +19,16 @@
 //   connection, or `owed_close`: two reads in one instant (the second's
 //   credit owed) and then both closes, so the wire empties while a credit
 //   is owed. A receive or a send lives in a slot until its callback.
-// - The parent runs seeds 1 to 16 in one child per profile, twice, and
+// - Three seed blocks, each with its own step weights: seeds 1 to 16 are
+//   slice 2's mix with no fault step; 17 to 32 add slice 3's fault steps
+//   (a partition, a silence, a delay with jitter, a clear, `failStream`);
+//   33 to 40 add two scripted steps, `train` and `late_credit` (above
+//   `stepTrain`), which put the model into states the random steps reach
+//   too rarely: a release or an abort right after a pull, a send after a
+//   hold in the other direction, and an older credit held after a newer
+//   one. A step added later gets weight 0 in the older blocks, so their
+//   draws, steps and digest lines never change.
+// - The parent runs every seed in one child per profile, twice, and
 //   compares each seed's digest line between the two children (same seed,
 //   two processes). Then, per seed, a child with no profile: it must panic
 //   with the line, and at the step, that the profiled run's no-profile
@@ -98,8 +107,9 @@
 // - the generator never reads the profile, so the runs with each profile
 //   and with none take the same steps up to the first point that differs.
 //
-// What it does not reach: faults, holding and `failStream` (slice 3); the
-// listener and handshake rules (slice 1's tests); a cancel inside a harvest
+// What it does not reach: a fault on the handshake (17.9a point 15: the
+// scenario tests have it); the listener and handshake rules (slice 1's
+// tests); a cancel inside a harvest
 // batch (the bytes tests have it); a window change while a send is woken
 // (refused; a refusal test has it); the TCP entry limit (the bytes tests
 // fill the wire on purpose; the generator keeps far below it).
@@ -125,8 +135,11 @@ const L = sim.wire_latency_ns;
 const us: u64 = 1000;
 const default_steps = 1500;
 /// Seeds 1 to `n_seeds` are slice 2's mix, unchanged; seeds `n_seeds + 1`
-/// to `2 * n_seeds` add slice 3's fault steps (`fault_weights`).
+/// to `2 * n_seeds` add slice 3's fault steps (`fault_weights`); the
+/// `n_pull_seeds` after them add the pull steps (`pull_weights`).
 const n_seeds = 16;
+const n_pull_seeds = 8;
+const all_seeds = 2 * n_seeds + n_pull_seeds;
 const max_live = 4;
 /// Connections made in a seed; the model's table holds those not retired.
 const max_seed_conns = 80;
@@ -134,11 +147,17 @@ const max_conns = 16;
 const max_slots = 2 * 2 * max_live;
 const buf_cap = 6000;
 
-const StepKind = enum { send, recv, poll, settle, shut_send, shut_both, close, abort, window, chunking, cancel, connect, owed_close, partition, silence, delay, clear_rule, fail };
+const StepKind = enum { send, recv, poll, settle, shut_send, shut_both, close, abort, window, chunking, cancel, connect, owed_close, partition, silence, delay, clear_rule, fail, train, late_credit };
 /// Slice 2's weights, with 0 for slice 3's steps: the same draws give the
-/// same steps as before slice 3, so seeds 1 to 16 are unchanged.
-const step_weights = [_]u32{ 24, 22, 18, 6, 1, 1, 2, 1, 5, 2, 4, 6, 3, 0, 0, 0, 0, 0 };
-const fault_weights = [_]u32{ 24, 22, 18, 6, 1, 1, 2, 1, 5, 2, 4, 6, 3, 3, 1, 2, 5, 1 };
+/// same steps as before slice 3, so seeds 1 to 16 are unchanged. A step
+/// added later gets 0 in the older tables, for the same reason: a 0 at the
+/// end changes neither the total nor the walk, so seeds 1 to 32 keep their
+/// steps and digests.
+const step_weights = [_]u32{ 24, 22, 18, 6, 1, 1, 2, 1, 5, 2, 4, 6, 3, 0, 0, 0, 0, 0, 0, 0 };
+const fault_weights = [_]u32{ 24, 22, 18, 6, 1, 1, 2, 1, 5, 2, 4, 6, 3, 3, 1, 2, 5, 1, 0, 0 };
+/// The pull seeds: slice 3's mix, with the scripted `train` and
+/// `late_credit` steps, and more clears, so that a rule rarely lives long.
+const pull_weights = [_]u32{ 24, 22, 18, 6, 1, 1, 2, 1, 5, 2, 4, 6, 3, 3, 1, 2, 9, 1, 6, 3 };
 /// Rules in force at once, and distinct rule keys per seed (the sim keeps
 /// `max_rule_history`, 256).
 const max_model_rules = 6;
@@ -238,6 +257,15 @@ const MConn = struct {
     next_seq: [2]u64 = .{ 2, 1 },
     /// Each direction's held entries, in send order (design 17.9).
     held: [2]std.ArrayList(MEntry) = .{ .empty, .empty },
+    /// For the counts only, never for a prediction. `pulled_due`: the
+    /// latest old landing time of the entries a pull took off the wire,
+    /// until the direction's next release; `pull_aborted`: an abort
+    /// discarded held entries since that pull. `hold_watch`: the other
+    /// direction had an entry held at its landing while this one had
+    /// entries on the wire, and this one has put nothing on the wire since.
+    pulled_due: [2]?u64 = .{ null, null },
+    pull_aborted: [2]bool = .{ false, false },
+    hold_watch: [2]bool = .{ false, false },
 };
 
 const EKind = enum { data, fin, rst, credit };
@@ -293,6 +321,8 @@ const Counts = struct {
     skip_rule_exists: u64 = 0,
     skip_no_rule: u64 = 0,
     skip_no_fail_target: u64 = 0,
+    skip_no_train_shape: u64 = 0,
+    skip_no_late_credit_shape: u64 = 0,
     send_admitted: u64 = 0,
     send_partial: u64 = 0,
     send_zero: u64 = 0,
@@ -401,6 +431,23 @@ const Counts = struct {
     dropped_failed: u64 = 0,
     /// A rule's counts returned by its clear, compared with the model's.
     rule_clears: u64 = 0,
+    // The pull seeds (t-4148, t-4154), each counted where its case is
+    // decided.
+    /// A release whose first entry's right landing time is before the old
+    /// landing time of an entry the pull took off the wire: a fence kept
+    /// from the pull would land it late. `pull_abort_release` is the same
+    /// with an abort between the pull and the release (its RST is first).
+    pull_release: u64 = 0,
+    pull_abort_release: u64 = 0,
+    /// The first entry a direction puts on the wire after the other
+    /// direction had an entry held at its landing, when an entry of its own
+    /// sent before that hold is still on the wire and lands after this
+    /// one's own time: a fence reset for both directions at the hold would
+    /// land it too early.
+    clamp_after_other_hold: u64 = 0,
+    /// The scripted steps that set their case up, by how they went on.
+    train_pulls: u64 = 0,
+    late_credit_setups: u64 = 0,
 
     fn add(a: *Counts, b: Counts) void {
         const info = @typeInfo(Counts).@"struct";
@@ -449,6 +496,8 @@ const M = struct {
     var rule_keys: usize = 0;
     var draws: u64 = 0;
     var faults: bool = false;
+    /// A pull seed: `pull_weights`.
+    var pull: bool = false;
     /// A failStream step found a receive and a send parked: the one
     /// harvested first is counted by which it was.
     var fail_both_now: bool = false;
@@ -588,10 +637,18 @@ fn sendEntry(ci: u8, from: u1, kind: EKind, extra: u64, bytes: []const u8, count
 fn putOnWire(entry: MEntry) void {
     var e = entry;
     e.due = now() + L + e.extra;
+    const own = e.due;
     for (M.wire.items) |w| {
         if (w.ci != e.ci or w.dir != e.dir) continue;
         if (w.seq >= e.seq) fail("connection {d} direction {d}: sequence {d} goes on the wire behind sequence {d}, which is already there", .{ e.conn_id, e.dir, e.seq, w.seq });
         e.due = @max(e.due, w.due);
+    }
+    const k = &M.conns[e.ci];
+    if (k.hold_watch[e.dir]) {
+        // Every entry of the direction on the wire was put there before
+        // the other direction's hold: this put is the first since.
+        k.hold_watch[e.dir] = false;
+        if (e.due > own) M.c.clamp_after_other_hold += 1;
     }
     var pos = M.wire.items.len;
     while (pos > 0 and entryBefore(e, M.wire.items[pos - 1])) pos -= 1;
@@ -706,7 +763,14 @@ fn holdAtLanding(w: MEntry) bool {
         _ = M.wire.orderedRemove(i);
         M.st.held_behind += 1;
         M.c.held_behind += 1;
+        k.pulled_due[w.dir] = @max(k.pulled_due[w.dir] orelse 0, x.due);
         hold(x);
+    }
+    for (M.wire.items) |x| {
+        if (x.ci == w.ci and x.dir == other(w.dir)) {
+            k.hold_watch[other(w.dir)] = true;
+            break;
+        }
     }
     return true;
 }
@@ -731,6 +795,21 @@ fn release() void {
             if (k.held[d].items.len == 0) continue;
             const fp, const tp = ports(k, d);
             if (blocked(fp, tp)) continue;
+            // The case a fence kept from a pull gets wrong (t-4148): the
+            // first entry's right time, by the design's rule, is before a
+            // pulled entry's old time.
+            if (k.pulled_due[d]) |old| {
+                const h0 = k.held[d].items[0];
+                var right = now() + L + h0.extra;
+                for (M.wire.items) |w| {
+                    if (w.ci == ci and w.dir == d) right = @max(right, w.due);
+                }
+                if (right < old) {
+                    if (k.pull_aborted[d] and h0.kind == .rst) M.c.pull_abort_release += 1 else M.c.pull_release += 1;
+                }
+                k.pulled_due[d] = null;
+                k.pull_aborted[d] = false;
+            }
             var has_credit = false;
             // A delay rule that still matches does not stop the release,
             // and the entry keeps the delay drawn at its send (17.9 item
@@ -763,6 +842,7 @@ const HeldDiscard = struct { data: usize = 0, credit: usize = 0 };
 /// Side `side`'s held data, FIN and credits go: an abort or a failStream.
 fn discardHeldOutbound(ci: u8, side: u1, cause: sim.Discard) HeldDiscard {
     const list = &M.conns[ci].held[side];
+    if (cause == .abort and list.items.len > 0 and M.conns[ci].pulled_due[side] != null) M.conns[ci].pull_aborted[side] = true;
     var n: HeldDiscard = .{};
     var i: usize = 0;
     while (i < list.items.len) {
@@ -1494,7 +1574,7 @@ fn stepRecv() bool {
     return true;
 }
 
-const SkipWhy = enum { no_endpoint, unresolved, no_parked, fixed_window, no_owed_shape, rule_limit, rule_exists, no_rule, no_fail_target };
+const SkipWhy = enum { no_endpoint, unresolved, no_parked, fixed_window, no_owed_shape, rule_limit, rule_exists, no_rule, no_fail_target, no_train_shape, no_late_credit_shape };
 
 fn skip(why: SkipWhy) bool {
     switch (why) {
@@ -1507,6 +1587,8 @@ fn skip(why: SkipWhy) bool {
         .rule_exists => M.c.skip_rule_exists += 1,
         .no_rule => M.c.skip_no_rule += 1,
         .no_fail_target => M.c.skip_no_fail_target += 1,
+        .no_train_shape => M.c.skip_no_train_shape += 1,
+        .no_late_credit_shape => M.c.skip_no_late_credit_shape += 1,
     }
     return false;
 }
@@ -1697,6 +1779,203 @@ fn stepFail() bool {
     return true;
 }
 
+// ---- The pull seeds' scripted steps (t-4148, t-4154) ----
+//
+// Each step puts the model into a state that the random steps reach too
+// rarely to test (sitting 34 measured 0 releases right after a pull over
+// seeds 17 to 32), then stops: what follows is either one scripted action
+// or, often, whatever the random steps do next. The steps decide nothing
+// themselves: every call goes through the same `submit`, `clearRule` and
+// `closeSide` as the random steps, so the model's checks run unchanged.
+
+/// Side `side` of `k` can start a send: open, no FIN out, no reset, not
+/// failed, and no unresolved send.
+fn canSend(k: *const MConn, side: u1) bool {
+    const e = k.ends[side];
+    return e.open and !e.fin_out and !e.reset_received and !e.rst_sent and e.failed == null and e.send == null;
+}
+
+/// No model rule matches either direction of `k`, and neither holds.
+fn quietConn(k: *const MConn) bool {
+    for (0..2) |dd| {
+        const d: u1 = @intCast(dd);
+        const fp, const tp = ports(k, d);
+        for (M.rules[0..M.n_rules]) |r| {
+            if (ruleMatches(r, fp, tp)) return false;
+        }
+        if (k.held[d].items.len > 0) return false;
+    }
+    return true;
+}
+
+/// Polls until `done` holds or the clock reaches `t` (bounded by time, as
+/// a poll stops at every landing).
+fn pollUntil(t: u64, comptime done: fn () bool) void {
+    var n: usize = 0;
+    while (!done() and now() < t) : (n += 1) {
+        if (n > 100_000) fail("pollUntil did not reach {d} ns", .{t});
+        pollOnce(t - now());
+    }
+}
+
+var train_ci: u8 = 0;
+var train_dir: u1 = 0;
+fn trainHeld() bool {
+    return M.conns[train_ci].held[train_dir].items.len > 0;
+}
+
+/// A long train of small fixed chunks in one direction, a partition of
+/// that direction at once, and a poll to the train's first landing: the
+/// first chunk is held and the rest pulled (design 17.9 item 2). Half the
+/// time the other direction first gets a train of its own, under a delay
+/// rule half of those times. Then one of: the clear soon after (a release
+/// right after a pull), an abort of the sender and the clear, a send in
+/// the other direction with its delay rule cleared, or nothing.
+fn stepTrain() bool {
+    if (M.n_rules + 2 > max_model_rules or M.rule_keys + 2 > max_rule_keys) return skip(.rule_limit);
+    var cand: [2 * max_conns]struct { u8, u1 } = undefined;
+    var n: usize = 0;
+    for (&M.conns, 0..) |*k, ci| {
+        if (!k.used or !k.ends[0].open or !k.ends[1].open or !quietConn(k)) continue;
+        for (0..2) |side| {
+            const d: u1 = @intCast(side);
+            if (!canSend(k, d)) continue;
+            // A window change needs the other sender's send not woken.
+            if (k.ends[other(d)].send) |i| {
+                if (M.slots[i].state == .woken) continue;
+            }
+            cand[n] = .{ @intCast(ci), d };
+            n += 1;
+        }
+    }
+    if (n == 0) return skip(.no_train_shape);
+    const ci, const d = cand[rand(n)];
+    const k = &M.conns[ci];
+    const r = other(d);
+    // `.fixed` needs both windows at 16 KiB or less; a long train needs
+    // room in d's.
+    for (0..2) |side| {
+        const x: u1 = @intCast(side);
+        const w = k.dirs[other(x)].window;
+        if (w < 4097 or w > 16384) applyWindow(ci, x, @intCast(4097 + rand(12288)));
+    }
+    const chunk: usize = 1 + rand(7);
+    const mode: sim.ChunkMode = .{ .fixed = @intCast(chunk) };
+    sim.setStreamChunking(k.ends[0].fd, mode);
+    k.chunking = mode;
+    const then = rand(4);
+    const fp, const tp = ports(k, d);
+    var reverse_delay = false;
+    if (chance(50) and canSend(k, r)) {
+        if (chance(50)) {
+            const delay = (150 + rand(250)) * us;
+            sim.setImpairment(tcpPath(tp, fp), .{ .delay_ns = delay, .jitter_ns = 0 });
+            addModelRule(.{ .kind = .impairment, .from = tp, .to = fp, .delay = delay, .jitter = 0 });
+            reverse_delay = true;
+        }
+        submit(.send, ci, r, 1 + rand(600));
+    }
+    // 150 to 649 chunks: more than L / 1 µs, so the train's tail lands
+    // more than L after its head, and a release at the pull is before it.
+    submit(.send, ci, d, @min(buf_cap, chunk * (150 + rand(500))));
+    pollOnce(0);
+    sim.setPartition(tcpPath(fp, tp));
+    addModelRule(.{ .kind = .partition, .from = fp, .to = tp });
+    train_ci = ci;
+    train_dir = d;
+    pollUntil(now() + 2 * L, trainHeld);
+    if (trainHeld()) M.c.train_pulls += 1;
+    switch (then) {
+        0 => {
+            if (chance(50)) pollOnce(rand(60) * us);
+            if (findModelRule(.partition, fp, tp)) |i| clearRule(i);
+        },
+        1 => {
+            if (k.ends[d].open) closeSide(ci, d, true);
+            if (findModelRule(.partition, fp, tp)) |i| clearRule(i);
+        },
+        2 => {
+            if (reverse_delay) {
+                if (findModelRule(.impairment, tp, fp)) |i| clearRule(i);
+            }
+            if (canSend(k, r)) submit(.send, ci, r, 1 + rand(16));
+            pollOnce(0);
+        },
+        else => {},
+    }
+    return true;
+}
+
+fn never() bool {
+    return false;
+}
+
+/// An older credit that reaches the held list after a newer one (the
+/// outside review of slice 3, first P2). The receiver x gets two bytes or
+/// more (its peer sends them when it has none), reads one, and the credit
+/// leaves under a delay of more than 2L; the credit's direction is
+/// partitioned; one L later x reads again, and that newer credit is held
+/// at its send; the older one is held at its landing after it.
+fn stepLateCredit() bool {
+    if (M.n_rules + 2 > max_model_rules or M.rule_keys + 2 > max_rule_keys) return skip(.rule_limit);
+    var cand: [2 * max_conns]struct { u8, u1 } = undefined;
+    var n: usize = 0;
+    for (&M.conns, 0..) |*k, ci| {
+        if (!k.used or !k.ends[0].open or !k.ends[1].open or !quietConn(k)) continue;
+        for (0..2) |side| {
+            const x: u1 = @intCast(side);
+            const e = &k.ends[x];
+            if (e.recv != null or e.shut_rd or e.reset_received or e.failed != null or dirTerminal(k, other(x))) continue;
+            if (e.unread.items.len < 2 and !(canSend(k, other(x)) and k.dirs[other(x)].room() >= 2)) continue;
+            cand[n] = .{ @intCast(ci), x };
+            n += 1;
+        }
+    }
+    if (n == 0) return skip(.no_late_credit_shape);
+    const ci, const x = cand[rand(n)];
+    const k = &M.conns[ci];
+    lc_ci = ci;
+    lc_x = x;
+    if (k.ends[x].unread.items.len < 2) {
+        submit(.send, ci, other(x), 2 + rand(15));
+        pollOnce(0);
+        pollUntil(now() + 2 * L + 20 * us, lcReady);
+    }
+    // The pacing: a credit may leave at once.
+    const dd = &k.dirs[other(x)];
+    if (dd.owed_at) |t| pollUntil(t, lcOwedGone);
+    if (dd.last_credit_at) |t| pollUntil(t + L, never);
+    if (!lcReady() or dd.owed_at != null or !k.ends[other(x)].open or dirTerminal(k, other(x))) return true;
+    // Credits for the data toward x leave from x.
+    const fp, const tp = ports(k, x);
+    const delay = (2 * L / us + 50 + rand(200)) * us;
+    sim.setImpairment(tcpPath(fp, tp), .{ .delay_ns = delay, .jitter_ns = 0 });
+    addModelRule(.{ .kind = .impairment, .from = fp, .to = tp, .delay = delay, .jitter = 0 });
+    submit(.recv, ci, x, 1);
+    pollOnce(0);
+    sim.setPartition(tcpPath(fp, tp));
+    addModelRule(.{ .kind = .partition, .from = fp, .to = tp });
+    pollUntil(now() + L, never);
+    const e = &k.ends[x];
+    if (e.open and e.recv == null and e.unread.items.len > 0) {
+        submit(.recv, ci, x, 1);
+        pollOnce(0);
+        M.c.late_credit_setups += 1;
+    }
+    return true;
+}
+
+var lc_ci: u8 = 0;
+var lc_x: u1 = 0;
+/// x is open, with no receive, and two bytes or more unread.
+fn lcReady() bool {
+    const e = &M.conns[lc_ci].ends[lc_x];
+    return e.open and e.recv == null and !e.shut_rd and e.unread.items.len >= 2;
+}
+fn lcOwedGone() bool {
+    return M.conns[lc_ci].dirs[other(lc_x)].owed_at == null;
+}
+
 fn shutdown(how: os_net.ShutdownHow) bool {
     const ci, const side = pickEnd() orelse return skip(.no_endpoint);
     const k = &M.conns[ci];
@@ -1745,6 +2024,12 @@ fn shutdown(how: os_net.ShutdownHow) bool {
 
 fn close(abortive: bool) bool {
     const ci, const side = pickEnd() orelse return skip(.no_endpoint);
+    closeSide(ci, side, abortive);
+    return true;
+}
+
+/// A close step on (`ci`, `side`), which is open.
+fn closeSide(ci: u8, side: u1, abortive: bool) void {
     const k = &M.conns[ci];
     const e = &k.ends[side];
     if (abortive) {
@@ -1775,13 +2060,11 @@ fn close(abortive: bool) bool {
     var op = ev.NetClose.init(e.fd);
     runOp(&op.c, 0, 1);
     op.getResult() catch |err| fail("close: {t}", .{err});
-    return true;
 }
 
 fn stepWindow() bool {
     const ci, const side = pickEnd() orelse return skip(.no_endpoint);
     const k = &M.conns[ci];
-    const d = &k.dirs[other(side)];
     // Refused while the sender's send is woken and not yet harvested (a
     // refusal test has that case).
     if (k.ends[other(side)].send) |i| {
@@ -1793,12 +2076,19 @@ fn stepWindow() bool {
         2 => @intCast(4097 + rand(12288)),
         else => if (k.chunking == .fixed) return skip(.fixed_window) else sim.default_stream_window,
     };
+    applyWindow(ci, side, w);
+    return true;
+}
+
+/// Sets the window toward (`ci`, `side`): its sender's send is not woken.
+fn applyWindow(ci: u8, side: u1, w: u32) void {
+    const k = &M.conns[ci];
+    const d = &k.dirs[other(side)];
     sim.setStreamWindow(k.ends[side].fd, w);
     const used = d.admitted - d.credited;
     if (used > w) M.c.shrink_below_use += 1;
     d.window = w;
     if (k.ends[other(side)].open and d.room() > 0) wakeSend(ci, other(side), .grow);
-    return true;
 }
 
 fn stepChunking() bool {
@@ -1948,11 +2238,13 @@ fn runStep(kind: StepKind) bool {
         .delay => stepDelay(),
         .clear_rule => stepClearRule(),
         .fail => stepFail(),
+        .train => stepTrain(),
+        .late_credit => stepLateCredit(),
     };
 }
 
 fn pickStep() StepKind {
-    const weights = if (M.faults) &fault_weights else &step_weights;
+    const weights = if (M.pull) &pull_weights else if (M.faults) &fault_weights else &step_weights;
     var total: u32 = 0;
     for (weights) |w| total += w;
     var r = M.rng.random().uintLessThan(u32, total);
@@ -2036,14 +2328,30 @@ fn checkState() void {
     const nd = sim.testTcpEntries(false, &entry_buf);
     if (nd != M.wire.items.len) fail("TCP entries on the wire: sim {d}, model {d}", .{ nd, M.wire.items.len });
     for (M.wire.items, entry_buf[0..nd], 0..) |w, t, i| {
+        if (!sameEntry(w, t)) wireTimesByIdentity(nd);
         if (!sameEntry(w, t)) fail("wire entry {d}: sim has connection {d} direction {d} {t} sequence {d} count {d} length {d}, model connection {d} direction {d} {t} sequence {d} count {d} length {d}", .{ i, t.conn_id, @intFromBool(!t.from_client), t.kind, t.seq, t.count, t.len, w.conn_id, w.dir, w.kind, w.seq, w.count, w.bytes.len });
         if (w.due != t.due_at) fail("wire entry {d} (connection {d}, direction {d}, {t}, sequence {d}): sim lands it at {d} ns, model at {d} ns", .{ i, w.conn_id, w.dir, w.kind, w.seq, t.due_at, w.due });
     }
     checkStats();
 }
 
-var entry_buf: [8192]sim.TestTcpEntry = undefined;
-var held_buf: [8192]sim.TestTcpEntry = undefined;
+/// On a wire whose order differs: the wire is in landing order, so an
+/// entry the sim lands at another time than the model shows first as two
+/// different entries at one index. Find each sim entry's model entry by
+/// what it is, and fail naming both landing times, before the order check
+/// names only the identities.
+fn wireTimesByIdentity(nd: usize) void {
+    for (entry_buf[0..nd]) |t| {
+        for (M.wire.items) |w| {
+            if (!sameEntry(w, t)) continue;
+            if (w.due != t.due_at) fail("wire entry (connection {d}, direction {d}, {t}, sequence {d}): sim lands it at {d} ns, model at {d} ns (found by what it is: the wire's order differs)", .{ w.conn_id, w.dir, w.kind, w.seq, t.due_at, w.due });
+            break;
+        }
+    }
+}
+
+var entry_buf: [32768]sim.TestTcpEntry = undefined;
+var held_buf: [32768]sim.TestTcpEntry = undefined;
 
 fn sameEntry(w: MEntry, t: sim.TestTcpEntry) bool {
     return w.conn_id == t.conn_id and w.dir == @intFromBool(!t.from_client) and w.seq == t.seq and std.mem.eql(u8, @tagName(w.kind), @tagName(t.kind)) and w.count == t.count and w.bytes.len == t.len;
@@ -2262,6 +2570,7 @@ fn runSeed(seed_value: u64, steps: usize, profile: Profile, child: bool) Counts 
     M.rule_keys = 0;
     M.draws = 0;
     M.faults = seed_value > n_seeds;
+    M.pull = seed_value > 2 * n_seeds;
     M.fail_both_now = false;
 
     sim.begin(seed_value);
@@ -2322,6 +2631,7 @@ fn printCounts(c: Counts, profile: Profile, seeds: usize, steps: usize) void {
     }
     std.debug.print("  skips: no endpoint {d}, op unresolved {d}, no parked op {d}, connection limit {d}, .fixed with a large window {d}, no owed_close shape {d}\n", .{ c.skip_no_endpoint, c.skip_unresolved, c.skip_no_parked, c.skip_conn_limit, c.skip_fixed_window, c.skip_no_owed_shape });
     std.debug.print("  fault skips: rule limit {d}, rule exists {d}, no rule {d}, no failStream target {d}\n", .{ c.skip_rule_limit, c.skip_rule_exists, c.skip_no_rule, c.skip_no_fail_target });
+    std.debug.print("  pull skips: no train shape {d}, no late_credit shape {d}\n", .{ c.skip_no_train_shape, c.skip_no_late_credit_shape });
     inline for (fault_floor_names) |name| std.debug.print("  {s}: {d}\n", .{ name, @field(c, name) });
     const info = @typeInfo(Counts).@"struct";
     inline for (info.field_names, info.field_types) |name, T| {
@@ -2345,6 +2655,12 @@ const fault_floor_names = .{
     "fail_held_credit",
 };
 
+/// The pull seeds' cases (t-4148, t-4154). Each needs `pull_floor_min`
+/// over a profile's seeds, not only 1: a case that a floor of 1 lets
+/// through once per profile is one generator change away from 0.
+const pull_floor_names = .{ "pull_release", "pull_abort_release", "clamp_after_other_hold", "older_credit_after_newer" };
+const pull_floor_min = 10;
+
 fn floors(c: Counts, profile: Profile) void {
     // Every zero count is printed before the child fails, so one run names
     // them all (a mutant that zeroes several counts shows each floor).
@@ -2355,7 +2671,13 @@ fn floors(c: Counts, profile: Profile) void {
             zero += 1;
         }
     }
-    if (zero != 0) fail("{d} of slice 3's counts are 0 over the seeds of profile {t} (listed above)", .{ zero, profile });
+    inline for (pull_floor_names) |name| {
+        if (@field(c, name) < pull_floor_min) {
+            std.debug.print("stream model: count {s} is {d} over the seeds of profile {t}, under {d}: the run did not test it enough\n", .{ name, @field(c, name), profile, pull_floor_min });
+            zero += 1;
+        }
+    }
+    if (zero != 0) fail("{d} of slice 3's counts are 0, or under their floor, over the seeds of profile {t} (listed above)", .{ zero, profile });
     const req = .{
         "send_admitted",    "send_partial",     "send_zero",     "send_parked",      "send_epipe",       "send_reset",
         "recv_data",        "recv_eof",         "recv_reset",    "recv_parked",      "closed_op",        "cancel_recv",
@@ -2407,8 +2729,8 @@ test "sim: stream op model: connections under random sends, receives, shutdowns,
         sim.childDone(child_name);
         return;
     }
-    for (1..2 * n_seeds + 1) |s| total.add(runSeed(s, steps, profile, true));
-    printCounts(total, profile, 2 * n_seeds, steps);
+    for (1..all_seeds + 1) |s| total.add(runSeed(s, steps, profile, true));
+    printCounts(total, profile, all_seeds, steps);
     if (std.c.getenv("ZIO_STREAM_MODEL_STEPS") == null) floors(total, profile);
     sim.childDone(child_name);
 }

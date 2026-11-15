@@ -493,6 +493,56 @@ test "sim: stream faults: a release, or an abort's RST, right after a pull lands
     }
 }
 
+/// t-4154: the pull resets the fence of the held direction only. The other
+/// direction keeps its entries on the wire, and a later send there lands
+/// behind them even with a smaller extra time (17.7's order rule).
+const other_fence = struct {
+    const D: u64 = 300_000;
+
+    fn body() !void {
+        const srv, const c, const s = try pair();
+        sim.setStreamChunking(c.socket.handle, .{ .fixed = 1 });
+        // Server to client: one byte under a delay, landing at t0 + L + D.
+        sim.setImpairment(s2c, .{ .delay_ns = D });
+        const t0 = sim.clockNs();
+        try expectEqual(@as(usize, 1), try s.write("x", .none));
+        // Client to server: two chunks; a partition from t0 + L/2 holds the
+        // first at its landing and pulls the second.
+        try expectEqual(@as(usize, 2), try c.write("ab", .none));
+        try sleepUntil(t0 + L / 2);
+        sim.setPartition(c2s);
+        try sleepUntil(t0 + L);
+        try expectEqual(@as(u32, 2), (try dir(true)).held_entries);
+        try expectEqual(@as(u64, 1), sim.streamStats().held_behind);
+        // With the delay gone, a send's own time is t0 + 2L, but the
+        // delayed byte is still on the wire: the new one lands behind it.
+        try expectEqual(@as(u64, 1), sim.clearImpairment(s2c).delayed);
+        try expectEqual(@as(usize, 1), try s.write("y", .none));
+        var e: [2]sim.TestTcpEntry = undefined;
+        try expectEqual(@as(usize, 2), sim.testTcpEntries(false, &e));
+        for (e, 0..) |x, k| {
+            try expect(!x.from_client);
+            try expectEqual(@as(u64, k), x.seq - e[0].seq);
+            try expectEqual(t0 + L + D, x.due_at);
+        }
+        // What the client reads: nothing at t0 + 2L, then "xy" in order.
+        try sleepUntil(t0 + 2 * L);
+        try expectEqual(@as(usize, 0), unread(c));
+        try sleepUntil(t0 + L + D);
+        var got: [2]u8 = undefined;
+        try expectEqual(@as(usize, 2), try c.read(&got, .none));
+        try expect(std.mem.eql(u8, "xy", &got));
+        _ = sim.healPartition(c2s);
+        try t1.closeAll3(c, s, srv);
+    }
+};
+
+test "sim: stream faults: a hold at its landing with a pull in one direction leaves the other direction's fence: a later send there with a smaller extra time lands behind its delayed entry" {
+    if (comptime skip) return error.SkipZigTest;
+    try run(1, .linux, other_fence.body);
+    try run(1, .macos, other_fence.body);
+}
+
 test "sim: stream faults: a partition and a delay over one entry: the clear of the partition releases it, and it lands L plus its delay after the release" {
     if (comptime skip) return error.SkipZigTest;
     try run(1, .linux, partition_and_delay.body);
