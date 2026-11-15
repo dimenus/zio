@@ -403,7 +403,12 @@ fn resetIo() void {
 
 pub fn end() void {
     refuseOtherThread("sim.end");
+    // A run that asked for it lists its open datagram sockets first, so a
+    // run that also leaves stream objects shows both before either check
+    // panics.
+    const dgrams_open = if (refuse_open_dgrams) dgramTeardownList() else 0;
     if (stream_used) streamTeardownCheck();
+    if (dgrams_open != 0) panic("sim: datagram teardown: {d} datagram sockets are open at sim.end (listed above), in a run that called sim.refuseOpenDatagramsAtEnd(): close every datagram socket before sim.end", .{dgrams_open});
     freeNet();
     restoreFdNamespace();
     sim_thread.store(0, .release);
@@ -1543,8 +1548,52 @@ fn resetNet() void {
     rule_history_len = 0;
     udp_rule_set = false;
     tcp_rule_set = false;
+    refuse_open_dgrams = false;
     fault_stats = .{};
     fault_draws = 0;
+}
+
+/// Whether `end` refuses this run's open datagram sockets
+/// (`refuseOpenDatagramsAtEnd`). `begin` clears it.
+var refuse_open_dgrams: bool = false;
+
+/// Makes `end` refuse this run if a datagram socket is still open: it lists
+/// each one's fd and panics, as it does for stream objects, so a program
+/// that forgets a close (for example, destroys an ENet host without closing
+/// its socket) fails its test instead of passing. For this run only;
+/// `begin` clears it. Without it, `end` frees open datagram sockets
+/// silently, as it always has.
+///
+/// A named opt-in, not the default (t-4138, sitting 33): at this commit 157
+/// runs of zio's own sim suite (about 78 tests, most through the `dg.run`
+/// harness) end with a datagram socket open, and making the refusal the
+/// default needs those tests fixed first, and starh2's runs checked.
+pub fn refuseOpenDatagramsAtEnd() void {
+    if (comptime !compiled_in) return;
+    refuseOtherThread("sim.refuseOpenDatagramsAtEnd");
+    if (!begun) panic("sim: refuseOpenDatagramsAtEnd outside a sim run", .{});
+    refuse_open_dgrams = true;
+}
+
+/// Datagram sockets open now in this run (t-4136): a consumer can check
+/// them before `end` and word its own failure. 0 outside a run.
+pub fn datagramSocketsOpen() usize {
+    if (comptime !compiled_in) return 0;
+    if (!begun) return 0;
+    var n: usize = 0;
+    for (dgrams) |d| n += @intFromBool(d.used);
+    return n;
+}
+
+/// Prints one line per datagram socket still open, and returns how many.
+fn dgramTeardownList() usize {
+    var n: usize = 0;
+    for (dgrams, 0..) |d, i| {
+        if (!d.used) continue;
+        n += 1;
+        std.debug.print("sim: datagram teardown: sim fd {d} is an open datagram socket\n", .{fd_base + max_ends + @as(i32, @intCast(i))});
+    }
+    return n;
 }
 
 /// Frees every socket and every datagram still on the wire, at `end`.
@@ -9607,6 +9656,56 @@ test "sim: refuses a loop of a second loop group polling in one run, which would
     try refusal("sim: refuses a loop of a second loop group polling in one run, which would take a pipe op submitted on the first", "sim: a sim run has one loop group", struct {
         fn body() !void {
             try two_groups.run(true);
+        }
+    }.body);
+}
+
+test "sim: dgram: datagramSocketsOpen counts this run's open datagram sockets, 0 outside a run (t-4136)" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(usize, 0), datagramSocketsOpen());
+    try dg.run(1, struct {
+        fn body() !void {
+            try std.testing.expectEqual(@as(usize, 0), datagramSocketsOpen());
+            const a = try dg.open();
+            const b = try dg.open();
+            try std.testing.expectEqual(@as(usize, 2), datagramSocketsOpen());
+            dg.os_net.close(a);
+            try std.testing.expectEqual(@as(usize, 1), datagramSocketsOpen());
+            dg.os_net.close(b);
+            try std.testing.expectEqual(@as(usize, 0), datagramSocketsOpen());
+        }
+    }.body);
+    try std.testing.expectEqual(@as(usize, 0), datagramSocketsOpen());
+}
+
+test "sim: dgram: a run that called refuseOpenDatagramsAtEnd and closed its sockets ends normally, and the next run, which did not call it, may leave one open (t-4138)" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            refuseOpenDatagramsAtEnd();
+            const a = try dg.open();
+            dg.os_net.close(a);
+        }
+    }.body);
+    try dg.run(1, struct {
+        fn body() !void {
+            _ = try dg.open();
+        }
+    }.body);
+}
+
+test "sim: dgram refuses: sim.end in a run that called refuseOpenDatagramsAtEnd, with a datagram socket open (t-4138)" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: sim.end in a run that called refuseOpenDatagramsAtEnd", "sim: datagram teardown: 1 datagram sockets are open at sim.end (listed above), in a run that called sim.refuseOpenDatagramsAtEnd(): close every datagram socket before sim.end", struct {
+        fn body() !void {
+            try dg.run(1, struct {
+                fn inner() !void {
+                    refuseOpenDatagramsAtEnd();
+                    const a = try dg.open();
+                    _ = try dg.open();
+                    dg.os_net.close(a);
+                }
+            }.inner);
         }
     }.body);
 }
