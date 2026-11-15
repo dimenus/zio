@@ -403,12 +403,11 @@ fn resetIo() void {
 
 pub fn end() void {
     refuseOtherThread("sim.end");
-    // A run that asked for it lists its open datagram sockets first, so a
-    // run that also leaves stream objects shows both before either check
-    // panics.
-    const dgrams_open = if (refuse_open_dgrams) dgramTeardownList() else 0;
+    // Open datagram sockets are listed first, so a run that also leaves
+    // stream objects shows both before either check panics.
+    const dgrams_open = dgramTeardownList();
     if (stream_used) streamTeardownCheck();
-    if (dgrams_open != 0) panic("sim: datagram teardown: {d} datagram sockets are open at sim.end (listed above), in a run that called sim.refuseOpenDatagramsAtEnd(): close every datagram socket before sim.end", .{dgrams_open});
+    if (dgrams_open != 0) panic("sim: datagram teardown: {d} datagram sockets are open at sim.end (listed above): close every datagram socket before sim.end", .{dgrams_open});
     freeNet();
     restoreFdNamespace();
     sim_thread.store(0, .release);
@@ -1548,35 +1547,23 @@ fn resetNet() void {
     rule_history_len = 0;
     udp_rule_set = false;
     tcp_rule_set = false;
-    refuse_open_dgrams = false;
     fault_stats = .{};
     fault_draws = 0;
 }
 
-/// Whether `end` refuses this run's open datagram sockets
-/// (`refuseOpenDatagramsAtEnd`). `begin` clears it.
-var refuse_open_dgrams: bool = false;
-
-/// Makes `end` refuse this run if a datagram socket is still open: it lists
-/// each one's fd and panics, as it does for stream objects, so a program
-/// that forgets a close (for example, destroys an ENet host without closing
-/// its socket) fails its test instead of passing. For this run only;
-/// `begin` clears it. Without it, `end` frees open datagram sockets
-/// silently, as it always has.
-///
-/// A named opt-in, not the default (t-4138, sitting 33): at this commit 157
-/// runs of zio's own sim suite (about 78 tests, most through the `dg.run`
-/// harness) end with a datagram socket open, and making the refusal the
-/// default needs those tests fixed first, and starh2's runs checked.
-pub fn refuseOpenDatagramsAtEnd() void {
-    if (comptime !compiled_in) return;
-    refuseOtherThread("sim.refuseOpenDatagramsAtEnd");
-    if (!begun) panic("sim: refuseOpenDatagramsAtEnd outside a sim run", .{});
-    refuse_open_dgrams = true;
-}
-
 /// Datagram sockets open now in this run (t-4136): a consumer can check
 /// them before `end` and word its own failure. 0 outside a run.
+///
+/// `end` refuses a run that leaves one open (t-4142): it lists each one's
+/// fd (`sim: datagram teardown: sim fd N is an open datagram socket`) and
+/// panics, as it does for stream objects, so a program that forgets a
+/// close (for example, destroys an ENet host without closing its socket)
+/// fails its test instead of passing. Close each socket before `end`. The
+/// layer's close (`os_net.close`, which calls `dgramClose`) draws nothing
+/// from the run's RNG and does not move the clock, and on a socket with no
+/// parked op it records nothing in the trace or the wire digest (a parked
+/// op would complete, which the trace records). So a test that closes its
+/// idle sockets after its last digest read keeps every digest it records.
 pub fn datagramSocketsOpen() usize {
     if (comptime !compiled_in) return 0;
     if (!begun) return 0;
@@ -5690,11 +5677,20 @@ fn runPanicChild(comptime test_name: []const u8, comptime want: []const u8) !u64
 /// Whether a line of `stderr` is the panic itself saying `want`: the line
 /// `refuse` writes, or `thread <n> panic: <want>`. A plain substring match is
 /// not enough: a panic's stack trace prints source lines, and the test's own
-/// line holds `want` as a literal, so any other panic would match it.
+/// line holds `want` as a literal, so any other panic would match it. A line
+/// may start with the test runner's progress clear (`\r` and `ESC [0K`),
+/// which the child's first line of stderr carries; it is skipped.
 pub fn hasPanicLine(stderr: []const u8, want: []const u8) bool {
     var it = std.mem.splitScalar(u8, stderr, '\n');
     while (it.next()) |raw| {
         var line = raw;
+        while (true) {
+            if (std.mem.startsWith(u8, line, "\r")) {
+                line = line[1..];
+            } else if (std.mem.startsWith(u8, line, "\x1b[0K")) {
+                line = line[4..];
+            } else break;
+        }
         if (std.mem.startsWith(u8, line, "thread ")) {
             const at = std.mem.indexOf(u8, line, " panic: ") orelse continue;
             line = line[at + " panic: ".len ..];
@@ -5709,6 +5705,8 @@ test "sim: hasPanicLine matches the panic, not a source line in its trace" {
     try std.testing.expect(hasPanicLine("thread 7 panic: sim: Event.set from a thread that is not\n", want));
     try std.testing.expect(hasPanicLine("x\nsim: Event.set from a thread that is not SEED=1\n", want));
     try std.testing.expect(!hasPanicLine("thread 7 panic: sim: deadlock clock_ns=0\n    try refusal(\"t\", \"sim: Event.set from a thread\", struct {\n", want));
+    // The child's first line, after the runner's progress clear.
+    try std.testing.expect(hasPanicLine("\r\x1b[0Ksim: Event.set from a thread that is not\n", want));
 }
 
 const death = struct {
@@ -7582,11 +7580,15 @@ test "sim: dgram: port 0 gives 49152, 49153, 49154 in every run" {
     const T = struct {
         var ports: [3]u16 = undefined;
         fn body() !void {
-            for (&ports) |*p| {
-                const fd = try dg.open();
-                try dg.bindTo(fd, dg.addr(127, 0, 0, 1, 0));
-                p.* = (try dg.local(fd)).port;
+            // All three stay open to the end: a closed one would free its
+            // port for the next.
+            var fds: [3]i32 = undefined;
+            for (&ports, &fds) |*p, *fd| {
+                fd.* = try dg.open();
+                try dg.bindTo(fd.*, dg.addr(127, 0, 0, 1, 0));
+                p.* = (try dg.local(fd.*)).port;
             }
+            for (fds) |fd| dg.os_net.close(fd);
         }
     };
     var seed_value: u64 = 1;
@@ -7603,7 +7605,9 @@ test "sim: dgram: a bind conflict is AddressInUse, for an equal address and acro
         fn body() !void {
             const a = try dg.open();
             const b = try dg.open();
+            defer dg.os_net.close(b);
             const c = try dg.open();
+            defer dg.os_net.close(c);
             try dg.bindTo(a, dg.addr(127, 0, 0, 1, 5000));
             try std.testing.expectError(error.AddressInUse, dg.bindTo(b, dg.addr(127, 0, 0, 1, 5000)));
             try std.testing.expectError(error.AddressInUse, dg.bindTo(b, dg.addr(0, 0, 0, 0, 5000)));
@@ -7611,14 +7615,17 @@ test "sim: dgram: a bind conflict is AddressInUse, for an equal address and acro
             try dg.bindTo(b, dg.addr(127, 0, 0, 2, 5000));
             try dg.bindTo(c, dg.addr(0, 0, 0, 0, 6000));
             const d = try dg.open();
+            defer dg.os_net.close(d);
             try std.testing.expectError(error.AddressInUse, dg.bindTo(d, dg.addr(127, 0, 0, 9, 6000)));
             // Closing frees the port.
             dg.os_net.close(a);
             try dg.bindTo(d, dg.addr(127, 0, 0, 1, 5000));
             // Port 0 skips a port that is taken.
             const e = try dg.open();
+            defer dg.os_net.close(e);
             try dg.bindTo(e, dg.addr(127, 0, 0, 1, 49152));
             const f = try dg.open();
+            defer dg.os_net.close(f);
             try dg.bindTo(f, dg.addr(127, 0, 0, 1, 0));
             try std.testing.expectEqual(@as(u16, 49153), (try dg.local(f)).port);
         }
@@ -7630,7 +7637,9 @@ test "sim: dgram: a wildcard receiver gets the destination address, a reply from
     try dg.run(1, struct {
         fn body() !void {
             const server = try dg.open();
+            defer dg.os_net.close(server);
             const client = try dg.open();
+            defer dg.os_net.close(client);
             try dg.bindTo(server, dg.addr(0, 0, 0, 0, 7000));
             try dg.os_net.enableDestinationAddress(server);
             try dg.bindTo(client, dg.addr(127, 0, 0, 1, 0));
@@ -7668,14 +7677,17 @@ test "sim: dgram: non-blocking state is stored and read back, an empty receive w
     try dg.run(1, struct {
         fn body() !void {
             const blocking = try dg.os_net.socket(.ipv4, .dgram, .udp, .{ .nonblocking = false });
+            defer dg.os_net.close(blocking);
             try std.testing.expect(!try dg.os_net.isNonBlocking(blocking));
             try dg.os_net.setNonBlocking(blocking, true);
             try std.testing.expect(try dg.os_net.isNonBlocking(blocking));
             try dg.os_net.setNonBlocking(blocking, false);
             try std.testing.expect(!try dg.os_net.isNonBlocking(blocking));
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             try std.testing.expect(try dg.os_net.isNonBlocking(rx));
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
             var buf: [4]u8 = undefined;
             // Empty: WouldBlock, from the socket's mode alone (no dontwait).
@@ -7715,7 +7727,9 @@ test "sim: dgram: the default byte budget drops by bytes, counted, and a datagra
     try dg.run(1, struct {
         fn body() !void {
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
             // Each empty datagram costs `datagram_overhead` bytes: the budget
             // holds 832 of them, under the 1024-packet limit.
@@ -7750,8 +7764,11 @@ const dg_order = struct {
     /// logical time; the receiver logs the payloads in arrival order.
     fn body() !void {
         const rx = try dg.open();
+        defer dg.os_net.close(rx);
         const a = try dg.open();
+        defer dg.os_net.close(a);
         const b = try dg.open();
+        defer dg.os_net.close(b);
         try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
         const to = dg.addr(127, 0, 0, 1, 49152);
         for ([_][]const u8{ "a", "b", "c" }) |p| _ = try dg.sendFrom(a, to, null, p);
@@ -7819,7 +7836,9 @@ test "sim: dgram: an empty datagram queued while the ring empties does not make 
     try dg.run(1, struct {
         fn body() !void {
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
             const to = dg.addr(127, 0, 0, 1, (try dg.local(rx)).port);
             var buf: [4]u8 = undefined;
@@ -8249,9 +8268,11 @@ test "sim: dgram ev: a receive parked on a socket that is closed and whose numbe
             try dg.rt_mod.sleep(.fromNanoseconds(1));
             dg.os_net.close(rx);
             const nx = try dg.open();
+            defer dg.os_net.close(nx);
             try std.testing.expectEqual(rx, nx);
             try dg.bindTo(nx, dg.addr(127, 0, 0, 1, 0));
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, (try dg.local(nx)).port), null, "new");
             try dg.settle();
             try std.testing.expectError(error.FileDescriptorNotASocket, h.join());
@@ -8267,11 +8288,13 @@ test "sim: dgram: a closed fd number is reused by the next open, which does not 
         fn body() !void {
             const rx = try dg.open();
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
             _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 49152), null, "old");
             try dg.settle();
             dg.os_net.close(rx);
             const again = try dg.open();
+            defer dg.os_net.close(again);
             try std.testing.expectEqual(rx, again);
             try std.testing.expectEqual(Ip4{ .ip = .{ 0, 0, 0, 0 }, .port = 0 }, try dg.local(again));
             try dg.bindTo(again, dg.addr(127, 0, 0, 1, 49152));
@@ -8282,13 +8305,18 @@ test "sim: dgram: a closed fd number is reused by the next open, which does not 
     }.body);
 }
 
-test "sim: dgram: end frees every socket and every datagram on the wire, so the next run starts empty" {
+test "sim: dgram: end frees every datagram still on the wire, so the next run starts empty" {
     if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
     const T = struct {
         var first_fd: i32 = 0;
+        // The sockets close at the end of the run's body, as `end` requires
+        // (t-4142); the close drops the queued datagram, and `end` frees the
+        // one still on the wire.
         fn leave() !void {
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             first_fd = rx;
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
             _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 49152), null, "queued");
@@ -8298,6 +8326,7 @@ test "sim: dgram: end frees every socket and every datagram on the wire, so the 
         }
         fn fresh() !void {
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             try std.testing.expectEqual(first_fd, fd);
             try dg.bindTo(fd, dg.addr(127, 0, 0, 1, 0));
             try std.testing.expectEqual(@as(u16, 49152), (try dg.local(fd)).port);
@@ -8336,6 +8365,7 @@ test "sim: dgram refuses: sendto with MSG_OOB" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
             const to = dg.addr(127, 0, 0, 1, 7000);
             _ = try dg.os_net.sendto(fd, &iov, .{ .oob = true }, @ptrCast(&to), @sizeOf(dg.os_net.sockaddr.in));
@@ -8349,6 +8379,7 @@ test "sim: dgram refuses: sendto with MSG_FASTOPEN" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
             const to = dg.addr(127, 0, 0, 1, 7000);
             _ = try dg.os_net.sendto(fd, &iov, .{ .fastopen = true }, @ptrCast(&to), @sizeOf(dg.os_net.sockaddr.in));
@@ -8362,6 +8393,7 @@ test "sim: dgram refuses: sendmsg with MSG_EOR" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
             const to = dg.addr(127, 0, 0, 1, 7000);
             _ = try dg.os_net.sendmsg(fd, &iov, .{ .eor = true }, @ptrCast(&to), @sizeOf(dg.os_net.sockaddr.in), null);
@@ -8375,6 +8407,7 @@ test "sim: dgram refuses: sendDatagram with MSG_DONTROUTE" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
             const to = dg.addr(127, 0, 0, 1, 7000);
             _ = try dg.os_net.sendDatagram(fd, &iov, .{ .dont_route = true }, &to, null);
@@ -8388,6 +8421,7 @@ test "sim: dgram refuses: sendDatagram with MSG_CONFIRM" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
             const to = dg.addr(127, 0, 0, 1, 7000);
             _ = try dg.os_net.sendDatagram(fd, &iov, .{ .confirm = true }, &to, null);
@@ -8428,6 +8462,7 @@ test "sim: dgram refuses: recvmsg without a control buffer on a socket that aske
             try dg.run(1, struct {
                 fn inner() !void {
                     const rx = try dg.open();
+                    defer dg.os_net.close(rx);
                     try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 7000));
                     try dg.os_net.enableDestinationAddress(rx);
                     _ = try dg.sendFrom(rx, dg.addr(127, 0, 0, 1, 7000), null, "x");
@@ -8448,6 +8483,7 @@ test "sim: dgram refuses: recvmsg with a control buffer on a socket that asked f
         fn body() !void {
             try r3.up();
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             try dg.os_net.enableDestinationAddress(rx);
             var buf: [4]u8 = undefined;
             var ctl: [64]u8 = undefined;
@@ -8487,6 +8523,7 @@ test "sim: dgram refuses: a send to a non-loopback address" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             _ = try dg.sendFrom(fd, dg.addr(10, 0, 0, 1, 9), null, "x");
         }
     }.body);
@@ -8498,6 +8535,7 @@ test "sim: dgram refuses: a bind to a non-loopback address" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             try dg.bindTo(fd, dg.addr(192, 168, 1, 1, 9));
         }
     }.body);
@@ -8509,6 +8547,7 @@ test "sim: dgram refuses: a datagram over 65507 bytes" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             const big = try std.heap.page_allocator.alloc(u8, 65508);
             _ = try dg.sendFrom(fd, dg.addr(127, 0, 0, 1, 9), null, big);
         }
@@ -8521,6 +8560,7 @@ test "sim: dgram refuses: a send to port 0" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             _ = try dg.sendFrom(fd, dg.addr(127, 0, 0, 1, 0), null, "x");
         }
     }.body);
@@ -8532,6 +8572,7 @@ test "sim: dgram refuses: a bind of a bound socket" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             try dg.bindTo(fd, dg.addr(127, 0, 0, 1, 0));
             try dg.bindTo(fd, dg.addr(127, 0, 0, 1, 0));
         }
@@ -8556,6 +8597,7 @@ test "sim: dgram refuses: connect on a datagram socket" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             const a = dg.addr(127, 0, 0, 1, 9);
             try dg.os_net.connect(fd, @ptrCast(&a), @sizeOf(dg.os_net.sockaddr.in));
         }
@@ -8568,6 +8610,7 @@ test "sim: dgram refuses: an IPv6 destination" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var a6: std.c.sockaddr.in6 = .{ .port = 0, .flowinfo = 0, .addr = @splat(0), .scope_id = 0 };
             var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
             _ = try dg.os_net.sendto(fd, &iov, .{}, @ptrCast(&a6), @sizeOf(std.c.sockaddr.in6));
@@ -8581,6 +8624,7 @@ test "sim: dgram refuses: MSG_PEEK" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var buf: [4]u8 = undefined;
             var iov = [1]dg.os_net.iovec{dg.os_net.iovecFromSlice(&buf)};
             _ = try dg.os_net.recvfrom(fd, &iov, .{ .peek = true }, null, null);
@@ -8697,6 +8741,7 @@ test "sim: dgram: a datagram in flight is I/O still to come: the clock reaches i
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             _ = try dg.sendFrom(fd, dg.addr(127, 0, 0, 1, 9), null, "x");
             var ev: @import("sync/Event.zig") = .init;
             try ev.wait();
@@ -8739,6 +8784,7 @@ test "sim: dgram ev: the layer sends two buffers to an ev receiver, and an ev se
             const ev_addr = try dg.evBind(ev_fd, dg.addr(127, 0, 0, 1, 0));
             try std.testing.expectEqual(Ip4{ .ip = .{ 127, 0, 0, 1 }, .port = 49152 }, ev_addr);
             const c_fd = try dg.open();
+            defer dg.os_net.close(c_fd);
             try dg.bindTo(c_fd, dg.addr(127, 0, 0, 1, 0));
             // Layer to ev.
             _ = try dg.sendTo(c_fd, dg.addr(127, 0, 0, 1, 49152), &.{ "hel", "lo" });
@@ -8766,7 +8812,9 @@ test "sim: dgram ev: poll with a zero timeout reports readable only once a datag
     try dg.run(1, struct {
         fn body() !void {
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
             const IN = dg.os_net.POLL.IN;
             const OUT = dg.os_net.POLL.OUT;
@@ -8812,7 +8860,9 @@ test "sim: dgram ev: a poll parked before the datagram is sent wakes when it lan
     try dg.run(1, struct {
         fn body() !void {
             dg_park.rx = try dg.open();
+            defer dg.os_net.close(dg_park.rx);
             dg_park.tx = try dg.open();
+            defer dg.os_net.close(dg_park.tx);
             try dg.bindTo(dg_park.rx, dg.addr(127, 0, 0, 1, 0));
             var round: usize = 0;
             while (round < 2) : (round += 1) {
@@ -8838,7 +8888,9 @@ test "sim: dgram ev: a parked receive that is canceled gives Canceled, and the n
     try dg.run(1, struct {
         fn body() !void {
             dg_park.rx = try dg.open();
+            defer dg.os_net.close(dg_park.rx);
             dg_park.tx = try dg.open();
+            defer dg.os_net.close(dg_park.tx);
             try dg.bindTo(dg_park.rx, dg.addr(127, 0, 0, 1, 0));
             var h = try dg.runtime.spawn(dg_park.recvThenRecord, .{});
             try dg.rt_mod.sleep(.fromMilliseconds(1));
@@ -9424,6 +9476,7 @@ test "sim: dgram ev: an ev receive with a datagram already queued and a poll for
     try dg.run(1, struct {
         fn body() !void {
             const rx = try dg.evOpen();
+            defer dg.os_net.close(rx);
             _ = try dg.evBind(rx, dg.addr(127, 0, 0, 1, 0));
             var buf: [4]u8 = undefined;
             var iov: [1]dg.os_net.iovec = undefined;
@@ -9431,6 +9484,7 @@ test "sim: dgram ev: an ev receive with a datagram already queued and a poll for
             try dg.io_common.waitForIo(&op.c);
             try std.testing.expectError(error.WouldBlock, op.getResult());
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 49152), null, "now");
             try dg.settle();
             const before = clockNs();
@@ -9529,6 +9583,7 @@ const second_waiter = struct {
         first = true;
         const loop = &dg.rt_mod.getCurrentExecutor().loop;
         const tx = try dg.open();
+        defer dg.os_net.close(tx);
         for (0..2) |k| {
             fds[k] = try dg.open();
             try dg.bindTo(fds[k], dg.addr(127, 0, 0, 1, 0));
@@ -9700,29 +9755,44 @@ test "sim: dgram: datagramSocketsOpen counts this run's open datagram sockets, 0
     try std.testing.expectEqual(@as(usize, 0), datagramSocketsOpen());
 }
 
-test "sim: dgram: a run that called refuseOpenDatagramsAtEnd and closed its sockets ends normally, and the next run, which did not call it, may leave one open (t-4138)" {
+test "sim: dgram: a run that closed its datagram sockets ends normally, and the next run starts with none open (t-4142)" {
     if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
     try dg.run(1, struct {
         fn body() !void {
-            refuseOpenDatagramsAtEnd();
             const a = try dg.open();
             dg.os_net.close(a);
         }
     }.body);
     try dg.run(1, struct {
         fn body() !void {
-            _ = try dg.open();
+            try std.testing.expectEqual(@as(usize, 0), datagramSocketsOpen());
         }
     }.body);
 }
 
-test "sim: dgram refuses: sim.end in a run that called refuseOpenDatagramsAtEnd, with a datagram socket open (t-4138)" {
+test "sim: dgram refuses: sim.end with a datagram socket open (t-4142)" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    try refusal("sim: dgram refuses: sim.end in a run that called refuseOpenDatagramsAtEnd", "sim: datagram teardown: 1 datagram sockets are open at sim.end (listed above), in a run that called sim.refuseOpenDatagramsAtEnd(): close every datagram socket before sim.end", struct {
+    try refusal("sim: dgram refuses: sim.end with a datagram socket open", "sim: datagram teardown: 1 datagram sockets are open at sim.end (listed above): close every datagram socket before sim.end", struct {
         fn body() !void {
             try dg.run(1, struct {
                 fn inner() !void {
-                    refuseOpenDatagramsAtEnd();
+                    const a = try dg.open();
+                    _ = try dg.open();
+                    dg.os_net.close(a);
+                }
+            }.inner);
+        }
+    }.body);
+}
+
+// The list line, before the panic: the open socket by its own fd (the
+// second open, 100033), not the closed one (100032).
+test "sim: dgram refuses: sim.end lists each open datagram socket by its fd before it panics (t-4142)" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: sim.end lists each open datagram socket by its fd", "sim: datagram teardown: sim fd 100033 is an open datagram socket", struct {
+        fn body() !void {
+            try dg.run(1, struct {
+                fn inner() !void {
                     const a = try dg.open();
                     _ = try dg.open();
                     dg.os_net.close(a);
@@ -9749,8 +9819,10 @@ test "sim: refuses two Runtimes in one sim run" {
         var got: usize = 0;
         fn exchange() !void {
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 7100));
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 7100), null, "hi");
             var buf: [8]u8 = undefined;
             got = (try dg.evRecvFrom(rx, &buf)).len;
@@ -9892,6 +9964,7 @@ test "sim: dgram ev refuses: pollInterruptible with a positive timeout on a sim 
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             _ = try dg.os_net.pollInterruptible(fd, dg.os_net.POLL.IN, 5);
         }
     }.body);
@@ -9904,6 +9977,7 @@ test "sim: dgram options: an ENet-shaped host creation: socket, non-blocking, RC
     try dg.run(1, struct {
         fn body() !void {
             const fd = try dg.os_net.socket(.ipv4, .dgram, .udp, .{ .nonblocking = false });
+            defer dg.os_net.close(fd);
             try dg.os_net.setNonBlocking(fd, true);
             try std.testing.expect(try dg.os_net.isNonBlocking(fd));
             try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF, 256 * 1024);
@@ -9921,6 +9995,7 @@ test "sim: dgram options: an ENet-shaped host creation: socket, non-blocking, RC
             try dg.setInt(fd, sys.IPPROTO.IP, dst_opt, 1);
             // It works: a datagram arrives with its destination address.
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 49152), null, "host");
             try dg.settle();
             var buf: [8]u8 = undefined;
@@ -9934,6 +10009,7 @@ test "sim: dgram options: an unsupported option returns OptionNotSupported and c
     try dg.run(1, struct {
         fn body() !void {
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             const before = try dg.getInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF);
             const unsupported = [_][2]i64{
                 .{ sys.SOL.SOCKET, sys.SO.RCVLOWAT },
@@ -9949,6 +10025,7 @@ test "sim: dgram options: an unsupported option returns OptionNotSupported and c
             try std.testing.expectEqual(before, try dg.getInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF));
             try dg.bindTo(fd, dg.addr(127, 0, 0, 1, 0));
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 49152), null, "still");
             try dg.settle();
             var buf: [8]u8 = undefined;
@@ -9962,7 +10039,9 @@ test "sim: dgram limits: with a large byte budget, the packet limit drops empty 
     try dg.run(1, struct {
         fn body() !void {
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             try dg.setInt(rx, sys.SOL.SOCKET, sys.SO.RCVBUF, 1 << 20);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
             try dg.sendN(tx, dg.addr(127, 0, 0, 1, 49152), rcv_packet_limit + 6, "");
@@ -9978,7 +10057,9 @@ test "sim: dgram limits: a small byte budget drops by bytes, raising SO_RCVBUF a
     try dg.run(1, struct {
         fn body() !void {
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             // 1000 bytes: two 150-byte datagrams (406 each) fit, a third does not.
             try dg.setInt(rx, sys.SOL.SOCKET, sys.SO.RCVBUF, 1000);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
@@ -10027,7 +10108,9 @@ test "sim: dgram limits: lowering SO_RCVBUF below what is queued drops nothing q
     try dg.run(1, struct {
         fn body() !void {
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
             const to = dg.addr(127, 0, 0, 1, 49152);
             var p: [100]u8 = @splat(7);
@@ -10056,8 +10139,11 @@ test "sim: dgram limits: one socket's overflow does not drop or block another so
     try dg.run(1, struct {
         fn body() !void {
             const small = try dg.open();
+            defer dg.os_net.close(small);
             const big = try dg.open();
+            defer dg.os_net.close(big);
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             try dg.setInt(small, sys.SOL.SOCKET, sys.SO.RCVBUF, 300);
             try dg.bindTo(small, dg.addr(127, 0, 0, 1, 0));
             try dg.bindTo(big, dg.addr(127, 0, 0, 1, 0));
@@ -10080,6 +10166,7 @@ test "sim: dgram limits: out of memory at open and at send is SystemResources, a
     try dg.run(1, struct {
         fn body() !void {
             const ok_fd = try dg.open();
+            defer dg.os_net.close(ok_fd);
             var failing = std.testing.FailingAllocator.init(std.heap.smp_allocator, .{ .fail_index = 0 });
             testSetNetAllocator(failing.allocator());
             defer testSetNetAllocator(std.heap.smp_allocator);
@@ -10102,6 +10189,7 @@ test "sim: dgram options refuse: SO_BROADCAST" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.BROADCAST, 1);
         }
     }.body);
@@ -10113,6 +10201,7 @@ test "sim: dgram options refuse: SO_REUSEPORT" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.REUSEPORT, 1);
         }
     }.body);
@@ -10124,6 +10213,7 @@ test "sim: dgram options refuse: a multicast membership" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var mreq: [8]u8 = @splat(0);
             try dg.os_net.setsockopt(fd, sys.IPPROTO.IP, sys.IP.ADD_MEMBERSHIP, &mreq);
         }
@@ -10136,6 +10226,7 @@ test "sim: dgram options refuse: a TCP option on a datagram socket" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             try dg.setInt(fd, sys.IPPROTO.TCP, 1, 1);
         }
     }.body);
@@ -10147,6 +10238,7 @@ test "sim: dgram options refuse: SO_RCVBUF of zero" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF, 0);
         }
     }.body);
@@ -10158,6 +10250,7 @@ test "sim: dgram options refuse: a read of an option that is not simulated" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             _ = try dg.getInt(fd, sys.SOL.SOCKET, sys.SO.SNDBUF);
         }
     }.body);
@@ -10181,6 +10274,7 @@ test "sim: dgram options refuse: out of memory re-provisioning the receive queue
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var failing = std.testing.FailingAllocator.init(std.heap.smp_allocator, .{ .fail_index = 0 });
             testSetNetAllocator(failing.allocator());
             try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF, 300000);
@@ -10235,10 +10329,12 @@ const dg_wire = struct {
     /// length, and the bytes.
     fn body() !void {
         const rx = try dg.open();
+        defer dg.os_net.close(rx);
         try dg.bindTo(rx, dg.addr(0, 0, 0, 0, 7000));
         try dg.os_net.enableDestinationAddress(rx);
         var senders: [3]i32 = undefined;
         for (&senders) |*fd| fd.* = try dg.open();
+        defer for (senders) |fd| dg.os_net.close(fd);
         transcript_len = 0;
         var h = try dg.runtime.spawn(evFirst, .{rx});
         try dg.rt_mod.sleep(.fromMilliseconds(1));
@@ -10355,10 +10451,12 @@ const dg_drops = struct {
 
     fn body() !void {
         const rx = try dg.open();
+        defer dg.os_net.close(rx);
         try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 7000));
         // Two 10-byte datagrams cost 2 * (10 + 256) = 532 bytes; a third does not fit.
         try dg.setInt(rx, sys.SOL.SOCKET, sys.SO.RCVBUF, 600);
         const tx = try dg.open();
+        defer dg.os_net.close(tx);
         try dg.bindTo(tx, dg.addr(127, 0, 0, 1, 7100));
         for (0..4) |k| {
             const p: [10]u8 = @splat(@intCast('a' + k));
@@ -10464,9 +10562,12 @@ const dg_inflight = struct {
     /// changes one thing and keeps every length, time and payload byte.
     fn body() !void {
         const rx = try dg.open();
+        defer dg.os_net.close(rx);
         try dg.bindTo(rx, dg.addr(0, 0, 0, 0, 7000));
-        _ = try dg.open(); // a second socket on 7001 would hide a bad port
+        const spare = try dg.open(); // a second socket on 7001 would hide a bad port
+        defer dg.os_net.close(spare);
         const tx = try dg.open();
+        defer dg.os_net.close(tx);
         try dg.bindTo(tx, dg.addr(0, 0, 0, 0, 7100));
         const first: []const u8 = if (variant == .queue_swapped) "b" else "a";
         const second: []const u8 = if (variant == .queue_swapped) "a" else "b";
@@ -10896,8 +10997,11 @@ const nf = struct {
 const nf_silence = struct {
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const c = try nf.sock(1, 7002);
+        defer dg.os_net.close(c);
         silence(nf.ep(1, 7001));
         for (0..3) |k| try nf.send(a, 1, 7001, @intCast(k));
         for (0..2) |k| try nf.send(b, 1, 7000, @intCast(k));
@@ -10931,15 +11035,20 @@ test "sim: net faults: a silence of an exact endpoint drops what it sends and wh
 const nf_silence_forms = struct {
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const w = try dg.open();
+        defer dg.os_net.close(w);
         try dg.bindTo(w, dg.addr(0, 0, 0, 0, 7010));
         silence(.{ .port = 7010 });
         try nf.send(a, 1, 7010, 1);
         try nf.send(a, 3, 7010, 2);
         try nf.send(w, 1, 7000, 3);
         const h1 = try nf.sock(5, 7020);
+        defer dg.os_net.close(h1);
         const h2 = try nf.sock(5, 7021);
+        defer dg.os_net.close(h2);
         silence(.{ .ip = .{ 127, 0, 0, 5 } });
         try nf.send(a, 5, 7020, 4);
         try nf.send(a, 5, 7021, 5);
@@ -10965,7 +11074,9 @@ test "sim: net faults: a silence by port alone covers a socket bound to the wild
 const nf_partition = struct {
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
         setPartition(ab);
         for (0..2) |k| try nf.send(a, 1, 7001, @intCast(k));
@@ -10999,7 +11110,9 @@ test "sim: net faults: a partition drops one direction only, its reversed path t
 const nf_in_flight = struct {
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
         // On the wire when the partition starts: dropped at landing.
         try nf.send(a, 1, 7001, 1);
@@ -11064,8 +11177,11 @@ const nf_loss = struct {
 
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const c = try nf.sock(1, 7002);
+        defer dg.os_net.close(c);
         setImpairment(.{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) }, imp);
         landed = @splat(false);
         var k: u32 = 0;
@@ -11127,8 +11243,11 @@ test "sim: net faults: loss and burst loss drop exactly the datagrams the test's
 const nf_last_wins = struct {
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const c = try nf.sock(1, 7002);
+        defer dg.os_net.close(c);
         const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
         // Everything lost, then a narrower rule that loses nothing it can
         // see: a burst that alternates, bad on the first datagram, good on
@@ -11217,7 +11336,9 @@ const nf_records = struct {
         expect_hasher = std.hash.Wyhash.init(0);
         const lat = wire_latency_ns;
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
         const t0 = clockNs();
         try nf.send(a, 1, 7001, 0);
@@ -11312,7 +11433,9 @@ test "sim: net faults: each drop is in the trace and the wire digest with its ca
 const nf_matched = struct {
     fn body() !void {
         const a = try nf.sock(1, 7000);
-        _ = try nf.sock(1, 7001);
+        defer dg.os_net.close(a);
+        const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
         // Matched at send, then cleared.
         setImpairment(ab, .{ .loss_ppm = 1_000_000 });
@@ -11346,6 +11469,7 @@ test "sim: net faults refuse: requireEveryRuleMatched with a cleared rule and a 
             setPartition(.{ .to = .{ .port = 7998 } });
             silence(.{ .port = 7997 });
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             try dg.bindTo(fd, dg.addr(127, 0, 0, 1, 7997));
             _ = try dg.sendFrom(fd, dg.addr(127, 0, 0, 1, 7996), null, "x");
             requireEveryRuleMatched();
@@ -11541,7 +11665,9 @@ test "sim: net faults refuse: more distinct rules in a run than it records" {
 const nf_drop_order = struct {
     fn body() !void {
         const a = try nf.sock(1, 7000);
-        _ = try nf.sock(1, 7001);
+        defer dg.os_net.close(a);
+        const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
         // Two partitions match: the most recent drops and is counted.
         setPartition(.{});
@@ -11587,7 +11713,9 @@ const nf_delay = struct {
 
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         setImpairment(.{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) }, imp);
         for (0..n) |k| {
             sent_at[k] = clockNs();
@@ -11688,7 +11816,9 @@ test "sim: net faults: delay, jitter and duplication without reorder keep each f
 const nf_route = struct {
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
         const ms = std.time.ns_per_ms;
         var got: [8]u32 = undefined;
@@ -11772,6 +11902,8 @@ const nf_wake = struct {
 
     fn recvBody() !void {
         const s = try setup();
+        defer dg.os_net.close(s.a);
+        defer dg.os_net.close(s.b);
         var h = try dg.runtime.spawn(recvTask, .{s.b});
         try dg.rt_mod.sleep(.fromMilliseconds(1));
         const t = clockNs();
@@ -11784,6 +11916,8 @@ const nf_wake = struct {
 
     fn pollBody() !void {
         const s = try setup();
+        defer dg.os_net.close(s.a);
+        defer dg.os_net.close(s.b);
         var h = try dg.runtime.spawn(pollTask, .{s.b});
         try dg.rt_mod.sleep(.fromMilliseconds(1));
         const t = clockNs();
@@ -11800,6 +11934,7 @@ const nf_wake = struct {
     /// own receive it wakes.
     fn reuseBody() !void {
         const s = try setup();
+        defer dg.os_net.close(s.a);
         var h = try dg.runtime.spawn(recvTask, .{s.b});
         try dg.rt_mod.sleep(.fromMilliseconds(1));
         const t = clockNs();
@@ -11809,6 +11944,7 @@ const nf_wake = struct {
         try std.testing.expectEqual(@as(?anyerror, error.FileDescriptorNotASocket), err);
         try std.testing.expect(woke_at < t + delay);
         const b2 = try nf.sock(1, 7001);
+        defer dg.os_net.close(b2);
         try std.testing.expectEqual(s.b, b2);
         got_len = 0;
         var h2 = try dg.runtime.spawn(recvTask, .{b2});
@@ -11881,9 +12017,11 @@ const dg_faulted = struct {
 
     fn body() !void {
         const rx = try dg.open();
+        defer dg.os_net.close(rx);
         try dg.bindTo(rx, dg.addr(0, 0, 0, 0, 7000));
         try dg.os_net.enableDestinationAddress(rx);
         for (&senders, 0..) |*fd, i| fd.* = try nf.sock(1, @intCast(7100 + i));
+        defer for (senders) |fd| dg.os_net.close(fd);
         transcript_len = 0;
         const delay: u64 = std.time.ns_per_ms + @as(u64, @intFromBool(variant == .delay_one_ns_more));
         setImpairment(.{ .to = .{ .port = 7000 } }, .{
@@ -12126,7 +12264,9 @@ const many_iov = struct {
 
     fn dgramBody() !void {
         const rx = try nf.sock(1, 7000);
+        defer dg.os_net.close(rx);
         const tx = try nf.sock(1, 7001);
+        defer dg.os_net.close(tx);
         const to = dg.addr(127, 0, 0, 1, 7000);
         for ([_]usize{ 65, kernel_iov_max }) |n| {
             // sendDatagram, read whole by the layer.
@@ -12177,6 +12317,7 @@ test "sim: dgram refuses: a sendDatagram of IOV_MAX + 1 buffers" {
             try dg.run(1, struct {
                 fn b() !void {
                     const tx = try nf.sock(1, 7001);
+                    defer dg.os_net.close(tx);
                     const to = dg.addr(127, 0, 0, 1, 7000);
                     _ = try many_iov.os_net.sendDatagram(tx, many_iov.gather(iov_over), .{}, &to, null);
                 }
@@ -12192,6 +12333,7 @@ test "sim: dgram refuses: a sendmsg of IOV_MAX + 1 buffers" {
             try dg.run(1, struct {
                 fn b() !void {
                     const tx = try nf.sock(1, 7001);
+                    defer dg.os_net.close(tx);
                     const to = dg.addr(127, 0, 0, 1, 7000);
                     _ = try many_iov.sendmsgTo(tx, &to, iov_over);
                 }
@@ -12207,6 +12349,7 @@ test "sim: dgram refuses: an ev send of IOV_MAX + 1 buffers" {
             try dg.run(1, struct {
                 fn b() !void {
                     const tx = try nf.sock(1, 7001);
+                    defer dg.os_net.close(tx);
                     const to = dg.addr(127, 0, 0, 1, 7000);
                     _ = try many_iov.evSendTo(tx, &to, iov_over);
                 }
@@ -12222,6 +12365,7 @@ test "sim: dgram refuses: a receive of IOV_MAX + 1 buffers" {
             try dg.run(1, struct {
                 fn b() !void {
                     const rx = try nf.sock(1, 7000);
+                    defer dg.os_net.close(rx);
                     _ = many_iov.os_net.recvDatagram(rx, many_iov.scatter(iov_over), .{ .dontwait = true }, null) catch {};
                 }
             }.b);
@@ -12277,7 +12421,9 @@ const r5_alloc = struct {
 
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
         // The review's sequence: everything duplicated and delayed. A fresh
         // run's wire has no capacity, so a send allocates its payload copy

@@ -1093,6 +1093,17 @@ test "sim: stream refuses: the teardown check: FINs still on the wire at sim.end
     try refusal("sim: stream refuses: the teardown check: FINs still on the wire", "sim: stream teardown: 1 stream objects remain at sim.end", null, refuse_bodies.leakWire);
 }
 
+// `sim.end` lists open datagram sockets before the stream check can panic,
+// so a run that leaves both shows both (t-4142). The stream socket takes
+// slot 0 (100032), the datagram socket slot 1.
+fn leakStreamAndDatagram() !void {
+    _ = try os_net.socket(.ipv4, .stream, .ip, .{ .nonblocking = true });
+    _ = try os_net.socket(.ipv4, .dgram, .ip, .{ .nonblocking = true });
+}
+test "sim: stream teardown: a run that leaves a stream socket and a datagram socket lists the datagram socket before the stream check panics (t-4142)" {
+    try refusal("sim: stream teardown: a run that leaves a stream socket and a datagram socket", "sim: datagram teardown: sim fd 100033 is an open datagram socket", null, leakStreamAndDatagram);
+}
+
 // ---- Parity: rows of design 17.13 on real sockets and in the sim ----
 
 /// One kernel's expected answers, from the probes of sittings 23 and 25
