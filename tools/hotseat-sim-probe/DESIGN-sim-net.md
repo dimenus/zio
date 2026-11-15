@@ -1085,18 +1085,53 @@ the mutants in its commits.
   - **Sitting 32, in short.** t-4133 (69eac70), t-4132 (02ae53f), the
     design fixes (07825f6), slice 3. Upstream (`origin/main` 5357759) had
     not moved.
+  - **Sitting 33: the follow-up of the outside review of slice 3**
+    (`gpt-simnet15.md`; report 33 has the commands, outputs and the
+    mutant lists, `zio-sim33/` beside it). Each defect got a test that
+    failed first; the failing output is in each commit.
+    - 29d2559: two held credits of a direction coalesce to the one with
+      the larger sequence, whichever was held first (17.9a point 8 was
+      wrong). The op model had copied the old rule; its reference now
+      keeps the larger count, compares every held and on-wire entry by
+      identity (`checkHeld`), checks that no live direction is credited
+      short (`checkCreditLive`) and that no send is stranded at the end.
+    - 196ceef: found while looking for the same shape: an entry held at
+      its landing now holds the later entries of its direction still on
+      the wire at once (17.9 item 2). Before, a release could put them
+      ahead of it, and an abort delivered them after a hole (the op
+      model's seed 17 did, unseen). The model has a stream-offset check
+      that shares nothing with the hold logic.
+    - 5e81fb1: the entry limit is checked on the count after the step
+      (`reserveTcp(n, freed)`), at the abort, the coalescing credit and
+      `shutdown(.both)`'s release credit.
+    - 6865949: the review's P3s: a real deadline-then-release case; the
+      three floors count their own case; the two snapshot pairs; tests
+      for held credits at abort and failure, hold-release-hold, a release
+      at the time limit, a failure canceled or closed before harvest, and
+      a held SYN-ACK and ACK. `Timeout` in `C-syn` is right (measured on
+      Linux: a kernel's connect timeout reaches zio as `Timeout`).
+    - 367db81: t-4139 answered by a test: std.Io sees
+      `ConnectionResetByPeer` for both `failStream` kinds.
+    - 2de1d25: `sim.datagramSocketsOpen()` and the opt-in
+      `sim.refuseOpenDatagramsAtEnd()`. Not the default: 75 zio tests
+      leave a datagram socket open at `end` (t-4142); starh2's steps
+      leave none.
   - **Next, in this order:**
-    1. Slice 4 (17.16): the users. starh2's `dst-conn` accept step;
+    1. t-4142: close the datagram sockets in zio's 75 tests, then make the
+       refusal the default (t-4138).
+    2. Slice 4 (17.16): the users. starh2's `dst-conn` accept step;
        hotseat's tests (17.15 item 7), after t-4110 and t-4111; then an
-       outside review. t-4139 asks what hotseat sees through std.Io for
-       `failStream(.timed_out)`.
+       outside review. Through std.Io, hotseat's "host dies" test sees
+       `ConnectionResetByPeer` (t-4139's test).
   - **Open, filed:** t-4126 (macOS row 41g's answer varied in 1 run of 3),
     t-4127 (what stays open after the ruling: whether zio's readiness
     backends' `SO_ERROR` read is a defect, the parked cells no row
-    measures, the gap as a fidelity limit), t-4139 (std.Io maps
-    `ConnectionTimedOut` to `ConnectionResetByPeer`). Queued for the sim
-    seat, not started: t-4106, t-4115, t-4117. Closed in sitting 32:
-    t-4132, t-4133.
+    measures, the gap as a fidelity limit), t-4138 and t-4142 (the
+    datagram refusal as the default), t-4139 (whether std.Io's mapping of
+    `ConnectionTimedOut` should change: upstream's file, the owner's
+    decision), t-4143 (pipe ends at `end`). Queued for the sim seat, not
+    started: t-4106, t-4115, t-4117. Closed: t-4132, t-4133 (sitting
+    32), t-4136 (sitting 33).
   - **What I would change, with what I know now:**
     - The parity table prints every row's answer now; a row that passes
       silently was how a measured difference could hide.
@@ -1409,6 +1444,17 @@ the mutants in its commits.
   time.** A release can put hundreds of entries on the wire 1 µs apart;
   the op model's connect waited 100 polls and failed with nothing wrong
   in the sim (sitting 32). Bound a wait by virtual time.
+- **A reference model that copies the sim's rule is not an oracle.**
+  The stream op model's credit coalescing was the sim's own rule, so the
+  two agreed on a wrong answer (sitting 33). Derive the reference from
+  the design text, and add a check that shares nothing with the logic
+  under test (the stream offset, the credit liveness).
+- **A cancel ends a parked op and a woken op the same way.** A test of
+  "woken, then canceled before its harvest" must check the op was woken
+  (`sim.testStreamParked`); without it the mutant "the failure wakes
+  nothing" survived (sitting 33).
+- **65536 one-byte TCP entries cost about 1.9 s per test** (each
+  `orderedRemove` moves the rest of the list). The limit tests pay it.
 - **A held list is in sequence order, not arrival order.** An entry held
   at its landing is older than one sent later and held at its send. The
   op model's first copy appended, and the new landing-time check found
