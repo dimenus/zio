@@ -1832,7 +1832,7 @@ pub const Loop = struct {
     /// every such submit, as on a pipe end).
     fn simDgramMayWait(c: *Completion) bool {
         return switch (c.op) {
-            .net_recvfrom, .net_recvmsg => true,
+            .net_recv, .net_recvfrom, .net_recvmsg => true,
             .net_poll => c.cast(NetPoll).event == .recv,
             else => false,
         };
@@ -1996,8 +1996,21 @@ pub const Loop = struct {
                 if (net.send(op.handle, op.buffer.iovecs, op.flags)) |n| c.setResult(.net_send, n) else |err| c.setError(err);
             },
             .net_recv => {
+                // On a connected socket it waits as a NetRecvFrom does; on
+                // an unconnected one the layer answers at once.
                 const op = c.cast(NetRecv);
-                if (net.recv(op.handle, op.buffers.iovecs, op.flags)) |n| c.setResult(.net_recv, n) else |err| c.setError(err);
+                var flags = op.flags;
+                flags.dontwait = true;
+                if (net.recv(op.handle, op.buffers.iovecs, flags)) |n| {
+                    c.setResult(.net_recv, n);
+                } else |err| switch (err) {
+                    error.WouldBlock => if (op.flags.dontwait) c.setError(err) else return false,
+                    else => c.setError(err),
+                }
+            },
+            .net_connect => {
+                const op = c.cast(NetConnect);
+                if (net.connect(op.handle, op.addr, op.addr_len)) |_| c.setResult(.net_connect, {}) else |err| c.setError(err);
             },
             .net_sendto => {
                 const op = c.cast(NetSendTo);
@@ -2031,8 +2044,9 @@ pub const Loop = struct {
             },
             .net_poll => {
                 const op = c.cast(NetPoll);
-                // Read for every event: it refuses a closed socket.
-                const readable = sim.dgramReadable(op.handle);
+                // Read for every event: it refuses a closed socket. A
+                // pending error counts as ready, as both kernels wake it.
+                const readable = sim.dgramPollReady(op.handle);
                 if (op.event == .recv and !readable) return false;
                 c.setResult(.net_poll, {});
             },

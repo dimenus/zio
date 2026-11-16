@@ -89,7 +89,8 @@ sim socket table, or does what the row says.
 | `poll(fd, events, timeout = 0)` | `{ readable, writable }` now; a closed socket or a sim pipe fd is refused for any events; a negative fd is skipped (revents 0), as the kernel does | `poll` with timeout 0 |
 | `pollInterruptible(fd, events, timeout_ms)` | timeout 0 only; a positive timeout is refused under sim | `poll`; returns `.interrupted` on `EINTR` instead of retrying |
 | `close(fd)` | frees the fd and the port | `close` |
-| `connect`, `listen`, `accept`, `shutdown`, `send`, `recv` on a datagram fd | refused (`error.OperationNotSupported`) | as the kernel answers |
+| `connect` on a datagram fd | fixes the peer: the protocol above `dgramConnect` in `src/sim.zig` (t-4167) | `connect` |
+| `listen`, `accept` on a datagram fd; `send`, `recv` on an unconnected one | refused (`error.OperationNotSupported`) | as the kernel answers |
 
 **Send errors keep the distinctions a consumer needs:** `SendError` gains
 `AddressUnavailable` (`EADDRNOTAVAIL`), done in 696d880. Before, it fell into
@@ -331,7 +332,10 @@ option, and hotseat's bridge will not; `IP_TTL` is not modelled.
 - Send flags other than `MSG_NOSIGNAL` and `MSG_DONTWAIT` (accepted with no
   effect): `MSG_OOB`, `MSG_EOR`, `MSG_DONTROUTE`, `MSG_CONFIRM`,
   `MSG_FASTOPEN`, and any flag added later.
-- `connect` on a datagram socket.
+- On a datagram socket: a second `connect`, a disconnect, a send with an
+  address on a connected socket, a layer `poll` of a socket with a pending
+  error, `shutdown` of a connected socket (the list above `dgramConnect` in
+  `src/sim.zig`).
 - The misuse class of section 8.
 - A sim fd at a native exit (section 3).
 - A real fd passed to a sim op during a run.
@@ -347,7 +351,9 @@ option, and hotseat's bridge will not; `IP_TTL` is not modelled.
 
 - **Send pressure** and local send failures (`EAGAIN`, `ENOBUFS`,
   `EMSGSIZE`). `AddressUnavailable` occurs only for a bad `from`.
-- **Connected UDP:** peer filtering, and ICMP-driven `ECONNREFUSED`.
+- **Connected UDP** is modelled (t-4167); its limits (ICMP rate limits,
+  Linux's error set before the send returns, Linux's error-first order) are
+  listed above `dgramConnect` in `src/sim.zig`.
 - **TCP internals:** segments, Nagle, windows, retransmits, keepalive,
   TIME_WAIT, abortive close, kernel backlog overflow. Half-close is modelled.
 - **MTU and fragmentation.**

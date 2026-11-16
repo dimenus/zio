@@ -714,6 +714,25 @@ fn digestNet(h: *std.hash.Wyhash) void {
         }
         h.update(&pk);
     }
+    // Only for a run that connected a socket (a run without keeps its
+    // digests): the ICMP count, and each socket's peer, pending error,
+    // filter drops and refusals.
+    if (dgram_connect_used) {
+        std.mem.writeInt(u64, &b, icmp_seq, .little);
+        h.update(&b);
+        for (dgrams) |s| {
+            var e: [24]u8 = @splat(0);
+            if (s.peer) |p| {
+                e[0] = 1;
+                @memcpy(e[1..5], &p.ip);
+                std.mem.writeInt(u16, e[5..7], p.port, .little);
+            }
+            e[7] = @intFromBool(s.refused);
+            std.mem.writeInt(u64, e[8..16], s.stats.dropped_not_peer, .little);
+            std.mem.writeInt(u64, e[16..24], s.stats.refusals, .little);
+            h.update(&e);
+        }
+    }
 }
 
 pub fn panic(comptime fmt: []const u8, args: anytype) noreturn {
@@ -1450,6 +1469,13 @@ pub const DatagramStats = struct {
     received: u64 = 0,
     /// Datagrams addressed to this socket that did not fit its queue.
     dropped_rcvbuf: u64 = 0,
+    /// Datagrams addressed to this connected socket from another source:
+    /// dropped at the landing (the connected-socket protocol below).
+    dropped_not_peer: u64 = 0,
+    /// ICMP port unreachables that reached this connected socket. Each sets
+    /// the one pending error; a second before a call takes it is counted
+    /// here and still leaves one error.
+    refusals: u64 = 0,
 };
 
 const Queued = struct { off: usize, len: usize, from: Ip4, to: [4]u8 };
@@ -1479,6 +1505,13 @@ const Dgram = struct {
     /// That op until it has its result: parked, or woken and not yet
     /// harvested. One at a time (`dgramRefuseSecondWaiter`).
     unresolved: ?DgramParked = null,
+    /// The peer `connect` fixed (`dgramConnect`); null for an unconnected
+    /// socket.
+    peer: ?Ip4 = null,
+    /// The pending error of a connected socket: an ICMP port unreachable
+    /// landed, and the next send or receive takes it (`ConnectionRefused`).
+    /// One slot, as both kernels keep it (`so_error`, `sk_err`).
+    refused: bool = false,
 };
 
 const WireDatagram = struct {
@@ -1490,6 +1523,10 @@ const WireDatagram = struct {
     /// The second copy of a duplicated datagram (`dup_ppm`). Its records
     /// set bit 0x80 of the outcome.
     copy: bool = false,
+    /// An ICMP port unreachable, not a datagram: `from` is the closed
+    /// address, `to` the sender of the datagram that died there, and it has
+    /// no bytes. Its records set bit 0x40 of the outcome.
+    icmp: bool = false,
 };
 
 /// Socket queues and datagrams on the wire. Not the runtime's allocator: the
@@ -1530,6 +1567,24 @@ var wire_hasher: std.hash.Wyhash = std.hash.Wyhash.init(0);
 /// Datagrams not yet landed, sorted by (due_at, seq): landing order.
 var wire: std.ArrayList(WireDatagram) = .empty;
 var wire_seq: u64 = 0;
+/// Whether this run connected a datagram socket. Only then does
+/// `stateDigest` cover the connected state and an ICMP go on the wire, so a
+/// run with no connect keeps every digest it had before (promise 1).
+var dgram_connect_used: bool = false;
+/// ICMP port unreachables made in this run; the fault draws of the next
+/// one use `icmp_send_base + icmp_seq` as its send number.
+var icmp_seq: u64 = 0;
+/// An ICMP's send number for the fault draws is in its own range, so it
+/// never draws what a datagram draws, and making one moves no datagram's
+/// fate. `faultDraw` multiplies the number by 8 (mod 2^64): bit 60 is the
+/// highest bit that survives that, so the ranges stay apart below 2^60 sends.
+const icmp_send_base: u64 = 1 << 60;
+/// Ports from which a datagram died at its landing (no socket took it) with
+/// no ICMP made, because no socket bound there was connected to its
+/// destination then. A socket on such a port that connected later could be
+/// the one a kernel's ICMP finds, and the sim made none: `dgramConnect`
+/// refuses it. Never in a digest.
+var icmp_ghost_ports: std.StaticBitSet(65536) = .empty;
 
 fn resetNet() void {
     for (dgrams) |d| {
@@ -1542,6 +1597,9 @@ fn resetNet() void {
     dropped_no_socket = 0;
     wire_seq = 0;
     net_used = false;
+    dgram_connect_used = false;
+    icmp_seq = 0;
+    icmp_ghost_ports = .empty;
     wire_hasher = std.hash.Wyhash.init(0);
     rules_len = 0;
     rule_history_len = 0;
@@ -1733,15 +1791,136 @@ pub fn dgramEnableDestinationAddress(fd: i32) void {
     dgramSlot("enableDestinationAddress", fd).dst_addr = true;
 }
 
+// ---- Connected datagram sockets (t-4167) ----
+//
+// What `connect` on a sim datagram socket does, and what the sim refuses.
+// Every row that cites a number is a row of the parity table in
+// `sim_dgram_connect_test.zig`: it runs through zio's API on real loopback
+// sockets in a build without sim (macOS, and Linux with io_uring and with
+// epoll) and in a sim run in a sim build, and checks each against its
+// column. Where the kernels disagree, the table has both columns and the
+// sim's choice below says why.
+//
+// How to use it: `zio.net.Socket.connect` (or std.Io's `connect` with
+// `.dgram`, or the layer's `connect`), then `Socket.send` and
+// `Socket.receive` (the ev ops NetSend and NetRecv), the layer's `send`,
+// `recv`, `sendmsg` with no address, or any receive that also gives the
+// source (`recvfrom`, `recvmsg`, `recvDatagram`, NetRecvFrom, NetRecvMsg).
+//
+// - **The peer.** `connect` fixes it (row 1). A socket bound to the wildcard
+//   address now has 127.0.0.1 as its local address, with its port; an
+//   unbound socket is bound to 127.0.0.1 and the next port (rows 1 and 2).
+//   `getpeername` reads the peer back; on an unconnected socket it is
+//   `SocketUnconnected`. Datagrams already queued stay, from whatever source
+//   (row 14: neither kernel drops them).
+// - **The filter.** A datagram that lands at a connected socket from any
+//   other address or port is dropped and counted in
+//   `DatagramStats.dropped_not_peer`, recorded as `LandOutcome.not_peer` in
+//   the trace and the wire digest (row 3). To the kernel that datagram found
+//   no socket, so it is a dead landing like one to a closed port (row 17).
+// - **Sends and receives with no address** go to and come from the peer.
+//   A send with an address on a connected socket refuses: macOS fails it
+//   with EISCONN, which zio maps to `Unexpected` (`SendError` has no name for
+//   it, and adding one changes the build without sim), and Linux sends to
+//   the address (row 5). The sim has no datagram OS profile, and a program
+//   that relies on either answer is not portable; Hotseat sends with no
+//   address for this reason. A send with no address on an unconnected socket
+//   keeps the layer's old answer (`OperationNotSupported`), as does a `recv`.
+// - **ICMP port unreachable.** A datagram that dies at its landing (no
+//   socket bound to its destination, or the filter above) while the socket
+//   that sent it is connected to that destination makes an ICMP entry on
+//   the wire, from the destination back to the sender. It meets the fault
+//   rules as a datagram on that reversed path does: silence, partition,
+//   loss, burst, delay, jitter, the order clamp and duplication, with its own
+//   range of send numbers for the draws (`icmp_send_base`), and the rules'
+//   counts include it. So it lands one path latency after the death, a full
+//   round trip after the send. At its landing, if a socket bound to the
+//   sender's address is connected to the ICMP's source, its pending error is
+//   set (`Dgram.refused`, `DatagramStats.refusals`) and an ev op parked on
+//   it is woken. Recorded with bit 0x40 of the outcome: `landed` when it set
+//   an error, `no_socket` when no such socket was there. No datagram that
+//   dies otherwise (a full queue, a fault) makes one, as no kernel does.
+// - **The pending error** is one slot (row 16: macOS gives one error for two
+//   ICMPs). The next send takes it and does not send its datagram (row 7);
+//   a receive takes it when the queue is empty (rows 6, 9). A parked
+//   receive is woken with it (row 9). A parked NetPoll for reading is woken
+//   and completes with success, and the error stays (row 10). `getsockopt`
+//   `SO_ERROR` returns ECONNREFUSED and clears it (row 8). An unconnected
+//   socket never has one (row 12).
+// - **Two choices where the kernels disagree.** A queued datagram before the
+//   error is macOS's order; Linux returns the error first (row 11). The sim
+//   takes macOS's order on every host: it cannot refuse a case that only
+//   timing makes, and Hotseat, the consumer, ships on macOS. A layer `poll`
+//   of a socket with a pending error refuses: macOS reports POLLIN, Linux
+//   POLLERR (row 6), and a caller's next step depends on the bit it reads.
+//
+// Refused by name (a panic): a second connect, to any peer (both kernels
+// allow it and replace the peer, row 13: not simulated); a disconnect
+// (`AF_UNSPEC`); a connect to a port 0, a non-loopback or a wildcard
+// address; a connect on a port listed in `icmp_ghost_ports` (a datagram from
+// that port died before, with no ICMP made, and a kernel's could still find
+// this socket); `shutdown` of a connected socket; a send with an address on
+// a connected socket; a layer `poll` of a socket with a pending error.
+//
+// Fidelity limits: ICMP rate limits (Linux allows 1000 a second with a
+// burst of 50, macOS's `icmplim`) are not modelled; Linux sets the error on
+// loopback before the send returns (row 16: its second send is refused),
+// where the sim takes a round trip, as macOS does.
+
+/// `connect` on a datagram socket: fixes the peer (the connected-socket
+/// protocol above). `to` is the address the caller gave.
+pub fn dgramConnect(fd: i32, to: Ip4) void {
+    refuseOtherThread("sim socket connect");
+    const d = dgramSlot("connect", fd);
+    if (d.peer != null) panic("sim: a second connect on sim datagram socket {d}: both kernels allow it and replace the peer; not simulated", .{fd});
+    refuseNonLoopback("connect to", to.ip);
+    if (to.port == 0) panic("sim: connect of sim datagram socket {d} to port 0", .{fd});
+    const port = if (d.bound) d.local.port else ephemeralPort(.{ 0, 0, 0, 0 }) catch panic("sim: no free ephemeral port to bind sim fd {d} for its connect", .{fd});
+    if (icmp_ghost_ports.isSet(port)) panic("sim: connect of sim datagram socket {d} on port {d}, from which a datagram died at its landing before, with no ICMP made (no socket was connected then): a kernel's ICMP could still find this socket; not simulated", .{ fd, port });
+    // The local address the kernels choose (rows 1 and 2): the wildcard
+    // becomes 127.0.0.1, the address a wildcard socket sends from here.
+    d.bound = true;
+    d.local = .{ .ip = if (isWildcard(d.local.ip)) .{ 127, 0, 0, 1 } else d.local.ip, .port = port };
+    d.peer = to;
+    dgram_connect_used = true;
+}
+
+/// The connected peer (`getpeername`), or null.
+pub fn dgramPeer(fd: i32) ?Ip4 {
+    return dgramSlot("getpeername", fd).peer;
+}
+
+/// `shutdown` of a sim datagram socket: an unconnected one is
+/// `SocketUnconnected` (ENOTCONN, as Linux answers); a connected one refuses.
+pub fn dgramShutdownRefuse(fd: i32) void {
+    if (dgramSlot("shutdown", fd).peer != null) panic("sim: shutdown of connected sim datagram socket {d} is not simulated", .{fd});
+}
+
 /// One datagram of `src` gathered, to `to`. With `from`, the datagram leaves
 /// from that address, which must be one the socket can receive on: its bound
 /// address, or for a wildcard socket any 127/8 address. Else
 /// `AddressUnavailable`, as the kernel says. Completes at once; the datagram
 /// lands `wire_latency_ns` later.
-pub fn dgramSend(fd: i32, src: anytype, to: Ip4, from: ?[4]u8) error{ AddressUnavailable, SystemResources }!usize {
+///
+/// `to_addr` null is a send with no address (`send`, `sendmsg` without
+/// one): to the peer of a connected socket. The layer passes null only for
+/// a connected socket. An address on a connected socket refuses (the
+/// connected-socket protocol above `dgramConnect`). A connected socket with
+/// a pending error takes it here instead of sending: `ConnectionRefused`,
+/// and the datagram is not sent, as both kernels do (rows 7 of the parity
+/// table in `sim_dgram_connect_test.zig`).
+pub fn dgramSend(fd: i32, src: anytype, to_addr: ?Ip4, from: ?[4]u8) error{ AddressUnavailable, SystemResources, ConnectionRefused }!usize {
     refuseOtherThread("sim socket send");
     checkIovecs("a send", fd, src.len);
     const d = dgramSlot("send", fd);
+    const to = if (to_addr) |a| blk: {
+        if (d.peer != null) panic("sim: a send with an address on connected sim datagram socket {d}: the kernels disagree (macOS fails it with EISCONN, which zio maps to Unexpected; Linux sends to the address), so it is not simulated: use send with no address", .{fd});
+        break :blk a;
+    } else d.peer orelse panic("sim: a send with no address on unconnected sim datagram socket {d}", .{fd});
+    if (d.refused) {
+        d.refused = false;
+        return error.ConnectionRefused;
+    }
     refuseNonLoopback("send to", to.ip);
     if (to.port == 0) panic("sim: send to port 0 from sim fd {d}", .{fd});
     const total = totalLen(src);
@@ -1838,11 +2017,22 @@ pub const Received = struct {
 /// is lost: the datagram is consumed whole, as the kernel does. An empty
 /// queue is `WouldBlock` when `dont_wait` or the socket is non-blocking;
 /// otherwise the receive would block the sim thread for ever, so it refuses.
-pub fn dgramRecv(fd: i32, dst: anytype, dont_wait: bool) error{WouldBlock}!Received {
+///
+/// A connected socket's pending error is taken by a receive that finds the
+/// queue empty: `ConnectionRefused`. A queued datagram comes first, as macOS
+/// orders it; Linux returns the error first (row 11 of the parity table in
+/// `sim_dgram_connect_test.zig`). The sim has no datagram profile and takes
+/// macOS's order on every host (the connected-socket protocol above
+/// `dgramConnect` says why).
+pub fn dgramRecv(fd: i32, dst: anytype, dont_wait: bool) error{ WouldBlock, ConnectionRefused }!Received {
     refuseOtherThread("sim socket receive");
     checkIovecs("a receive", fd, dst.len);
     const d = dgramSlot("receive", fd);
     if (d.meta_len == 0) {
+        if (d.refused) {
+            d.refused = false;
+            return error.ConnectionRefused;
+        }
         if (dont_wait or d.nonblocking) return error.WouldBlock;
         panic("sim: a blocking receive on sim fd {d}, which is not non-blocking: nothing can land while the sim thread waits", .{fd});
     }
@@ -1918,6 +2108,13 @@ pub fn datagramStats(fd: i32) DatagramStats {
 /// Datagrams that landed where no socket was bound, in this run.
 pub fn datagramsDroppedNoSocket() u64 {
     return dropped_no_socket;
+}
+
+/// ICMP port unreachables made in this run (the connected-socket protocol
+/// above `dgramConnect`): one per datagram that died with its sender
+/// connected there. A copy made by `dup_ppm` is not counted again.
+pub fn icmpsMade() u64 {
+    return icmp_seq;
 }
 
 // The ev ops on a datagram socket (`Loop.submitSimDgram`): each gets an op id
@@ -2010,7 +2207,17 @@ pub fn dgramIsOpen(fd: i32) bool {
 /// Refuses a pipe end and a closed socket, so a poll calls it for every
 /// entry, whatever its events.
 pub fn dgramReadable(fd: i32) bool {
-    return dgramSlot("poll", fd).meta_len > 0;
+    const d = dgramSlot("poll", fd);
+    if (d.refused) panic("sim: a poll of sim datagram socket {d}, which has a pending error: the kernels disagree (macOS reports POLLIN, Linux POLLERR), so it is not simulated", .{fd});
+    return d.meta_len > 0;
+}
+
+/// What a NetPoll for reading waits for: a queued datagram, or a pending
+/// error (both kernels wake it and complete it with success; the error
+/// stays for the next call: row 10 of the parity table).
+pub fn dgramPollReady(fd: i32) bool {
+    const d = dgramSlot("poll", fd);
+    return d.meta_len > 0 or d.refused;
 }
 
 // ---- Socket options (design section 8) ----
@@ -2093,14 +2300,19 @@ pub fn dgramSetOption(fd: i32, level: i32, name: u32, val: []const u8) error{Opt
 }
 
 /// `getsockopt` on a sim datagram socket: `SO_RCVBUF` (the byte limit),
-/// `SO_ERROR` (always 0: nothing is pending), and the destination-address
-/// option. Every other read refuses: the layer's `GetsockoptError` has no
-/// "unsupported" to return.
+/// `SO_ERROR` (ECONNREFUSED for a connected socket's pending error, which
+/// the read clears, as both kernels do; else 0), and the
+/// destination-address option. Every other read refuses: the layer's
+/// `GetsockoptError` has no "unsupported" to return.
 pub fn dgramGetOption(fd: i32, level: i32, name: u32, out: []u8) void {
     const d = dgramSlot("getsockopt", fd);
     const v: c_int = switch (classifyOption(level, name)) {
         .rcvbuf => @intCast(d.byte_limit),
-        .so_error => 0,
+        .so_error => blk: {
+            if (!d.refused) break :blk 0;
+            d.refused = false;
+            break :blk @intCast(@backingInt(std.posix.E.CONNREFUSED));
+        },
         .dst_addr => @intFromBool(d.dst_addr),
         .sndbuf, .unsupported, .misuse => panic("sim: getsockopt {s} (level {d}, option {d}) on sim fd {d} is not simulated", .{ optionName(level, name), level, name, fd }),
     };
@@ -2157,11 +2369,14 @@ const LandOutcome = enum(u8) {
     silenced = 6,
     partitioned_in_flight = 7,
     silenced_in_flight = 8,
+    /// Landed at a connected socket from a source that is not its peer
+    /// (the connected-socket protocol above `dgramConnect`).
+    not_peer = 9,
 };
 
 /// Records a datagram at its landing time in the trace and the wire digest.
 fn recordLanding(w: WireDatagram, outcome: LandOutcome) void {
-    const code: u8 = @backingInt(outcome) | (@as(u8, @intFromBool(w.copy)) << 7);
+    const code: u8 = @backingInt(outcome) | (@as(u8, @intFromBool(w.icmp)) << 6) | (@as(u8, @intFromBool(w.copy)) << 7);
     emit(.dgram, @as(u32, w.from.port) | (@as(u32, code) << 16), (@as(u32, w.to.port) << 16) | @as(u32, @intCast(w.bytes.len)));
     var h: [25]u8 = undefined;
     std.mem.writeInt(u64, h[0..8], w.due_at, .little);
@@ -2200,11 +2415,21 @@ fn land(w: WireDatagram) void {
             return;
         }
     }
+    if (w.icmp) return landIcmp(w);
     const d = receiverOf(w.to) orelse {
         dropped_no_socket += 1;
         recordLanding(w, .no_socket);
+        diedAtLanding(w);
         return;
     };
+    if (d.peer) |p| {
+        if (!std.meta.eql(p, w.from)) {
+            d.stats.dropped_not_peer += 1;
+            recordLanding(w, .not_peer);
+            diedAtLanding(w);
+            return;
+        }
+    }
     const cost = w.bytes.len + datagram_overhead;
     if (d.meta_len == d.meta.len or d.charged + cost > d.byte_limit) {
         d.stats.dropped_rcvbuf += 1;
@@ -2236,6 +2461,58 @@ fn wakeParked(d: *Dgram) void {
     pushDueAt(p.c, .dgram, p.id, clock_ns);
 }
 
+/// A datagram found no socket at its landing (none bound there, or a
+/// connected one whose peer it is not). If the socket that sent it is
+/// connected to where it died, the kernel's ICMP port unreachable goes back
+/// to it (`sendIcmp`). Otherwise nothing can observe one, and the port is
+/// remembered (`icmp_ghost_ports`) so a later connect there refuses.
+fn diedAtLanding(w: WireDatagram) void {
+    const s = receiverOf(w.from) orelse return icmp_ghost_ports.set(w.from.port);
+    const p = s.peer orelse return icmp_ghost_ports.set(w.from.port);
+    if (!std.meta.eql(p, w.to)) return icmp_ghost_ports.set(w.from.port);
+    sendIcmp(w.to, w.from);
+}
+
+/// Puts an ICMP port unreachable from `from` (the address where a datagram
+/// died) to `to` (its sender) on the wire, through the fault rules as a
+/// datagram on that path. `landDue` reserved the room.
+fn sendIcmp(from: Ip4, to: Ip4) void {
+    const send_no = icmp_send_base + icmp_seq;
+    icmp_seq += 1;
+    const base: WireDatagram = .{ .seq = send_no, .from = from, .to = to, .bytes = &.{}, .due_at = clock_ns + wire_latency_ns, .icmp = true };
+    if (!udp_rule_set) return wireInsert(base);
+    switch (faultAtSend(send_no, from, to)) {
+        .dropped => |outcome| {
+            var x = base;
+            x.due_at = clock_ns;
+            recordLanding(x, outcome);
+        },
+        .sent => |s| {
+            var a = base;
+            a.due_at = s.due[0];
+            wireInsert(a);
+            if (s.copies == 2) {
+                var b = base;
+                b.due_at = s.due[1];
+                b.copy = true;
+                wireInsert(b);
+            }
+        },
+    }
+}
+
+/// An ICMP landed at the address of the datagram's sender: the socket bound
+/// there takes the error if it is connected to the ICMP's source.
+fn landIcmp(w: WireDatagram) void {
+    const d = receiverOf(w.to) orelse return recordLanding(w, .no_socket);
+    const p = d.peer orelse return recordLanding(w, .no_socket);
+    if (!std.meta.eql(p, w.from)) return recordLanding(w, .no_socket);
+    recordLanding(w, .landed);
+    d.refused = true;
+    d.stats.refusals += 1;
+    wakeParked(d);
+}
+
 fn sameFlow(a: WireDatagram, b: WireDatagram) bool {
     return std.meta.eql(a.from, b.from) and std.meta.eql(a.to, b.to);
 }
@@ -2247,6 +2524,10 @@ fn landDue() void {
     var n: usize = 0;
     while (n < wire.items.len and wire.items[n].due_at <= clock_ns) n += 1;
     if (n == 0) return;
+    // Each landing can make one ICMP, in two copies at most (`sendIcmp`),
+    // inserted after these n (it is due later than now). Reserved first, so
+    // `due_now` stays valid.
+    if (dgram_connect_used) wire.ensureUnusedCapacity(net_alloc, 2 * n) catch panic("sim: out of memory for the ICMP entries of {d} landings", .{n});
     const due_now = wire.items[0..n];
     var i: usize = 0;
     while (i < n) {
@@ -8591,14 +8872,17 @@ test "sim: dgram refuses: a send on a closed socket" {
     }.body);
 }
 
-test "sim: dgram refuses: connect on a datagram socket" {
+// Until t-4167 every connect on a datagram socket refused, and this test
+// checked that. A connect is simulated now (`sim_dgram_connect_test.zig`);
+// one to an address outside 127/8 still refuses, as a send there does.
+test "sim: dgram refuses: connect on a datagram socket to an address outside 127/8" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    try refusal("sim: dgram refuses: connect on a datagram socket", "sim: connect on sim datagram socket 100032: connected UDP is not simulated", struct {
+    try refusal("sim: dgram refuses: connect on a datagram socket to an address outside 127/8", "sim: connect to 10.0.0.1: only 127.0.0.0/8 is simulated", struct {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
             defer dg.os_net.close(fd);
-            const a = dg.addr(127, 0, 0, 1, 9);
+            const a = dg.addr(10, 0, 0, 1, 9);
             try dg.os_net.connect(fd, @ptrCast(&a), @sizeOf(dg.os_net.sockaddr.in));
         }
     }.body);
@@ -10686,6 +10970,7 @@ test {
     _ = @import("sim_stream_bytes_test.zig");
     _ = @import("sim_stream_fault_test.zig");
     _ = @import("sim_stream_op_model_test.zig");
+    _ = @import("sim_dgram_connect_test.zig");
 }
 
 // ---- Phase 1: the native-exit refusals, one test per class of exit ----

@@ -209,8 +209,12 @@ pub fn shutdown(fd: fd_t, how: ShutdownHow) ShutdownError!void {
             .send => .send,
             .both => .both,
         });
-        // An unconnected UDP socket: ENOTCONN, as Linux answers.
-        if (sim.isDgramFd(fd)) return error.SocketUnconnected;
+        // An unconnected UDP socket: ENOTCONN, as Linux answers. A connected
+        // one refuses (`sim.dgramShutdownRefuse`).
+        if (sim.isDgramFd(fd)) {
+            sim.dgramShutdownRefuse(fd);
+            return error.SocketUnconnected;
+        }
         sim.refuseSimFd(@src(), fd);
     }
     switch (builtin.os.tag) {
@@ -677,7 +681,10 @@ pub fn connect(fd: fd_t, addr: *const sockaddr, addr_len: socklen_t) ConnectErro
         // Under sim the loop dispatches NetConnect itself (`sim.streamConnect`);
         // only the native backends call this.
         if (sim.isStreamFd(fd)) sim.panic("sim: the socket layer's connect on sim stream socket {d}: not reached under sim (only the native backends call it)", .{fd});
-        if (sim.isDgramFd(fd)) sim.panic("sim: connect on sim datagram socket {d}: connected UDP is not simulated", .{fd});
+        if (sim.isDgramFd(fd)) {
+            if (addr_len >= @sizeOf(sockaddr) and addr.family == AF.UNSPEC) sim.panic("sim: connect with AF_UNSPEC (a disconnect) on sim datagram socket {d} is not simulated", .{fd});
+            return sim.dgramConnect(fd, simAddr("connect", addr, addr_len));
+        }
         sim.refuseSimFd(@src(), fd);
     }
     switch (builtin.os.tag) {
@@ -831,7 +838,7 @@ pub const GetPeerNameError = error{ SocketUnconnected, Unexpected };
 pub fn getpeername(fd: fd_t, addr: *sockaddr, addr_len: *socklen_t) GetPeerNameError!void {
     if (comptime sim_layer) {
         if (sim.isStreamFd(fd)) return writeSimAddr(sim.streamPeer(fd) orelse return error.SocketUnconnected, addr, addr_len);
-        if (sim.isDgramFd(fd)) sim.panic("sim: getpeername on sim datagram socket {d} is not simulated (no sim datagram socket is connected)", .{fd});
+        if (sim.isDgramFd(fd)) return writeSimAddr(sim.dgramPeer(fd) orelse return error.SocketUnconnected, addr, addr_len);
         sim.refuseSimFd(@src(), fd);
     }
     switch (builtin.os.tag) {
@@ -1255,7 +1262,13 @@ pub fn recv(fd: fd_t, buffers: []iovec, flags: RecvFlags) RecvError!usize {
     }
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
-        if (sim.isDgramFd(fd)) return error.OperationNotSupported;
+        // A connected datagram socket receives from its peer; an
+        // unconnected one keeps the old answer (the connected-socket
+        // protocol above `sim.dgramConnect`).
+        if (sim.isDgramFd(fd)) {
+            if (sim.dgramPeer(fd) == null) return error.OperationNotSupported;
+            return simRecvLen(try simRecv(fd, buffers, flags), flags);
+        }
         sim.refuseSimFd(@src(), fd);
     }
 
@@ -1386,7 +1399,13 @@ pub fn send(fd: fd_t, buffers: []const iovec_const, flags: SendFlags) SendError!
     }
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
-        if (sim.isDgramFd(fd)) return error.OperationNotSupported;
+        // A connected datagram socket sends to its peer; an unconnected one
+        // keeps the old answer (the connected-socket protocol above
+        // `sim.dgramConnect`).
+        if (sim.isDgramFd(fd)) {
+            if (sim.dgramPeer(fd) == null) return error.OperationNotSupported;
+            return simSend(fd, buffers, flags, null, null);
+        }
         sim.refuseSimFd(@src(), fd);
     }
 
@@ -1882,8 +1901,9 @@ pub fn sendmsg(
             if (control != null and control.?.len > 0) {
                 sim.panic("sim: sendmsg with control data on sim fd {d}: use sendDatagram for a source address", .{fd});
             }
-            const a = addr orelse sim.panic("sim: sendmsg with no address on sim fd {d}: connected UDP is not simulated", .{fd});
-            return simSend(fd, buffers, flags, simAddr("sendmsg", a, addr_len), null);
+            // With no address: to a connected socket's peer
+            // (`sim.dgramSend` refuses it on an unconnected one).
+            return simSend(fd, buffers, flags, if (addr) |a| simAddr("sendmsg", a, addr_len) else null, null);
         }
     }
 
@@ -2230,7 +2250,7 @@ fn simRecvLen(r: sim.Received, flags: RecvFlags) usize {
 /// stream socket; ENet passes MSG_NOSIGNAL on every send) and `dontwait` (a
 /// sim send never waits). Every other flag refuses, by name: a flag added to
 /// `SendFlags` later refuses too until someone decides what it means here.
-fn simSend(fd: fd_t, buffers: []const iovec_const, flags: SendFlags, to: sim.Ip4, from: ?[4]u8) SendError!usize {
+fn simSend(fd: fd_t, buffers: []const iovec_const, flags: SendFlags, to: ?sim.Ip4, from: ?[4]u8) SendError!usize {
     inline for (comptime std.meta.fieldNames(SendFlags)) |name| {
         const accepted = comptime std.mem.eql(u8, name, "no_signal") or std.mem.eql(u8, name, "dontwait");
         if (!accepted and @field(flags, name)) sim.panic("sim: send flag " ++ name ++ " on sim fd {d} is not simulated", .{fd});
