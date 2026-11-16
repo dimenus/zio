@@ -1229,6 +1229,39 @@ the mutants in its commits.
     - The same instant: an ICMP landing at T is harvested before any task
       runs at T, so a connect at T comes after it (no ICMP). Pinned.
     - Promise 1 against 328d798: unchanged. 11 mutants, all killed.
+  - **Sitting 41: the last round on t-4167 (report 41).** One late-harvest
+    rule at the wire (`land`) and at every socket call (`dgramSlot`), in
+    a run that has connected; one receive preflight shared by `recvmsg`.
+    The track is closed.
+  - **Connected datagram sockets: what a user must know** (the protocol
+    is the comment above `dgramConnect` in `src/sim.zig`; the kernels'
+    answers are the tables in `src/sim_dgram_connect_test.zig`):
+    1. `connect`, `Socket.send`, `Socket.receive` (NetSend, NetRecv),
+       the layer's `send`, `recv`, `sendmsg` with no address work as on
+       the kernels. A stranger's datagram is dropped
+       (`DatagramStats.dropped_not_peer`). A datagram to a closed port
+       comes back as one pending `ConnectionRefused`, a round trip
+       later; the next send or receive takes it.
+    2. **Set a datagram profile** (`sim.setDatagramProfile(.linux or
+       .macos)`, before the run's first datagram socket) if the program
+       can send with an address on a connected socket, poll with an
+       error pending, or receive with a datagram queued and an error
+       pending: the kernels differ there, and with no profile those
+       panic. Hotseat uses `.macos`.
+    3. **Refused by name:** a second connect, a disconnect, `shutdown` of a
+       connected socket, a connect whose four-tuple has a ghost of unknown
+       fate (a fault rule, merged deaths, an overflowed bucket), and the
+       2^60th send of a run that connected.
+    4. **Never jump the clock with `sim.advanceNs` past datagram traffic
+       without polling right after** (sleep 1 ns). In a run that has
+       connected a datagram socket, an overdue entry at a harvest, or a
+       socket call while one is on the wire, panics with that advice.
+    5. A run that never connects a datagram socket and that completed
+       before t-4167 completes the same, with the same events, clock,
+       draws and digests.
+    6. Not modelled: Linux's refusal before the next send on loopback
+       (t-4179), ICMP rate limits; macOS's in-flight lookup was read, not
+       run.
   - **Next:**
     1. Slice 4 (17.16): the users. starh2's `dst-conn` accept step;
        hotseat's tests (17.15 item 7), after t-4110 and t-4111; then an
@@ -1617,9 +1650,11 @@ the mutants in its commits.
   (sitting 39: the overflow test passed by the luck of seed 1).
 - **`sim.advanceNs` does not poll.** A landing it jumps over is harvested
   at the next poll, not at the jump; a test that wants a harvest at the
-  jump sleeps 1 ns right after it. A late harvest that reaches a connected
-  datagram socket panics (sitting 40). An ev op (a connect too) polls, so
-  its harvest comes after the op is applied.
+  jump sleeps 1 ns right after it. In a run that has connected a datagram
+  socket, a late harvest or a socket call with an overdue entry on the
+  wire panics (sitting 41). An ev op (`Socket.open`, a connect) polls, so
+  its harvest comes after the op is applied; the layer's `socket` and
+  `bind` do not poll.
 - **An extra ICMP that no socket takes changes no error.** Two ghost
   mutants survived every error row; only `sim.icmpsMade()` showed them.
 - **A closed port costs a socket slot only while it is open.** A test
