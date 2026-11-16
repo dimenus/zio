@@ -558,6 +558,11 @@ The scripts the gates below use are beside them, in `zio-sim6-tools/` there
   158ebba):** the owner's two decisions on report 10 (sections 3.2 and 8).
   The bridge test's `enet_socketset_select` and its test are gone, and
   SO_SNDBUF sits in the bridge test's shared table.
+- **Connected datagram sockets (t-4167, 7ba69f0):** `connect`, the peer
+  filter, sends and receives with no address, and ICMP port unreachable as
+  a pending `ConnectionRefused`. Protocol: the comment above
+  `dgramConnect` in `src/sim.zig`; the kernels' answers: the parity table
+  in `src/sim_dgram_connect_test.zig`.
 - **Four rounds of outside review, all closed (3727c95 to d939580), and
   three model tests:** the next sections. Each fix commit holds the failing
   run before the fix, the mutants, and what was rejected.
@@ -1154,6 +1159,26 @@ the mutants in its commits.
       seed, events, clock, trace, wire digest and RNG are the same as at
       add1e96 (an end-of-run log compared run by run). Pipe ends are not
       the same shape: a pipe close draws from the RNG (t-4143 stays).
+  - **Sitting 37 (report 37, `j37/` and `g37/` in its scratch folder).**
+    - 7ba69f0 (t-4167): connected datagram sockets. Each row was run
+      first on real sockets through zio (macOS 25.6; Linux 6.8 with
+      io_uring and epoll; 3 runs each); the parity table holds them. The
+      kernels disagree on three rows: sendTo with an address on a
+      connected socket (the sim refuses), a poll with a pending error (the
+      sim refuses), and a queued datagram before the error (the sim takes
+      macOS's order). Promise 1: every existing run's end-of-run record is
+      unchanged (0 of 1096 main and 0 of 296 child runs differ). 31
+      mutants, all killed.
+    - Gates on 7ba69f0: macOS sim suite 473 of 473 (2 skipped) and
+      `check.sh --ci` 862 of 862 (476 skipped), 3 runs each; Linux sim
+      463 of 463 (1 skipped), without sim 878 of 880 (the two DNS
+      lookups), parity in io_uring and epoll, 3 runs each; the op model
+      digests and the stream model's 40 seeds as at 328d798; textcmp
+      equal to 0685d39, control differs; starh2's three steps with trace
+      digest c05b7576d516675ee650676f4af38437.
+    - Upstream: `origin/main` moved 3 commits (#923 cancel protection,
+      #924 check.sh shebang, #925 `max_executors`); none touches
+      sockets or the sim. Not merged.
   - **Next:**
     1. Slice 4 (17.16): the users. starh2's `dst-conn` accept step;
        hotseat's tests (17.15 item 7), after t-4110 and t-4111; then an
@@ -1170,7 +1195,12 @@ the mutants in its commits.
     migrated; whether to report it). Queued for the sim seat, not
     started: t-4106, t-4115, t-4117. Closed: t-4132, t-4133 (sitting
     32), t-4136 (sitting 33), t-4138, t-4142, t-4148, t-4149, t-4154
-    (sitting 35).
+    (sitting 35); t-4167 (sitting 37). Filed in sitting 37: t-4176
+    (hotseat: its ping-send test seam calls libc on the socket handle,
+    which under sim is a sim fd), t-4177 (no zio name for EISCONN), t-4178
+    (the sim's answers for send and recv on an unconnected datagram
+    socket), t-4179 (a datagram OS profile, if a consumer needs Linux's
+    order).
   - **What I would change, with what I know now:**
     - The parity table prints every row's answer now; a row that passes
       silently was how a measured difference could hide.
@@ -1281,6 +1311,11 @@ the mutants in its commits.
   run `<d>/bin/test` with `TEST_FILTER="sim: stream surface table"`.
   The same works for a mutant that the runner reports NOT RUN because
   an earlier test crashed the process.
+- **The connected datagram tests:** the filter `sim: dgram connect` in a
+  sim build. `sim: dgram connect parity` also runs without sim, on real
+  sockets, and checks the host kernel's column; on Linux run it in an
+  io_uring and an epoll binary (the gate scripts use the filter
+  `parity`, which runs the stream parity too).
 - **A new rule of section 17** gets a tag in `Rule` and its slice in
   `ruleSlice` in `src/sim_stream_test.zig`; the build fails until it
   has exactly one row.
@@ -1518,6 +1553,14 @@ the mutants in its commits.
   progress clear** (`\r`, `ESC [0K`). `hasPanicLine` skips it since
   d461504; before, a wanted line that was the child's first output never
   matched.
+- **A closed port costs a socket slot only while it is open.** A test
+  that makes a closed port (bind, read the port, close) frees slot 0, so
+  the next socket is fd 100032 again: a death test's expected fd moves
+  (sitting 37).
+- **Linux reports an ICMP error on loopback before the send returns;**
+  macOS later. A real-socket row that sends twice back to back to a
+  closed port gets two different answers (row 16 of the connected
+  table). Measure both before you write what "the kernel" does.
 - **A random test's floor that only says "not 0" sits thin.** The pull
   cases had floors of 1 and stayed at 1 per profile; the pull seeds'
   counts have floors of 10. Steering old seeds moved their digests and
