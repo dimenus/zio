@@ -209,10 +209,9 @@ pub fn shutdown(fd: fd_t, how: ShutdownHow) ShutdownError!void {
             .send => .send,
             .both => .both,
         });
-        // An unconnected UDP socket: ENOTCONN, as Linux answers. A connected
-        // one refuses (`sim.dgramShutdownRefuse`).
+        // An unconnected or closed UDP socket: ENOTCONN, as Linux answers.
         if (sim.isDgramFd(fd)) {
-            sim.dgramShutdownRefuse(fd);
+            if (sim.dgramIsConnected(fd)) sim.panic("sim: shutdown of connected sim datagram socket {d} is not simulated", .{fd});
             return error.SocketUnconnected;
         }
         sim.refuseSimFd(@src(), fd);
@@ -1684,6 +1683,8 @@ pub fn recvmsg(
             // a control buffer. Without one the kernels disagree (measured,
             // 2026-11-14): Linux 6.8 sets MSG_CTRUNC, macOS 25.6 does not.
             if (sim.dgramDestinationAddressEnabled(fd)) {
+                // A pending error first: it returns no datagram (review 4, finding 5).
+                if (sim.dgramTakeRefusal(fd)) return error.ConnectionRefused;
                 sim.panic("sim: recvmsg on sim fd {d}, which asked for destination addresses, is not simulated: use recvDatagram", .{fd});
             }
             const r = try simRecv(fd, buffers, flags);

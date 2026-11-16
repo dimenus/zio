@@ -1615,6 +1615,13 @@ const Ghost = struct {
     exact: bool,
 };
 pub const max_ghosts = 256;
+/// The most deaths an exact ghost counts (`testSetGhostCountMax`).
+var ghost_count_max: u32 = std.math.maxInt(u32);
+
+pub fn testSetGhostCountMax(n: u32) void {
+    if (comptime !builtin.is_test) @compileError("testSetGhostCountMax is for tests");
+    ghost_count_max = n;
+}
 var ghosts: [max_ghosts]Ghost = undefined;
 var ghosts_len: usize = 0;
 /// When the table is full even after merging each four-tuple into one
@@ -1644,7 +1651,7 @@ fn resetNet() void {
     wire_hasher = std.hash.Wyhash.init(0);
     rules_len = 0;
     rule_history_len = 0;
-    udp_rule_set = false;
+    udp_rule_since = no_rule;
     tcp_rule_set = false;
     fault_stats = .{};
     fault_draws = 0;
@@ -1888,9 +1895,10 @@ pub fn dgramEnableDestinationAddress(fd: i32) void {
 // - **A death no socket could take yet** (no socket at the sender's address
 //   was connected to the destination) makes no ICMP, so a run that never
 //   connects keeps every record. It is kept as a `Ghost` until its ICMP
-//   would have landed (the death is at the datagram's `due_at`); a
-//   `connect` that makes its four-tuple before then makes the ICMP, due at
-//   that time (row 19). A connect to another peer (row 20), from another
+//   would have landed (the death is at the datagram's `due_at`; it was
+//   under a fault rule only if one was set before then); a `connect` that
+//   makes its four-tuple before then makes the ICMP, due at that time
+//   (row 19). An exact ghost whose count would overflow becomes inexact. A connect to another peer (row 20), from another
 //   address (row 23), or after that time (row 24) makes none. Ghosts of one
 //   four-tuple are merged: deaths at one instant into one entry with a
 //   count; with a fault rule set, or when the table is full, into one
@@ -1899,6 +1907,13 @@ pub fn dgramEnableDestinationAddress(fd: i32) void {
 //   are not known). A table full even then puts the death in its
 //   four-tuple's overflow bucket, and only a connect whose four-tuple hashes
 //   to a live bucket refuses.
+// - **A late harvest** (a test jumped the clock with `advanceNs` past a wire
+//   entry and polled later; the loop's own clock never passes one): a late
+//   death whose sender is not connected to where it died is exact, as
+//   above. A late death whose sender is connected there, or a late ICMP
+//   that a connected socket would take, panics, naming the jump and the
+//   remedy (poll right after it): what the socket gets would depend on how
+//   late the harvest is.
 // - **The pending error** is one slot (rows 16 and 21: two ICMPs give one
 //   error on both kernels). The next send takes it and does not send its
 //   datagram (row 7), also a send with an address (row 25, both kernels;
@@ -1906,6 +1921,8 @@ pub fn dgramEnableDestinationAddress(fd: i32) void {
 //   9). A parked receive is woken with it (row 9). A parked NetPoll for
 //   reading is woken and completes with success, and the error stays (row
 //   10). `getsockopt` `SO_ERROR` returns ECONNREFUSED and clears it (row 8).
+//   `recvmsg` on a socket with destination addresses on takes it too; it
+//   still refuses a call that would return a datagram or would block.
 //   An unconnected socket never has one (row 12).
 // - **The datagram profile** (`DatagramProfile`), where the kernels differ:
 //   - row 5, a send with an address on a connected socket: `.macos` fails it
@@ -1933,7 +1950,8 @@ pub fn dgramEnableDestinationAddress(fd: i32) void {
 // (`AF_UNSPEC`); a connect to a port 0, a non-loopback or a wildcard
 // address; a connect that makes an inexact `Ghost`'s four-tuple (or any
 // ghost's, in a run that set a fault rule) before its bound, or whose
-// four-tuple's overflow bucket is live; `shutdown` of a connected socket;
+// four-tuple's overflow bucket is live; a late harvest that reaches a
+// connected socket; `shutdown` of a connected socket;
 // the three profile rows with no profile; in a run that connected, its
 // 2^60th datagram send or ICMP, and a connect after 2^60 sends.
 //
@@ -2011,7 +2029,7 @@ fn takeGhosts(fd: i32, local: Ip4, to: Ip4) void {
             i += 1;
             continue;
         }
-        if (!g.exact or udp_rule_set) panic("sim: connect of sim datagram socket {d} to {d}.{d}.{d}.{d}:{d}, where a datagram from its address died with no ICMP made, whose ICMP could still be on its way, in a run that set a fault rule or with deaths merged: its fate or time (loss, delay, jitter, order) is not known; not simulated", .{ fd, to.ip[0], to.ip[1], to.ip[2], to.ip[3], to.port });
+        if (!g.exact or udp_rule_since != no_rule) panic("sim: connect of sim datagram socket {d} to {d}.{d}.{d}.{d}:{d}, where a datagram from its address died with no ICMP made, whose ICMP could still be on its way, in a run that set a fault rule or with deaths merged: its fate or time (loss, delay, jitter, order) is not known; not simulated", .{ fd, to.ip[0], to.ip[1], to.ip[2], to.ip[3], to.port });
         std.mem.copyForwards(Ghost, ghosts[i .. ghosts_len - 1], ghosts[i + 1 .. ghosts_len]);
         ghosts_len -= 1;
         wire.ensureUnusedCapacity(net_alloc, g.count) catch panic("sim: out of memory for {d} ICMP entries at a connect", .{g.count});
@@ -2024,7 +2042,7 @@ fn takeGhosts(fd: i32, local: Ip4, to: Ip4) void {
 /// entry, else (the table full even after `compactGhosts`) its four-tuple's
 /// overflow bucket. Drops ghosts already past their arrival first.
 fn addGhost(sender: Ip4, dead: Ip4, death_at: u64) void {
-    const faulted = udp_rule_set;
+    const faulted = udp_rule_since < death_at;
     const arrival = death_at +| wire_latency_ns +| if (faulted) max_fault_delay_ns else 0;
     var w: usize = 0;
     for (ghosts[0..ghosts_len]) |x| {
@@ -2036,7 +2054,8 @@ fn addGhost(sender: Ip4, dead: Ip4, death_at: u64) void {
     for (ghosts[0..ghosts_len]) |*e| {
         if (!std.meta.eql(e.sender, sender) or !std.meta.eql(e.dead, dead)) continue;
         if (e.exact and !faulted and e.arrival == arrival) {
-            e.count +|= 1;
+            // A count that would overflow is no longer exact: a connect refuses.
+            if (e.count == ghost_count_max) e.exact = false else e.count += 1;
             return;
         }
         if (!e.exact or faulted) {
@@ -2089,12 +2108,6 @@ pub fn dgramPeer(fd: i32) ?Ip4 {
 pub fn dgramIsConnected(fd: i32) bool {
     if (!dgramIsOpen(fd)) return false;
     return dgrams[dgramIndex(fd)].peer != null;
-}
-
-/// `shutdown` of a sim datagram socket: an unconnected or closed one is
-/// `SocketUnconnected` (ENOTCONN, as Linux answers); a connected one refuses.
-pub fn dgramShutdownRefuse(fd: i32) void {
-    if (dgramIsConnected(fd)) panic("sim: shutdown of connected sim datagram socket {d} is not simulated", .{fd});
 }
 
 /// One datagram of `src` gathered, to `to`. With `from`, the datagram leaves
@@ -2154,7 +2167,7 @@ pub fn dgramSend(fd: i32, src: anytype, to_addr: ?Ip4, from: ?[4]u8) error{ Addr
         @memcpy(bytes[at..][0..sl.len], sl);
         at += sl.len;
     }
-    if (udp_rule_set) {
+    if (udp_rule_since != no_rule) {
         const src_addr: Ip4 = .{ .ip = src_ip, .port = d.local.port };
         // Every allocation this send could need comes before any fault
         // decision: a decision moves counts, matches, draws and a burst
@@ -2235,10 +2248,7 @@ pub fn dgramRecv(fd: i32, dst: anytype, dont_wait: bool) error{ WouldBlock, Conn
     refuseOtherThread("sim socket receive");
     checkIovecs("a receive", fd, dst.len);
     const d = dgramSlot("receive", fd);
-    if (d.refused and (d.meta_len == 0 or needDgramProfile("a receive with a datagram queued and an error pending (row 11)", fd) == .linux)) {
-        d.refused = false;
-        return error.ConnectionRefused;
-    }
+    if (dgramTakeRefusal(fd)) return error.ConnectionRefused;
     if (d.meta_len == 0) {
         if (dont_wait or d.nonblocking) return error.WouldBlock;
         panic("sim: a blocking receive on sim fd {d}, which is not non-blocking: nothing can land while the sim thread waits", .{fd});
@@ -2266,6 +2276,14 @@ pub fn dgramRecv(fd: i32, dst: anytype, dont_wait: bool) error{ WouldBlock, Conn
     }
     d.charged -= q.len + datagram_overhead;
     return .{ .copied = copied, .len = q.len, .from = q.from, .to = if (d.dst_addr) q.to else null };
+}
+
+/// Takes `fd`'s pending error if a receive would now: queue empty, or row 11.
+pub fn dgramTakeRefusal(fd: i32) bool {
+    const d = dgramSlot("receive", fd);
+    if (!d.refused or (d.meta_len != 0 and needDgramProfile("a receive with a datagram queued and an error pending (row 11)", fd) == .macos)) return false;
+    d.refused = false;
+    return true;
 }
 
 /// Puts `w` on the wire after every entry due no later (capacity reserved).
@@ -2688,19 +2706,15 @@ fn diedAtLanding(w: WireDatagram) void {
     const s = receiverOf(w.from) orelse return addGhost(w.from, w.to, w.due_at);
     const p = s.peer orelse return addGhost(w.from, w.to, w.due_at);
     if (!std.meta.eql(p, w.to)) return addGhost(w.from, w.to, w.due_at);
-    // The death is at `due_at` (the loop's clock never passes a wire entry;
-    // only a test's `advanceNs` can harvest one late), so its ICMP lands
-    // L later. If a jump has passed that time already and no fault rule
-    // could act on it, it lands now, recorded at that time; under a rule it
-    // goes on the wire for the next instant.
-    const back = w.due_at +| wire_latency_ns;
-    if (back <= clock_ns and !udp_rule_set) {
-        if (icmp_seq >= icmp_send_base) panic("sim: ICMP number {d}: from 2^60 on, its send number would leave its range (`icmp_send_base`)", .{icmp_seq});
-        const seq = icmp_send_base + icmp_seq;
-        icmp_seq += 1;
-        return landIcmp(.{ .seq = seq, .from = w.to, .to = w.from, .bytes = &.{}, .due_at = back, .icmp = true });
-    }
-    sendIcmpAt(w.to, w.from, @max(back, clock_ns +| 1));
+    lateHarvest("its sender is connected to where it died", w);
+    sendIcmpAt(w.to, w.from, clock_ns + wire_latency_ns);
+}
+
+/// A wire entry processed after its `due_at` (a test's `advanceNs` jumped
+/// past it; the loop's clock never does) refuses to reach a connected socket.
+fn lateHarvest(comptime what: []const u8, w: WireDatagram) void {
+    if (w.due_at >= clock_ns) return;
+    panic("sim: a datagram from port {d} to port {d} due at {d} ns was harvested at {d} ns, after a clock jump (sim.advanceNs) with no poll between; " ++ what ++ ", and what a connected socket gets would depend on how late the harvest is: not simulated. Poll right after the jump (for example sleep 1 ns)", .{ w.from.port, w.to.port, w.due_at, clock_ns });
 }
 
 /// Puts an ICMP port unreachable from `from` (the address where a datagram
@@ -2708,11 +2722,12 @@ fn diedAtLanding(w: WireDatagram) void {
 /// in the run, else through the rules as a datagram on that path (sent now).
 /// The caller reserved the room (`landDue`, `takeGhosts`).
 fn sendIcmpAt(from: Ip4, to: Ip4, due_at: u64) void {
-    if (icmp_seq >= icmp_send_base) panic("sim: ICMP number {d}: from 2^60 on, its send number would leave its range (`icmp_send_base`)", .{icmp_seq});
+    // Below 2^60 always: each ICMP is a death, each death a send, and a run
+    // that connected refuses its 2^60th send (`dgramSend`, `dgramConnect`).
     const send_no = icmp_send_base + icmp_seq;
     icmp_seq += 1;
     const base: WireDatagram = .{ .seq = send_no, .from = from, .to = to, .bytes = &.{}, .due_at = due_at, .icmp = true };
-    if (!udp_rule_set) return wireInsert(base);
+    if (udp_rule_since == no_rule) return wireInsert(base);
     switch (faultAtSend(send_no, from, to)) {
         .dropped => |outcome| {
             var x = base;
@@ -2739,6 +2754,7 @@ fn landIcmp(w: WireDatagram) void {
     const d = receiverOf(w.to) orelse return recordLanding(w, .no_socket);
     const p = d.peer orelse return recordLanding(w, .no_socket);
     if (!std.meta.eql(p, w.from)) return recordLanding(w, .no_socket);
+    lateHarvest("it is an ICMP that a connected socket would take", w);
     recordLanding(w, .landed);
     d.refused = true;
     d.stats.refusals += 1;
@@ -5574,7 +5590,10 @@ var rule_history: [max_rule_history]HistoryEntry = undefined;
 var rule_history_len: usize = 0;
 /// Whether this run ever set a `.udp` rule (its datagrams take the fault
 /// path from then on), or a `.tcp` one (its TCP entries do).
-var udp_rule_set: bool = false;
+/// When this run first set a `.udp` rule: `no_rule` before. A death after
+/// it was under a rule, wherever it is harvested (`addGhost`).
+var udp_rule_since: u64 = no_rule;
+const no_rule = std.math.maxInt(u64);
 var tcp_rule_set: bool = false;
 
 var fault_stats: NetFaultStats = .{};
@@ -5803,7 +5822,7 @@ fn addRule(comptime what: []const u8, key: RuleKey, imp: Impairment) void {
     rules[rules_len] = .{ .key = key, .imp = imp, .hist = hist };
     rules_len += 1;
     switch (key.protocol()) {
-        .udp => udp_rule_set = true,
+        .udp => udp_rule_since = @min(udp_rule_since, clock_ns),
         .tcp => tcp_rule_set = true,
     }
 }

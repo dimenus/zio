@@ -1883,6 +1883,9 @@ const reuse_runs = struct {
     /// and one in the overflow, the profile set.
     fn dirty() !void {
         sim.setDatagramProfile(.linux);
+        // A rule set and healed: `udp_rule_since` must not reach the next run.
+        sim.setPartition(unrelated_path);
+        _ = sim.healPartition(unrelated_path);
         var u = try bound(lo, 0);
         defer u.close();
         const c = try connected(9);
@@ -1932,26 +1935,16 @@ test "sim: dgram connect r3: a run made after a run that connected has the diges
     try t1.run(1, null, reuse_runs.dirty);
     try t1.run(1, null, reuse_runs.connects);
     try expectEqual(conn, digests);
+    // An exact ghost converted at a connect (no rule in this run).
+    r4.jump = false;
+    try t1.run(1, null, r4.lateWindow);
+    const window = digests;
+    try t1.run(1, null, reuse_runs.dirty);
+    try t1.run(1, null, r4.lateWindow);
+    try expectEqual(window, digests);
 }
 
 const r3b = struct {
-    /// A connected sender's landing harvested late, after a clock jump:
-    /// with `poll_at_jump` at 1.5L + 1 ns (a poll right after the jump),
-    /// else at 2.25L (the next poll). The death is at L either way, so its
-    /// ICMP is back at 2L, and at 2.25L the error is pending.
-    var poll_at_jump: bool = false;
-    fn lateConnected() !void {
-        const c = try connected(try closedPort());
-        defer c.close();
-        const t0 = sim.clockNs();
-        _ = try c.send("x", .none);
-        sim.advanceNs(L * 3 / 2);
-        if (poll_at_jump) try rt_mod.sleep(.fromNanoseconds(1));
-        try rt_mod.sleep(.fromNanoseconds(t0 + L * 9 / 4 - sim.clockNs()));
-        try expectEqual(t0 + L * 9 / 4, sim.clockNs());
-        try expectEqual(refused, recvNow(c.handle));
-    }
-
     /// Two deaths of one four-tuple at t0 + L and one at t0 + L + 10 us,
     /// then the sender connects in time: three ICMPs, at 2L, 2L and 2L +
     /// 10 us; the error is taken between them and set again.
@@ -2002,14 +1995,6 @@ const r3b = struct {
     }
 };
 
-test "sim: dgram connect r3: a connected sender's landing harvested late still gets its ICMP at 2L" {
-    if (comptime skip) return error.SkipZigTest;
-    r3b.poll_at_jump = true;
-    try t1.run(1, null, r3b.lateConnected);
-    r3b.poll_at_jump = false;
-    try t1.run(1, null, r3b.lateConnected);
-}
-
 test "sim: dgram connect r3: three deaths of one four-tuple at two instants make three ICMPs, each at its time" {
     if (comptime skip) return error.SkipZigTest;
     try t1.run(1, null, r3b.threeDeaths);
@@ -2035,6 +2020,210 @@ test "sim: dgram connect refuses: a connect that makes a four-tuple whose deaths
             // arrival (t0 + 2L).
             try rt_mod.sleep(.fromNanoseconds(t0 + L * 3 / 2 - sim.clockNs()));
             try u.connect(addr(lo, x), .{});
+        }
+    }.body);
+}
+
+// ---- Round 4 of the review (gpt-simnet20.md): the late harvest ----
+//
+// A late harvest: a test jumps the clock (`sim.advanceNs`) past a wire
+// entry and polls later, so the entry is processed after its `due_at`. No
+// real program reaches it (`Loop.poll` never passes a wire entry). The rule
+// (the protocol above `dgramConnect`): a late death whose sender is not
+// connected to where it died is exact (a ghost from `due_at`, faulted only
+// if a rule existed before the death); anything a late harvest would hand
+// to a connected socket panics, naming the jump and the remedy.
+
+const late_msg = "after a clock jump (sim.advanceNs) with no poll between";
+
+const r4 = struct {
+    /// Finding 1: an unconnected send at 0, a jump to 3L with no harvest,
+    /// an unrelated rule set and healed, the harvest, then the sender
+    /// connects to the dead address. The ICMP was back at 2L, before any
+    /// rule: the connect succeeds, no ICMP, as on time.
+    fn ruleAfterDeath() !void {
+        const x = try closedPort();
+        var u = try bound(lo, 0);
+        defer u.close();
+        _ = try u.sendTo(addr(lo, x), "x", .none);
+        sim.advanceNs(3 * L);
+        sim.setPartition(unrelated_path);
+        _ = sim.healPartition(unrelated_path);
+        try rt_mod.sleep(.fromNanoseconds(1));
+        try u.connect(addr(lo, x), .{});
+        try pause();
+        try expectEqual(@as(u64, 0), sim.icmpsMade());
+        try expectEqual(would_block, recvNow(u.handle));
+    }
+
+    /// Finding 7's window: the same death harvested on time, or late (a
+    /// jump to 1.5L, then a poll); the sender connects at 1.6L, inside the
+    /// ghost's window. Both get the ICMP at exactly 2L, and equal digests.
+    var jump: bool = false;
+    fn lateWindow() !void {
+        const x = try closedPort();
+        var u = try bound(lo, 0);
+        defer u.close();
+        const t0 = sim.clockNs();
+        _ = try u.sendTo(addr(lo, x), "x", .none);
+        if (jump) {
+            sim.advanceNs(L * 3 / 2);
+            try rt_mod.sleep(.fromNanoseconds(1));
+        }
+        try rt_mod.sleep(.fromNanoseconds(t0 + L * 8 / 5 - sim.clockNs()));
+        try u.connect(addr(lo, x), .{});
+        var task = try parkReceive(u);
+        task.join();
+        try expectEqual(refused, ended);
+        try expectEqual(t0 + 2 * L, ended_at);
+        capture();
+    }
+
+    /// Finding 5: destination addresses on, an error pending, the queue
+    /// empty: `recvmsg` takes the error.
+    fn recvmsgPending() !void {
+        const c = try connected(try closedPort());
+        defer c.close();
+        try os_net.enableDestinationAddress(c.handle);
+        _ = try c.send("x", .none);
+        try pause();
+        var buf: [8]u8 = undefined;
+        var iov = [1]os_net.iovec{os_net.iovecFromSlice(&buf)};
+        try expectEqual(refused, res(if (os_net.recvmsg(c.handle, &iov, .{ .dontwait = true }, null, null, null)) |r| r.len else |e| e));
+    }
+
+    /// The grader's mutant (`<` for `<=`): the sender connects at exactly
+    /// the ICMP's arrival instant (2L). In the sim the ICMP's landing is
+    /// harvested before any task runs at that instant, so it found the
+    /// sender unconnected: no ICMP, as at row 24.
+    fn connectAtArrival() !void {
+        const x = try closedPort();
+        var u = try bound(lo, 0);
+        defer u.close();
+        const t0 = sim.clockNs();
+        _ = try u.sendTo(addr(lo, x), "x", .none);
+        try rt_mod.sleep(.fromNanoseconds(t0 + 2 * L - sim.clockNs()));
+        try expectEqual(t0 + 2 * L, sim.clockNs());
+        try u.connect(addr(lo, x), .{});
+        try pause();
+        try expectEqual(@as(u64, 0), sim.icmpsMade());
+        try expectEqual(would_block, recvNow(u.handle));
+    }
+};
+
+test "sim: dgram connect r4: a rule set after a death that is harvested late does not extend its ghost" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, r4.ruleAfterDeath);
+}
+
+test "sim: dgram connect r4: a death harvested late, with its sender unconnected, gives the same ICMP time and digests as on time" {
+    if (comptime skip) return error.SkipZigTest;
+    r4.jump = false;
+    try t1.run(1, null, r4.lateWindow);
+    const a = digests;
+    r4.jump = true;
+    try t1.run(1, null, r4.lateWindow);
+    // The state digest holds the trace and the event count, which the
+    // jump's extra poll changes; the socket's answers are the wire's.
+    try expectEqual(a.wire, digests.wire);
+}
+
+test "sim: dgram connect r4: recvmsg on a socket with destination addresses takes a pending error" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, r4.recvmsgPending);
+}
+
+test "sim: dgram connect r4: a connect at the ICMP's arrival instant comes after its landing: no ICMP" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, r4.connectAtArrival);
+}
+
+test "sim: dgram connect refuses: a late harvest of deaths of a connected sender (finding 2: two of one flow)" {
+    try t1.refusal("sim: dgram connect refuses: a late harvest of deaths of a connected sender (finding 2: two of one flow)", "sim: a datagram from port 49153 to port 49152 due at 150000 ns was harvested at 300001 ns, " ++ late_msg, null, struct {
+        fn body() !void {
+            const c = try connected(try closedPort());
+            defer c.close();
+            _ = try c.send("a", .none);
+            try rt_mod.sleep(.fromMicroseconds(50));
+            _ = try c.send("b", .none);
+            try rt_mod.sleep(.fromMicroseconds(60));
+            sim.advanceNs(190_000);
+            try rt_mod.sleep(.fromNanoseconds(1));
+        }
+    }.body);
+}
+
+test "sim: dgram connect refuses: a late harvest of a connected sender's death after a healed rule (finding 3)" {
+    try t1.refusal("sim: dgram connect refuses: a late harvest of a connected sender's death after a healed rule (finding 3)", "sim: a datagram from port 49153 to port 49152 due at 100000 ns was harvested at 225001 ns, " ++ late_msg, null, struct {
+        fn body() !void {
+            sim.setPartition(unrelated_path);
+            _ = sim.healPartition(unrelated_path);
+            const c = try connected(try closedPort());
+            defer c.close();
+            _ = try c.send("a", .none);
+            sim.advanceNs(225_000);
+            try rt_mod.sleep(.fromNanoseconds(1));
+        }
+    }.body);
+}
+
+test "sim: dgram connect refuses: a connect after a clock jump, before the late harvest of the sender's death (finding 4)" {
+    try t1.refusal("sim: dgram connect refuses: a connect after a clock jump, before the late harvest of the sender's death (finding 4)", "sim: a datagram from port 49153 to port 49152 due at 100000 ns was harvested at 300000 ns, " ++ late_msg, null, struct {
+        fn body() !void {
+            const x = try closedPort();
+            var u = try bound(lo, 0);
+            defer u.close();
+            _ = try u.sendTo(addr(lo, x), "x", .none);
+            sim.advanceNs(300_000);
+            try u.connect(addr(lo, x), .{});
+            try rt_mod.sleep(.fromNanoseconds(1));
+        }
+    }.body);
+}
+
+test "sim: dgram connect refuses: an ICMP harvested late at a connected socket" {
+    try t1.refusal("sim: dgram connect refuses: an ICMP harvested late at a connected socket", "sim: a datagram from port 49152 to port 49153 due at 200000 ns was harvested at 300001 ns, " ++ late_msg, null, struct {
+        fn body() !void {
+            const c = try connected(try closedPort());
+            defer c.close();
+            _ = try c.send("a", .none);
+            try rt_mod.sleep(.fromMicroseconds(150));
+            sim.advanceNs(150_000);
+            try rt_mod.sleep(.fromNanoseconds(1));
+        }
+    }.body);
+}
+
+test "sim: dgram connect refuses: a connect that makes a ghost whose count would have overflowed (finding 6)" {
+    try t1.refusal("sim: dgram connect refuses: a connect that makes a ghost whose count would have overflowed (finding 6)", "sim: connect of sim datagram socket 100032 to 127.0.0.1:49152, where a datagram from its address died with no ICMP made", null, struct {
+        fn body() !void {
+            // Three deaths of one four-tuple at one instant, with room to
+            // count two: the third makes the ghost inexact.
+            sim.testSetGhostCountMax(2);
+            const x = try closedPort();
+            var u = try bound(lo, 0);
+            defer u.close();
+            for (0..3) |_| _ = try u.sendTo(addr(lo, x), "x", .none);
+            try rt_mod.sleep(.fromMicroseconds(150));
+            try u.connect(addr(lo, x), .{});
+        }
+    }.body);
+}
+
+test "sim: dgram connect: with room to count two deaths, two deaths at one instant still make two ICMPs" {
+    if (comptime skip) return error.SkipZigTest;
+    sim.testSetGhostCountMax(2);
+    defer sim.testSetGhostCountMax(std.math.maxInt(u32));
+    try t1.run(1, null, struct {
+        fn body() !void {
+            const x = try closedPort();
+            var u = try bound(lo, 0);
+            defer u.close();
+            for (0..2) |_| _ = try u.sendTo(addr(lo, x), "x", .none);
+            try rt_mod.sleep(.fromMicroseconds(150));
+            try u.connect(addr(lo, x), .{});
+            try pause();
+            try expectEqual(@as(u64, 2), sim.icmpsMade());
         }
     }.body);
 }
