@@ -2260,6 +2260,28 @@ test "sim: dgram connect refuses: a bind after a clock jump, while a connected s
     }.body);
 }
 
+test "sim: dgram connect refuses: a bind after a clock jump that lands exactly on a connected sender's datagram's due time" {
+    // On time, the poll that moves the clock to an entry's due time lands it
+    // before any task runs at that instant, and every send is due at least
+    // wire_latency_ns after it leaves. So no on-time socket call sees an entry
+    // due now on the wire. After a jump to exactly that time, the bind runs
+    // before the landing: it must refuse, as it does one nanosecond later.
+    try t1.refusal("sim: dgram connect refuses: a bind after a clock jump that lands exactly on a connected sender's datagram's due time", "sim: bind on sim fd 100033, while a datagram from port 49153 to port 49152 due at 100000 ns is on the wire at 100000 ns: overdue, after a clock jump (sim.advanceNs) with no poll between, in a run that has connected a datagram socket", null, struct {
+        fn body() !void {
+            const c = try connected(try closedPort());
+            defer c.close();
+            _ = try c.send("a", .none);
+            sim.advanceNs(L);
+            // The layer's socket and bind do not poll (an ev op would).
+            const r = try os_net.socket(.ipv4, .dgram, .ip, .{ .nonblocking = true });
+            defer os_net.close(r);
+            var sa = t1.sockaddr(lo, 49152);
+            try os_net.bind(r, @ptrCast(&sa), @sizeOf(os_net.sockaddr.in));
+            try rt_mod.sleep(.fromNanoseconds(1));
+        }
+    }.body);
+}
+
 const r5 = struct {
     /// Finding 3: on the destination-address `recvmsg` branch, 1025 iovecs
     /// refuse before the pending error is taken, as on recvfrom.

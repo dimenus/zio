@@ -1747,7 +1747,12 @@ const overdue_remedy = "Poll right after the jump (for example sleep 1 ns)";
 fn dgramSlot(comptime what: []const u8, fd: i32) *Dgram {
     // A call between such a jump and the poll could change where an overdue
     // entry goes (a bind, a close, a connect) or see the state before it.
-    if (dgram_connect_used and wire.items.len != 0 and wire.items[0].due_at < clock_ns) {
+    // An entry due exactly now counts too: on time, the poll that moves the
+    // clock to its due time lands it before any task runs at that instant,
+    // and no send is due sooner than `wire_latency_ns` after it leaves, so no
+    // on-time call sees it here. (`land` keeps `<`: the poll at the due time
+    // is the on-time landing.)
+    if (dgram_connect_used and wire.items.len != 0 and wire.items[0].due_at <= clock_ns) {
         const w = wire.items[0];
         panic("sim: " ++ what ++ " on sim fd {d}, while {s} from port {d} to port {d} due at {d} ns is on the wire at {d} ns: overdue, after a clock jump (sim.advanceNs) with no poll between, in a run that has connected a datagram socket. " ++ overdue_remedy, .{ fd, if (w.icmp) "an ICMP" else "a datagram", w.from.port, w.to.port, w.due_at, clock_ns });
     }
