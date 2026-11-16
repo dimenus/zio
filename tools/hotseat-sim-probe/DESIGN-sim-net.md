@@ -1197,6 +1197,25 @@ the mutants in its commits.
     - Row 16 is a schedule on Linux, not a guarantee (read in v6.8's
       softirq path); not modelled, t-4179.
     - Promise 1 against 328d798: no run changed. 24 mutants, all killed.
+  - **Sitting 39 (report 39, `j39/` and `g37/<commit>/` in its scratch
+    folder): the outside review of e314ecf (`gpt-simnet19.md`).**
+    - Ghosts are keyed by four-tuple; an overflow refuses only a connect
+      whose four-tuple's bucket is live (Hotseat's shape: fault rules and
+      hundreds of media deaths at a closed client no longer refuse an
+      unrelated connect). A death is at its `due_at`, so the wire digest
+      and the clock determine every ghost. A send with an address takes a
+      pending error first (row 25, measured on both kernels). The 2^60
+      refusal only in a run that connected. Horizons saturate.
+    - The in-flight rows rerun with the change at 1.5 delays (measured
+      75 to 80 ms): the same answers. The kernel looks up at arrival.
+    - **The promise, stated exactly:** a run that never connects a
+      datagram socket and that completed before t-4167 completes the same,
+      with the same events, clock, draws and digests. A run that panicked
+      before may panic with another text or get an answer.
+    - The grader's three mutants of 7ba69f0 survived at e314ecf too (the
+      sim suite 489 of 489 under each); now killed. Every run-scoped
+      variable added for t-4167 has a mutant of its reset, killed by the
+      test of a run made after a run that connected.
   - **Next:**
     1. Slice 4 (17.16): the users. starh2's `dst-conn` accept step;
        hotseat's tests (17.15 item 7), after t-4110 and t-4111; then an
@@ -1580,6 +1599,12 @@ the mutants in its commits.
   answer on paths no test took (a NetRecv beside a parked op; calls on a
   closed fd). For each changed line, ask what the old answer was on every
   input, and pin it with a test.
+- **Flows due at one instant land in a seeded order.** A test that needs
+  one particular death to be "the 257th" must give it another instant
+  (sitting 39: the overflow test passed by the luck of seed 1).
+- **`sim.advanceNs` does not poll.** A landing it jumps over is harvested
+  at the next poll, not at the jump; a test that wants a harvest at the
+  jump sleeps 1 ns right after it.
 - **An extra ICMP that no socket takes changes no error.** Two ghost
   mutants survived every error row; only `sim.icmpsMade()` showed them.
 - **A closed port costs a socket slot only while it is open.** A test
