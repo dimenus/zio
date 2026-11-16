@@ -29,6 +29,7 @@ const ev = @import("ev/root.zig");
 const io_common = @import("common.zig");
 const os_net = @import("os/net.zig");
 const t1 = @import("sim_stream_test.zig");
+const zio_time = @import("time.zig");
 
 const L = sim.wire_latency_ns;
 const lo: [4]u8 = .{ 127, 0, 0, 1 };
@@ -177,6 +178,11 @@ const Got = struct {
     // 16: two sends to a closed port back to back.
     r16_send: [2]Res = @splat(.{}),
     r16_recv: [2]Res = @splat(.{}),
+    // 25: a send WITH an address while an error is pending, then a receive
+    // (round 3 of the review, finding 1).
+    r25_sendto: Res = .{},
+    r25_recv: Res = .{},
+    r25_other_got: Res = .{},
     // 17: a connected stranger, dropped by the filter, is refused.
     r17_send: Res = .{},
     r17_its_recv: Res = .{},
@@ -230,6 +236,9 @@ const macos_col: Got = .{
     .r17_send = ok1,
     .r17_its_recv = refused,
     .r17_c_recv = would_block,
+    .r25_sendto = refused,
+    .r25_recv = would_block,
+    .r25_other_got = would_block,
 };
 
 const linux_col: Got = blk: {
@@ -512,6 +521,19 @@ const parity = struct {
         got.r17_c_recv = recvNow(c.handle);
     }
 
+    fn row25() !void {
+        const p = try bound(lo, 0);
+        defer p.close();
+        const c = try connected(try closedPort());
+        defer c.close();
+        _ = try c.send("x", .none);
+        try pause();
+        got.r25_sendto = res(c.sendTo(addr(lo, try portOf(p)), "a", .none));
+        try pause();
+        got.r25_recv = recvNow(c.handle);
+        got.r25_other_got = recvNow(p.handle);
+    }
+
     fn body() !void {
         got = .{};
         const in_sim = sim.isRunning();
@@ -535,6 +557,7 @@ const parity = struct {
         try row15();
         try row16();
         try row17();
+        try row25();
     }
 
     fn check(k: Kernel) !void {
@@ -1147,18 +1170,23 @@ test "sim: dgram connect: with a fault rule set, a connect to another peer, or o
     }.body);
 }
 
-test "sim: dgram connect refuses: a connect while the ghost table has overflowed" {
-    try t1.refusal("sim: dgram connect refuses: a connect while the ghost table has overflowed", "sim: connect of sim datagram socket 100033 before 200000 ns: the ghost table overflowed", null, struct {
+// Round 3, finding 2: the overflow refuses only a connect whose four-tuple
+// was dropped (its bucket); `... 257 distinct deaths at one instant: an
+// unrelated connect is not refused ...` shows the other side.
+test "sim: dgram connect refuses: a connect whose four-tuple the full ghost table dropped" {
+    try t1.refusal("sim: dgram connect refuses: a connect whose four-tuple the full ghost table dropped", "sim: connect of sim datagram socket 100032 to 127.0.0.1:60257: the ghost table was full", null, struct {
         fn body() !void {
-            const x = try closedPort();
             var u = try bound(lo, 0);
             defer u.close();
-            // 257 deaths at L with no connected sender, each kept until 2L.
-            for (0..sim.max_ghosts + 1) |_| _ = try u.sendTo(addr(lo, x), "x", .none);
+            // 257 distinct four-tuples die at L; the 257th goes to its bucket.
+            var k: u16 = 0;
+            while (k < sim.max_ghosts) : (k += 1) _ = try u.sendTo(addr(lo, 60001 + k), "x", .none);
+            // The 257th dies 10 us after the others (flows due at one
+            // instant land in a seeded order), so it is the one dropped.
+            try rt_mod.sleep(.fromMicroseconds(10));
+            _ = try u.sendTo(addr(lo, 60001 + sim.max_ghosts), "x", .none);
             try rt_mod.sleep(.fromMicroseconds(150));
-            var v = try bound(lo, 0);
-            defer v.close();
-            try v.connect(addr(lo, x), .{});
+            try u.connect(addr(lo, 60001 + sim.max_ghosts), .{});
         }
     }.body);
 }
@@ -1198,13 +1226,25 @@ test "sim: dgram connect refuses: a second setDatagramProfile" {
     }.body);
 }
 
-test "sim: dgram connect refuses: a run's 2^60th datagram send" {
-    try t1.refusal("sim: dgram connect refuses: a run's 2^60th datagram send", "sim: datagram send number 1152921504606846976 on sim fd 100032: from 2^60 on", null, struct {
+test "sim: dgram connect refuses: the 2^60th datagram send of a run that connected" {
+    try t1.refusal("sim: dgram connect refuses: the 2^60th datagram send of a run that connected", "sim: datagram send number 1152921504606846976 on sim fd 100032: from 2^60 on", null, struct {
+        fn body() !void {
+            var u = try bound(lo, 0);
+            defer u.close();
+            try u.connect(addr(lo, 9), .{});
+            sim.testSetWireSeq(1 << 60);
+            _ = try u.send("x", .none);
+        }
+    }.body);
+}
+
+test "sim: dgram connect refuses: a connect after 2^60 datagram sends" {
+    try t1.refusal("sim: dgram connect refuses: a connect after 2^60 datagram sends", "sim: connect of sim datagram socket 100032 after 1152921504606846976 datagram sends", null, struct {
         fn body() !void {
             var u = try bound(lo, 0);
             defer u.close();
             sim.testSetWireSeq(1 << 60);
-            _ = try u.sendTo(addr(lo, 9), "x", .none);
+            try u.connect(addr(lo, 9), .{});
         }
     }.body);
 }
@@ -1467,9 +1507,22 @@ const in_flight = struct {
     var got: InFlight = .{};
     var delay_ms: u64 = 0;
 
-    /// Inside the window: after the send, before the ICMP is back.
-    fn soon() !void {
-        if (sim.isRunning()) try rt_mod.sleep(.fromMicroseconds(150)) else try rt_mod.sleep(.fromMilliseconds(delay_ms / 5));
+    /// Inside the window, at 1.5 path delays after the send: the datagram
+    /// has died (one delay) and its ICMP is not back yet (two delays). So
+    /// the change is made after the death, and the row shows whether the
+    /// recipient is chosen at the death or looked up at the arrival (round
+    /// 3 of the review, finding 4). Each row prints the time it made its
+    /// change, measured from its send.
+    fn soon(row: []const u8, t0: zio_time.Timestamp) !void {
+        if (sim.isRunning()) try rt_mod.sleep(.fromMicroseconds(L * 3 / 2 / 1000)) else try rt_mod.sleep(.fromMilliseconds(delay_ms * 3 / 2));
+        const ns = t0.durationTo(zio_time.Timestamp.now(.monotonic)).toNanoseconds();
+        const d: u64 = if (sim.isRunning()) L else delay_ms * std.time.ns_per_ms;
+        std.debug.print("in-flight {s}: change at {d} us after the send (one path delay {d} us)\n", .{ row, @divTrunc(ns, 1000), d / 1000 });
+        if (ns <= d or ns >= 2 * d) return error.ChangeOutsideTheWindow;
+    }
+
+    fn sentAt() zio_time.Timestamp {
+        return zio_time.Timestamp.now(.monotonic);
     }
 
     /// After the ICMP is back.
@@ -1482,8 +1535,9 @@ const in_flight = struct {
         var c = try bound(lo, 0);
         const cp = try portOf(c);
         try c.connect(addr(lo, x), .{});
+        const t0 = sentAt();
         _ = try c.send("x", .none);
-        try soon();
+        try soon("row 18", t0);
         c.close();
         var c2 = try bound(lo, cp);
         defer c2.close();
@@ -1496,8 +1550,9 @@ const in_flight = struct {
         const x = try closedPort();
         var u = try bound(lo, 0);
         defer u.close();
+        const t0 = sentAt();
         _ = try u.sendTo(addr(lo, x), "x", .none);
-        try soon();
+        try soon("row 19", t0);
         try u.connect(addr(lo, x), .{});
         try settle();
         got.r19_connect_to_it = recvNow(u.handle);
@@ -1509,8 +1564,9 @@ const in_flight = struct {
         const x = try closedPort();
         var u = try bound(lo, 0);
         defer u.close();
+        const t0 = sentAt();
         _ = try u.sendTo(addr(lo, x), "x", .none);
-        try soon();
+        try soon("row 20", t0);
         try u.connect(addr(lo, try portOf(p)), .{});
         _ = try u.send("y", .none);
         try settle();
@@ -1531,8 +1587,9 @@ const in_flight = struct {
         const x = try closedPort();
         const u = try bound(lo, 0);
         const up = try portOf(u);
+        const t0 = sentAt();
         _ = try u.sendTo(addr(lo, x), "x", .none);
-        try soon();
+        try soon("row 22", t0);
         u.close();
         var v = try bound(lo, up);
         defer v.close();
@@ -1547,8 +1604,9 @@ const in_flight = struct {
         const x = try closedPort();
         const u = try bound(lo, 0);
         defer u.close();
+        const t0 = sentAt();
         _ = try u.sendTo(addr(lo, x), "x", .none);
-        try soon();
+        try soon("row 23", t0);
         var v = try bound(lo, 0);
         defer v.close();
         try v.connect(addr(lo, x), .{});
@@ -1603,4 +1661,380 @@ test "sim: dgram connect in-flight rows: a connect or a new socket while the ICM
     var h = try rt.spawn(in_flight.body, .{});
     try h.join();
     try in_flight.check("linux with netem");
+}
+
+// ---- Round 3 of the review (gpt-simnet19.md) ----
+
+const unrelated_path: sim.Path = .{ .from = .{ .ip = .{ 127, 0, 0, 9 } }, .to = .{ .ip = .{ 127, 0, 0, 9 } } };
+
+const r3 = struct {
+    /// Finding 2, Hotseat's shape: a fault rule set (on an unrelated path),
+    /// a host sends 300 media datagrams to a client port that has closed,
+    /// then an unrelated socket connects to a live peer. It must not be
+    /// refused: none of the deaths has its four-tuple.
+    fn manyDeathsUnrelatedConnect() !void {
+        sim.setPartition(unrelated_path);
+        const p = try bound(lo, 0);
+        defer p.close();
+        const x = try closedPort();
+        const h = try bound(lo, 0);
+        defer h.close();
+        for (0..300) |_| {
+            _ = try h.sendTo(addr(lo, x), "media", .none);
+            try rt_mod.sleep(.fromMicroseconds(10));
+        }
+        try pause();
+        var v = try bound(lo, 0);
+        defer v.close();
+        try v.connect(addr(lo, try portOf(p)), .{});
+        try expectEqual(ok1, res(v.send("y", .none)));
+        _ = sim.healPartition(unrelated_path);
+        capture();
+    }
+
+    /// Finding 2 with no fault rule: 257 distinct four-tuples die at one
+    /// instant (one more than the table holds). Another socket connects to
+    /// a live peer: not refused. The sender connects to the first dead port
+    /// in time: its ICMP is made, exactly at 2L.
+    fn overflowUnrelated() !void {
+        const p = try bound(lo, 0);
+        defer p.close();
+        var u = try bound(lo, 0);
+        defer u.close();
+        const t0 = sim.clockNs();
+        var k: u16 = 0;
+        while (k < sim.max_ghosts) : (k += 1) _ = try u.sendTo(addr(lo, 60001 + k), "x", .none);
+        // The 257th dies 10 us after the others (flows due at one
+        // instant land in a seeded order), so it is the one dropped.
+        try rt_mod.sleep(.fromMicroseconds(10));
+        _ = try u.sendTo(addr(lo, 60001 + sim.max_ghosts), "x", .none);
+        try rt_mod.sleep(.fromMicroseconds(150));
+        var v = try bound(lo, 0);
+        defer v.close();
+        try v.connect(addr(lo, try portOf(p)), .{});
+        try u.connect(addr(lo, 60001), .{});
+        var task = try parkReceive(u);
+        task.join();
+        try expectEqual(refused, ended);
+        try expectEqual(t0 + 2 * L, ended_at);
+        capture();
+    }
+
+    /// Finding 3: the datagram is due at L. Run A harvests it at L; run B
+    /// jumps the clock to 1.5L first (`sim.advanceNs`), so it lands then.
+    /// Both stand at 2.25L, then the sender connects to the dead address.
+    /// The death is at L in both, its ICMP back at 2L: no ICMP either way,
+    /// and equal digests.
+    var jump: bool = false;
+    fn lateHarvest() !void {
+        const q = try bound(lo, 0);
+        defer q.close();
+        const c = try connected(try portOf(q));
+        defer c.close();
+        const x = try closedPort();
+        var u = try bound(lo, 0);
+        defer u.close();
+        const t0 = sim.clockNs();
+        _ = try u.sendTo(addr(lo, x), "x", .none);
+        if (jump) sim.advanceNs(L * 3 / 2);
+        try rt_mod.sleep(.fromNanoseconds(t0 + L * 9 / 4 - sim.clockNs()));
+        try expectEqual(t0 + L * 9 / 4, sim.clockNs());
+        try u.connect(addr(lo, x), .{});
+        try pause();
+        try expectEqual(@as(u64, 0), sim.icmpsMade());
+        try expectEqual(would_block, recvNow(u.handle));
+        capture();
+    }
+
+    /// Finding 5: a dead landing near the end of the clock's range, with
+    /// no connect; with `faulted` after a fault rule (a 60 s horizon).
+    var faulted: bool = false;
+    fn endOfClock() !void {
+        if (faulted) sim.setPartition(unrelated_path);
+        const x = try closedPort();
+        const u = try bound(lo, 0);
+        defer u.close();
+        sim.advanceNs(std.math.maxInt(u64) - sim.clockNs() - 150_000);
+        _ = try u.sendTo(addr(lo, x), "x", .none);
+        try rt_mod.sleep(.fromMicroseconds(100));
+        try expectEqual(@as(u64, 1), sim.datagramsDroppedNoSocket());
+        if (faulted) _ = sim.healPartition(unrelated_path);
+    }
+
+    /// Finding 6: a run that never connects sends its 2^60th datagram.
+    fn bigSendNoConnect() !void {
+        const u = try bound(lo, 0);
+        defer u.close();
+        sim.testSetWireSeq(1 << 60);
+        try expectEqual(ok1, res(u.sendTo(addr(lo, 9), "x", .none)));
+    }
+
+    /// Finding 7: with a fault rule set, the sender connects to the dead
+    /// address after the ghost's bound (death + L + max_fault_delay_ns):
+    /// no refusal, no ICMP.
+    fn faultedExpiry() !void {
+        sim.setPartition(unrelated_path);
+        const x = try closedPort();
+        var u = try bound(lo, 0);
+        defer u.close();
+        _ = try u.sendTo(addr(lo, x), "x", .none);
+        try rt_mod.sleep(.fromNanoseconds(2 * L + sim.max_fault_delay_ns + 1000));
+        try u.connect(addr(lo, x), .{});
+        try pause();
+        try expectEqual(@as(u64, 0), sim.icmpsMade());
+        try expectEqual(would_block, recvNow(u.handle));
+        _ = sim.healPartition(unrelated_path);
+    }
+
+    /// Mutant 3 of round 3: a socket bound to 127.0.0.2 keeps that address
+    /// at its connect, and its datagrams leave from it.
+    fn otherLoopback() !void {
+        const p = try bound(lo, 0);
+        defer p.close();
+        var c = try bound(.{ 127, 0, 0, 2 }, 0);
+        defer c.close();
+        try c.connect(addr(lo, try portOf(p)), .{});
+        const l = try local(c.handle);
+        try expectEqual([4]u8{ 127, 0, 0, 2 }, l.ip);
+        _ = try c.send("x", .none);
+        try pause();
+        var buf: [8]u8 = undefined;
+        var iov = [1]os_net.iovec{os_net.iovecFromSlice(&buf)};
+        var from: os_net.sockaddr.in = undefined;
+        _ = try os_net.recvDatagram(p.handle, &iov, .{ .dontwait = true }, &from);
+        try expectEqual([4]u8{ 127, 0, 0, 2 }, @as([4]u8, @bitCast(from.addr)));
+    }
+
+    /// Mutant 1 of round 3: a pending error, or the same error taken by a
+    /// read of SO_ERROR (which records nothing), at the digest.
+    var take: bool = false;
+    fn pendingByte() !void {
+        const c = try connected(try closedPort());
+        defer c.close();
+        _ = try c.send("x", .none);
+        try pause();
+        if (take) {
+            var e: i32 = 0;
+            try os_net.getsockopt(c.handle, os_net.SOL.SOCKET, os_net.SO.ERROR, std.mem.asBytes(&e));
+        }
+        capture();
+    }
+};
+
+test "sim: dgram connect r3: with a fault rule set, 300 deaths at a closed client, then an unrelated connect is not refused" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, r3.manyDeathsUnrelatedConnect);
+}
+
+test "sim: dgram connect r3: 257 distinct deaths at one instant: an unrelated connect is not refused, and a kept four-tuple still gets its ICMP at 2L" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, r3.overflowUnrelated);
+}
+
+test "sim: dgram connect r3: a landing harvested late (a clock jump) dies at its due time: the same ghost and digests as one harvested on time" {
+    if (comptime skip) return error.SkipZigTest;
+    r3.jump = false;
+    try t1.run(1, null, r3.lateHarvest);
+    const a = digests;
+    r3.jump = true;
+    try t1.run(1, null, r3.lateHarvest);
+    try expectEqual(a.state, digests.state);
+    try expectEqual(a.wire, digests.wire);
+}
+
+test "sim: dgram connect r3: a dead landing near the end of the clock's range, in a run that never connects, with and without a fault rule" {
+    if (comptime skip) return error.SkipZigTest;
+    r3.faulted = false;
+    try t1.run(1, null, r3.endOfClock);
+    r3.faulted = true;
+    try t1.run(1, null, r3.endOfClock);
+}
+
+test "sim: dgram connect r3: a run that never connects may send its 2^60th datagram" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, r3.bigSendNoConnect);
+}
+
+test "sim: dgram connect r3: with a fault rule set, a connect to the dead address after the ghost's bound is not refused and makes no ICMP" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, r3.faultedExpiry);
+}
+
+test "sim: dgram connect r3: a socket bound to 127.0.0.2 keeps that address at its connect" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, r3.otherLoopback);
+}
+
+test "sim: dgram connect r3: the state digest sees a pending error that a read of SO_ERROR took" {
+    if (comptime skip) return error.SkipZigTest;
+    r3.take = false;
+    try t1.run(1, null, r3.pendingByte);
+    const a = digests;
+    r3.take = true;
+    try t1.run(1, null, r3.pendingByte);
+    try expectEqual(a.trace, digests.trace);
+    try expectEqual(a.wire, digests.wire);
+    try expect(a.state != digests.state);
+}
+
+const reuse_runs = struct {
+    /// A run that connects and leaves state behind at its end: an ICMP made
+    /// (icmp_seq), live ghosts for 256 four-tuples from 127.0.0.1:49152
+    /// and one in the overflow, the profile set.
+    fn dirty() !void {
+        sim.setDatagramProfile(.linux);
+        var u = try bound(lo, 0);
+        defer u.close();
+        const c = try connected(9);
+        defer c.close();
+        _ = try c.send("x", .none);
+        var k: u16 = 0;
+        while (k < sim.max_ghosts) : (k += 1) _ = try u.sendTo(addr(lo, 60001 + k), "x", .none);
+        // The 257th dies 10 us after the others (flows due at one
+        // instant land in a seeded order), so it is the one dropped.
+        try rt_mod.sleep(.fromMicroseconds(10));
+        _ = try u.sendTo(addr(lo, 60001 + sim.max_ghosts), "x", .none);
+        try rt_mod.sleep(.fromMicroseconds(150));
+    }
+
+    /// A run that never connects.
+    fn plain() !void {
+        const u = try bound(lo, 0);
+        defer u.close();
+        _ = try u.sendTo(addr(lo, 60001), "x", .none);
+        try pause();
+        capture();
+    }
+
+    /// A run that connects from 127.0.0.1:49152 to two of the dead ports
+    /// the dirty run used, before 2L.
+    fn connects() !void {
+        var u = try bound(lo, 0);
+        try u.connect(addr(lo, 60001), .{});
+        u.close();
+        var v = try bound(lo, 49152);
+        defer v.close();
+        try v.connect(addr(lo, 60001 + sim.max_ghosts), .{});
+        try pause();
+        capture();
+    }
+};
+
+test "sim: dgram connect r3: a run made after a run that connected has the digests it has alone" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, reuse_runs.plain);
+    const plain = digests;
+    try t1.run(1, null, reuse_runs.connects);
+    const conn = digests;
+    try t1.run(1, null, reuse_runs.dirty);
+    try t1.run(1, null, reuse_runs.plain);
+    try expectEqual(plain, digests);
+    try t1.run(1, null, reuse_runs.dirty);
+    try t1.run(1, null, reuse_runs.connects);
+    try expectEqual(conn, digests);
+}
+
+const r3b = struct {
+    /// A connected sender's landing harvested late, after a clock jump:
+    /// with `poll_at_jump` at 1.5L + 1 ns (a poll right after the jump),
+    /// else at 2.25L (the next poll). The death is at L either way, so its
+    /// ICMP is back at 2L, and at 2.25L the error is pending.
+    var poll_at_jump: bool = false;
+    fn lateConnected() !void {
+        const c = try connected(try closedPort());
+        defer c.close();
+        const t0 = sim.clockNs();
+        _ = try c.send("x", .none);
+        sim.advanceNs(L * 3 / 2);
+        if (poll_at_jump) try rt_mod.sleep(.fromNanoseconds(1));
+        try rt_mod.sleep(.fromNanoseconds(t0 + L * 9 / 4 - sim.clockNs()));
+        try expectEqual(t0 + L * 9 / 4, sim.clockNs());
+        try expectEqual(refused, recvNow(c.handle));
+    }
+
+    /// Two deaths of one four-tuple at t0 + L and one at t0 + L + 10 us,
+    /// then the sender connects in time: three ICMPs, at 2L, 2L and 2L +
+    /// 10 us; the error is taken between them and set again.
+    fn threeDeaths() !void {
+        const x = try closedPort();
+        var u = try bound(lo, 0);
+        defer u.close();
+        const t0 = sim.clockNs();
+        _ = try u.sendTo(addr(lo, x), "a", .none);
+        _ = try u.sendTo(addr(lo, x), "b", .none);
+        try rt_mod.sleep(.fromMicroseconds(10));
+        _ = try u.sendTo(addr(lo, x), "c", .none);
+        try rt_mod.sleep(.fromNanoseconds(t0 + L * 3 / 2 - sim.clockNs()));
+        try u.connect(addr(lo, x), .{});
+        var task = try parkReceive(u);
+        task.join();
+        try expectEqual(refused, ended);
+        try expectEqual(t0 + 2 * L, ended_at);
+        // The third ICMP is 10 us later; the receive parks until it lands.
+        var buf: [8]u8 = undefined;
+        try expectEqual(refused, res(u.receive(&buf, .{ .duration = .fromSeconds(1) })));
+        try expectEqual(t0 + 2 * L + 10_000, sim.clockNs());
+        try expectEqual(@as(u64, 3), sim.icmpsMade());
+        try expectEqual(@as(u64, 3), sim.datagramStats(u.handle).refusals);
+    }
+
+    /// 257 deaths of one four-tuple at 257 instants fill the table; it is
+    /// compacted into one entry, so another four-tuple's death still gets
+    /// an exact ghost: its sender connects in time and gets its ICMP at 2L.
+    fn compacted() !void {
+        const x = try closedPort();
+        const u = try bound(lo, 0);
+        defer u.close();
+        for (0..sim.max_ghosts + 1) |_| {
+            _ = try u.sendTo(addr(lo, x), "a", .none);
+            try rt_mod.sleep(.fromNanoseconds(100));
+        }
+        var v = try bound(lo, 0);
+        defer v.close();
+        const t0 = sim.clockNs();
+        _ = try v.sendTo(addr(lo, x), "b", .none);
+        try rt_mod.sleep(.fromMicroseconds(150));
+        try v.connect(addr(lo, x), .{});
+        var task = try parkReceive(v);
+        task.join();
+        try expectEqual(refused, ended);
+        try expectEqual(t0 + 2 * L, ended_at);
+    }
+};
+
+test "sim: dgram connect r3: a connected sender's landing harvested late still gets its ICMP at 2L" {
+    if (comptime skip) return error.SkipZigTest;
+    r3b.poll_at_jump = true;
+    try t1.run(1, null, r3b.lateConnected);
+    r3b.poll_at_jump = false;
+    try t1.run(1, null, r3b.lateConnected);
+}
+
+test "sim: dgram connect r3: three deaths of one four-tuple at two instants make three ICMPs, each at its time" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, r3b.threeDeaths);
+}
+
+test "sim: dgram connect r3: after the table is compacted, another four-tuple keeps an exact ghost" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, r3b.compacted);
+}
+
+test "sim: dgram connect refuses: a connect that makes a four-tuple whose deaths were merged" {
+    try t1.refusal("sim: dgram connect refuses: a connect that makes a four-tuple whose deaths were merged", "sim: connect of sim datagram socket 100032 to 127.0.0.1:49152, where a datagram from its address died with no ICMP made", null, struct {
+        fn body() !void {
+            const x = try closedPort();
+            var u = try bound(lo, 0);
+            defer u.close();
+            const t0 = sim.clockNs();
+            for (0..sim.max_ghosts + 1) |_| {
+                _ = try u.sendTo(addr(lo, x), "a", .none);
+                try rt_mod.sleep(.fromNanoseconds(100));
+            }
+            // After the last death (t0 + 25.6 us + L), before the first
+            // arrival (t0 + 2L).
+            try rt_mod.sleep(.fromNanoseconds(t0 + L * 3 / 2 - sim.clockNs()));
+            try u.connect(addr(lo, x), .{});
+        }
+    }.body);
 }
