@@ -248,21 +248,33 @@ const linux_col: Got = blk: {
     break :blk g;
 };
 
-/// The sim: macOS's column, less the rows it refuses (rows 5, 6's poll and
-/// 13; each a death test below), and with the old answer of a send with no
-/// address on an unconnected socket (row 15).
-const sim_col: Got = blk: {
-    var g = macos_col;
-    g.r5_to_peer = null;
-    g.r5_to_other = null;
-    g.r5_peer_got = null;
-    g.r5_other_got = null;
-    g.r6_poll_revents = null;
+/// The sim under a datagram profile: that kernel's column, with three
+/// rows apart. Row 13 (a second connect) refuses under every profile (a
+/// death test below). Row 15 keeps the sim's old answer for an
+/// unconnected socket (t-4178). Row 16 under `.linux`: the sim always takes
+/// a round trip, so both back-to-back sends succeed, as on macOS (a
+/// schedule the sim does not model; the protocol above `dgramConnect`).
+/// With no profile, rows 5, 6's poll and 11 refuse too (death tests below).
+fn simColumn(p: ?sim.DatagramProfile) Got {
+    var g = if (p == .linux) linux_col else macos_col;
     g.r13_same = null;
     g.r13_other = null;
     g.r15_send = .{ .err = error.OperationNotSupported };
-    break :blk g;
-};
+    if (p == .linux) {
+        g.r16_send = macos_col.r16_send;
+        g.r16_recv = macos_col.r16_recv;
+    }
+    if (p == null) {
+        g.r5_to_peer = null;
+        g.r5_to_other = null;
+        g.r5_peer_got = null;
+        g.r5_other_got = null;
+        g.r6_poll_revents = null;
+        g.r11_send = .{};
+        g.r11_recv = @splat(.{});
+    }
+    return g;
+}
 
 const parity = struct {
     var got: Got = .{};
@@ -348,7 +360,7 @@ const parity = struct {
         defer c.close();
         got.r6_send = res(c.send("x", .none));
         try pause();
-        if (!sim.isRunning()) {
+        if (!sim.isRunning() or sim.datagramProfile() != null) {
             var fds = [1]os_net.pollfd{.{ .fd = c.handle, .events = os_net.POLL.IN, .revents = 0 }};
             _ = try os_net.poll(&fds, 0);
             got.r6_poll_revents = fds[0].revents;
@@ -503,17 +515,20 @@ const parity = struct {
     fn body() !void {
         got = .{};
         const in_sim = sim.isRunning();
+        // In a sim run with no profile, the rows where the kernels differ
+        // refuse (death tests below).
+        const no_profile = in_sim and sim.datagramProfile() == null;
         try row1();
         try row2();
         try row3();
         try row4();
-        if (!in_sim) try row5();
+        if (!no_profile) try row5();
         try row6();
         try row7();
         try row8();
         try row9();
         try row10();
-        try row11();
+        if (!no_profile) try row11();
         try row12();
         if (!in_sim) try row13();
         try row14();
@@ -523,16 +538,36 @@ const parity = struct {
     }
 
     fn check(k: Kernel) !void {
-        const w = switch (k) {
+        try checkAgainst(@tagName(k), switch (k) {
             .macos => macos_col,
             .linux => linux_col,
-            .sim => sim_col,
-        };
-        std.debug.print("dgram connect parity, {t} column: {any}\n", .{ k, got });
+            .sim => simColumn(null),
+        });
+    }
+
+    fn checkAgainst(name: []const u8, w: Got) !void {
+        std.debug.print("dgram connect parity, {s} column: {any}\n", .{ name, got });
         expectEqual(w, got) catch |err| {
-            std.debug.print("dgram connect parity, {t} column: want {any}\n", .{ k, w });
+            std.debug.print("dgram connect parity, {s} column: want {any}\n", .{ name, w });
             return err;
         };
+    }
+
+    var profile: ?sim.DatagramProfile = null;
+
+    fn bodyWithProfile() !void {
+        if (profile) |p| sim.setDatagramProfile(p);
+        try body();
+    }
+
+    /// The sim under `p`, against its column.
+    fn inSim(p: ?sim.DatagramProfile) !void {
+        profile = p;
+        try t1.run(1, null, bodyWithProfile);
+        try checkAgainst(if (p) |x| switch (x) {
+            .linux => "sim, profile linux",
+            .macos => "sim, profile macos",
+        } else "sim, no profile", simColumn(p));
     }
 };
 
@@ -541,8 +576,10 @@ const host_kernel: Kernel = if (builtin.os.tag.isDarwin()) .macos else .linux;
 test "sim: dgram connect parity: 17 rows through zio.net, on this host's kernel without sim, in a sim run with sim" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     if (comptime sim.compiled_in) {
-        try t1.run(1, null, parity.body);
-        return parity.check(.sim);
+        try parity.inSim(null);
+        try parity.inSim(.macos);
+        try parity.inSim(.linux);
+        return;
     }
     const rt = try rt_mod.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
@@ -913,6 +950,31 @@ test "sim: dgram connect: the same seed twice gives the same trace, state digest
     }
 }
 
+const profiles = struct {
+    var p: sim.DatagramProfile = .macos;
+
+    fn body() !void {
+        sim.setDatagramProfile(p);
+        const a = try bound(lo, 0);
+        defer a.close();
+        const c = try connected(try portOf(a));
+        defer c.close();
+        try pause();
+        capture();
+    }
+};
+
+test "sim: dgram connect: the state digest sees the datagram profile of a run that connected" {
+    if (comptime skip) return error.SkipZigTest;
+    profiles.p = .macos;
+    try t1.run(1, null, profiles.body);
+    const m = digests;
+    profiles.p = .linux;
+    try t1.run(1, null, profiles.body);
+    try expectEqual(m.trace, digests.trace);
+    try expect(m.state != digests.state);
+}
+
 const peers = struct {
     var to: u16 = 0;
     var stranger_sends: bool = false;
@@ -1012,8 +1074,8 @@ test "sim: dgram connect refuses: a disconnect (AF_UNSPEC)" {
     }.body);
 }
 
-test "sim: dgram connect refuses: sendTo with an address on a connected socket" {
-    try t1.refusal("sim: dgram connect refuses: sendTo with an address on a connected socket", "sim: a send with an address on connected sim datagram socket 100033: the kernels disagree", null, struct {
+test "sim: dgram connect refuses: sendTo with an address on a connected socket, with no datagram profile" {
+    try t1.refusal("sim: dgram connect refuses: sendTo with an address on a connected socket, with no datagram profile", "sim: a send with an address on a connected socket (row 5) on sim datagram socket 100033: the kernels differ here, and this run set no datagram profile", null, struct {
         fn body() !void {
             const p = try bound(lo, 0);
             defer p.close();
@@ -1024,8 +1086,8 @@ test "sim: dgram connect refuses: sendTo with an address on a connected socket" 
     }.body);
 }
 
-test "sim: dgram connect refuses: a layer poll of a socket with a pending error" {
-    try t1.refusal("sim: dgram connect refuses: a layer poll of a socket with a pending error", "sim: a poll of sim datagram socket 100032, which has a pending error: the kernels disagree", null, struct {
+test "sim: dgram connect refuses: a layer poll of a socket with a pending error, with no datagram profile" {
+    try t1.refusal("sim: dgram connect refuses: a layer poll of a socket with a pending error, with no datagram profile", "sim: a poll with an error pending (row 6) on sim datagram socket 100032: the kernels differ here, and this run set no datagram profile", null, struct {
         fn body() !void {
             const x = try closedPort();
             const c = try connected(x);
@@ -1050,15 +1112,99 @@ test "sim: dgram connect refuses: shutdown of a connected socket" {
     }.body);
 }
 
-test "sim: dgram connect refuses: a connect on a port from which a datagram died with no ICMP made" {
-    try t1.refusal("sim: dgram connect refuses: a connect on a port from which a datagram died with no ICMP made", "sim: connect of sim datagram socket 100032 on port 49153, from which a datagram died at its landing before", null, struct {
+test "sim: dgram connect refuses: a connect that makes a dead datagram's four-tuple while its ICMP could be on its way, in a run that set a fault rule" {
+    try t1.refusal("sim: dgram connect refuses: a connect that makes a dead datagram's four-tuple while its ICMP could be on its way, in a run that set a fault rule", "sim: connect of sim datagram socket 100032 to 127.0.0.1:49152, where a datagram from its address died with no ICMP made", null, struct {
         fn body() !void {
             const x = try closedPort();
-            var u = try bound(any, 0);
+            var u = try bound(lo, 0);
             defer u.close();
+            // A rule on another path: the ICMP's own fate was never drawn.
+            const other: sim.Path = .{ .from = .{ .ip = .{ 127, 0, 0, 9 } }, .to = .{ .ip = .{ 127, 0, 0, 9 } } };
+            sim.setPartition(other);
             _ = try u.sendTo(addr(lo, x), "x", .none);
-            try pause();
+            try rt_mod.sleep(.fromMicroseconds(150));
             try u.connect(addr(lo, x), .{});
+        }
+    }.body);
+}
+
+test "sim: dgram connect: with a fault rule set, a connect to another peer, or one after the bound, is not refused" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, struct {
+        fn body() !void {
+            const p = try bound(lo, 0);
+            defer p.close();
+            const x = try closedPort();
+            var u = try bound(lo, 0);
+            defer u.close();
+            const other: sim.Path = .{ .from = .{ .ip = .{ 127, 0, 0, 9 } }, .to = .{ .ip = .{ 127, 0, 0, 9 } } };
+            sim.setPartition(other);
+            _ = try u.sendTo(addr(lo, x), "x", .none);
+            try rt_mod.sleep(.fromMicroseconds(150));
+            try u.connect(addr(lo, try portOf(p)), .{});
+            _ = sim.healPartition(other);
+        }
+    }.body);
+}
+
+test "sim: dgram connect refuses: a connect while the ghost table has overflowed" {
+    try t1.refusal("sim: dgram connect refuses: a connect while the ghost table has overflowed", "sim: connect of sim datagram socket 100033 before 200000 ns: the ghost table overflowed", null, struct {
+        fn body() !void {
+            const x = try closedPort();
+            var u = try bound(lo, 0);
+            defer u.close();
+            // 257 deaths at L with no connected sender, each kept until 2L.
+            for (0..sim.max_ghosts + 1) |_| _ = try u.sendTo(addr(lo, x), "x", .none);
+            try rt_mod.sleep(.fromMicroseconds(150));
+            var v = try bound(lo, 0);
+            defer v.close();
+            try v.connect(addr(lo, x), .{});
+        }
+    }.body);
+}
+
+test "sim: dgram connect refuses: a receive with a datagram queued and an error pending, with no datagram profile" {
+    try t1.refusal("sim: dgram connect refuses: a receive with a datagram queued and an error pending, with no datagram profile", "sim: a receive with a datagram queued and an error pending (row 11) on sim datagram socket 100033: the kernels differ here, and this run set no datagram profile", null, struct {
+        fn body() !void {
+            const p = try bound(lo, 0);
+            const c = try connected(try portOf(p));
+            defer c.close();
+            _ = try p.sendTo(addr(lo, try portOf(c)), "dd", .none);
+            try pause();
+            p.close();
+            _ = try c.send("x", .none);
+            try pause();
+            _ = recvNow(c.handle);
+        }
+    }.body);
+}
+
+test "sim: dgram connect refuses: setDatagramProfile after the run's first datagram socket" {
+    try t1.refusal("sim: dgram connect refuses: setDatagramProfile after the run's first datagram socket", "sim: setDatagramProfile(linux) after the run's first datagram socket opened: set it before", null, struct {
+        fn body() !void {
+            const p = try bound(lo, 0);
+            defer p.close();
+            sim.setDatagramProfile(.linux);
+        }
+    }.body);
+}
+
+test "sim: dgram connect refuses: a second setDatagramProfile" {
+    try t1.refusal("sim: dgram connect refuses: a second setDatagramProfile", "sim: setDatagramProfile(linux) after setDatagramProfile(macos): a run has one profile", null, struct {
+        fn body() !void {
+            sim.setDatagramProfile(.macos);
+            sim.setDatagramProfile(.linux);
+        }
+    }.body);
+}
+
+test "sim: dgram connect refuses: a run's 2^60th datagram send" {
+    try t1.refusal("sim: dgram connect refuses: a run's 2^60th datagram send", "sim: datagram send number 1152921504606846976 on sim fd 100032: from 2^60 on", null, struct {
+        fn body() !void {
+            var u = try bound(lo, 0);
+            defer u.close();
+            sim.testSetWireSeq(1 << 60);
+            _ = try u.sendTo(addr(lo, 9), "x", .none);
         }
     }.body);
 }
@@ -1081,4 +1227,380 @@ test "sim: dgram connect refuses: sim.end with a connected datagram socket open"
             _ = try connected(49152);
         }
     }.body);
+}
+
+// ---- Round 2 of the review (gpt-simnet18.md) ----
+
+const r2 = struct {
+    var from_res: Res = .{};
+
+    fn parkRecvFrom(u: zio_net.Socket) void {
+        var buf: [8]u8 = undefined;
+        from_res = res(if (u.receiveFrom(&buf, .{ .duration = .fromSeconds(1) })) |r| r.len else |e| e);
+    }
+
+    /// Finding 4: a NetRecv on an UNconnected socket ends OperationNotSupported
+    /// at once, as before t-4167, also while a NetRecvFrom is parked there.
+    fn recvBesideParked() !void {
+        const u = try bound(any, 0);
+        from_res = .{};
+        var h = try rt_mod.spawn(parkRecvFrom, .{u});
+        try rt_mod.sleep(.fromMicroseconds(10));
+        var buf: [8]u8 = undefined;
+        try expectEqual(Res{ .err = error.OperationNotSupported }, res(u.receive(&buf, .none)));
+        u.close();
+        h.join();
+        try expectEqual(Res{ .err = error.FileDescriptorNotASocket }, from_res);
+        capture();
+    }
+
+    /// The same shape: the layer's send, recv and shutdown, and a NetRecv,
+    /// on a CLOSED datagram fd keep their answers from before t-4167.
+    fn closedFd() !void {
+        const u = try bound(any, 0);
+        const fd = u.handle;
+        u.close();
+        var iov = [1]os_net.iovec_const{os_net.iovecConstFromSlice("x")};
+        try expectEqual(Res{ .err = error.OperationNotSupported }, res(os_net.send(fd, &iov, .{})));
+        var buf: [8]u8 = undefined;
+        var rv = [1]os_net.iovec{os_net.iovecFromSlice(&buf)};
+        try expectEqual(Res{ .err = error.OperationNotSupported }, res(os_net.recv(fd, &rv, .{})));
+        try expectEqual(Res{ .err = error.SocketUnconnected }, res(os_net.shutdown(fd, .both)));
+        const s: zio_net.Socket = .{ .handle = fd, .address = undefined };
+        try expectEqual(Res{ .err = error.OperationNotSupported }, res(s.receive(&buf, .none)));
+        capture();
+    }
+
+    /// Finding 3, first sequence: a socket that sent to a closed port
+    /// connects later to another, live peer, and works.
+    fn otherPeer() !void {
+        const p = try bound(lo, 0);
+        defer p.close();
+        var u = try bound(any, 0);
+        defer u.close();
+        _ = try u.sendTo(addr(lo, try closedPort()), "x", .none);
+        try pause();
+        try u.connect(addr(lo, try portOf(p)), .{});
+        try expectEqual(ok1, res(u.send("y", .none)));
+        try pause();
+        try expectEqual(ok1, recvNow(p.handle));
+        try expectEqual(would_block, recvNow(u.handle));
+        capture();
+    }
+
+    /// Finding 3, second sequence: that socket closes; a new one binds its
+    /// address and connects elsewhere.
+    fn rebound() !void {
+        const p = try bound(lo, 0);
+        defer p.close();
+        const x = try closedPort();
+        const u = try bound(lo, 0);
+        const up = try portOf(u);
+        _ = try u.sendTo(addr(lo, x), "x", .none);
+        try pause();
+        u.close();
+        var v = try bound(lo, up);
+        defer v.close();
+        try v.connect(addr(lo, try portOf(p)), .{});
+        try expectEqual(ok1, res(v.send("y", .none)));
+        try pause();
+        try expectEqual(ok1, recvNow(p.handle));
+        capture();
+    }
+
+    /// The case that must be modelled: the socket sent to the closed port
+    /// while unconnected, and connects to it before the ICMP lands (it sent
+    /// at t0; the datagram died at t0 + L; the ICMP lands at t0 + 2L). Both
+    /// kernels look the socket up when the ICMP arrives.
+    fn connectInFlight() !void {
+        const x = try closedPort();
+        var u = try bound(lo, 0);
+        defer u.close();
+        const t0 = sim.clockNs();
+        _ = try u.sendTo(addr(lo, x), "x", .none);
+        try rt_mod.sleep(.fromMicroseconds(150));
+        try u.connect(addr(lo, x), .{});
+        var task = try parkReceive(u);
+        task.join();
+        try expectEqual(refused, ended);
+        try expectEqual(t0 + 2 * L, ended_at);
+        capture();
+    }
+
+    /// Finding 5: c, connected to the closed x, sends; it closes while the
+    /// ICMP is in flight; a new socket binds c's address and connects to x.
+    /// The ICMP finds the new socket (the current four-tuple).
+    fn replacement() !void {
+        const x = try closedPort();
+        var c = try bound(lo, 0);
+        const cp = try portOf(c);
+        try c.connect(addr(lo, x), .{});
+        const t0 = sim.clockNs();
+        _ = try c.send("x", .none);
+        try rt_mod.sleep(.fromMicroseconds(150));
+        c.close();
+        var c2 = try bound(lo, cp);
+        defer c2.close();
+        try c2.connect(addr(lo, x), .{});
+        var task = try parkReceive(c2);
+        task.join();
+        try expectEqual(refused, ended);
+        try expectEqual(t0 + 2 * L, ended_at);
+        capture();
+    }
+};
+
+const ghost_other = struct {
+    /// Row 23 in the sim: another socket connects to the dead address while
+    /// the sender's ICMP is in flight. It makes no ICMP: the ghost's
+    /// four-tuple is the sender's address, not this socket's.
+    fn body() !void {
+        const x = try closedPort();
+        const u = try bound(lo, 0);
+        defer u.close();
+        _ = try u.sendTo(addr(lo, x), "x", .none);
+        try rt_mod.sleep(.fromMicroseconds(150));
+        var v = try bound(lo, 0);
+        defer v.close();
+        try v.connect(addr(lo, x), .{});
+        try pause();
+        try expectEqual(@as(u64, 0), sim.icmpsMade());
+        try expectEqual(would_block, recvNow(v.handle));
+        capture();
+    }
+};
+
+const ghost_peer = struct {
+    /// Row 20 in the sim: the sender connects to another, live peer while
+    /// its ICMP is in flight. No ICMP is made: not the ghost's four-tuple.
+    fn body() !void {
+        const p = try bound(lo, 0);
+        defer p.close();
+        const x = try closedPort();
+        var u = try bound(lo, 0);
+        defer u.close();
+        _ = try u.sendTo(addr(lo, x), "x", .none);
+        try rt_mod.sleep(.fromMicroseconds(150));
+        try u.connect(addr(lo, try portOf(p)), .{});
+        try pause();
+        try expectEqual(@as(u64, 0), sim.icmpsMade());
+        try expectEqual(would_block, recvNow(u.handle));
+        capture();
+    }
+};
+
+test "sim: dgram connect r2: a sender that connects to another peer while its ICMP is in flight makes no ICMP" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, ghost_peer.body);
+}
+
+test "sim: dgram connect r2: another socket that connects to a dead address while a sender's ICMP is in flight makes no ICMP" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, ghost_other.body);
+}
+
+test "sim: dgram connect r2: a NetRecv on an unconnected socket with a NetRecvFrom parked ends OperationNotSupported, as before t-4167" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, r2.recvBesideParked);
+}
+
+test "sim: dgram connect r2: send, recv, shutdown and NetRecv on a closed datagram fd keep their answers from before t-4167" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, r2.closedFd);
+}
+
+test "sim: dgram connect r2: a socket that sent to a closed port later connects to another, live peer" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, r2.otherPeer);
+}
+
+test "sim: dgram connect r2: after a socket that sent to a closed port closes, a new one binds its address and connects elsewhere" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, r2.rebound);
+}
+
+test "sim: dgram connect r2: a socket that sent to a closed port and connects to it before the ICMP lands gets the refusal at 2L" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, r2.connectInFlight);
+}
+
+test "sim: dgram connect r2: a new socket that binds a closed sender's address and connects to the same peer while the ICMP is in flight gets the refusal" {
+    if (comptime skip) return error.SkipZigTest;
+    try t1.run(1, null, r2.replacement);
+}
+
+// ---- In-flight rows: what happens while an ICMP is on its way back ----
+//
+// On real loopback the ICMP comes back in microseconds (Linux: before the
+// send returns), so nothing can happen between. These rows run on a kernel
+// only with a delay on loopback: Linux in a container with
+// `tc qdisc add dev lo root netem delay <ms>ms` and ZIO_NETEM_MS=<ms> set;
+// then every datagram and ICMP takes that long, and the actions below run
+// between the death and the ICMP. macOS needs root for that (dummynet), so
+// its column is not run. In a sim run they always run, with the sim's L.
+
+const InFlight = struct {
+    r18_replacement: Res = .{},
+    r19_connect_to_it: Res = .{},
+    r20_other_peer: Res = .{},
+    r20_exchange: bool = false,
+    r21_sends: [2]Res = @splat(.{}),
+    r21_recv: [2]Res = @splat(.{}),
+    r22_rebound_same_peer: Res = .{},
+    r23_other_address: Res = .{},
+    r24_connect_after: Res = .{},
+};
+
+const in_flight_want: InFlight = .{
+    .r18_replacement = refused,
+    .r19_connect_to_it = refused,
+    .r20_other_peer = would_block,
+    .r20_exchange = true,
+    .r21_sends = .{ ok1, ok1 },
+    .r21_recv = .{ refused, would_block },
+    .r22_rebound_same_peer = refused,
+    .r23_other_address = would_block,
+    .r24_connect_after = would_block,
+};
+
+const in_flight = struct {
+    var got: InFlight = .{};
+    var delay_ms: u64 = 0;
+
+    /// Inside the window: after the send, before the ICMP is back.
+    fn soon() !void {
+        if (sim.isRunning()) try rt_mod.sleep(.fromMicroseconds(150)) else try rt_mod.sleep(.fromMilliseconds(delay_ms / 5));
+    }
+
+    /// After the ICMP is back.
+    fn settle() !void {
+        if (sim.isRunning()) try rt_mod.sleep(.fromMilliseconds(1)) else try rt_mod.sleep(.fromMilliseconds(delay_ms * 4));
+    }
+
+    fn row18() !void {
+        const x = try closedPort();
+        var c = try bound(lo, 0);
+        const cp = try portOf(c);
+        try c.connect(addr(lo, x), .{});
+        _ = try c.send("x", .none);
+        try soon();
+        c.close();
+        var c2 = try bound(lo, cp);
+        defer c2.close();
+        try c2.connect(addr(lo, x), .{});
+        try settle();
+        got.r18_replacement = recvNow(c2.handle);
+    }
+
+    fn row19() !void {
+        const x = try closedPort();
+        var u = try bound(lo, 0);
+        defer u.close();
+        _ = try u.sendTo(addr(lo, x), "x", .none);
+        try soon();
+        try u.connect(addr(lo, x), .{});
+        try settle();
+        got.r19_connect_to_it = recvNow(u.handle);
+    }
+
+    fn row20() !void {
+        const p = try bound(lo, 0);
+        defer p.close();
+        const x = try closedPort();
+        var u = try bound(lo, 0);
+        defer u.close();
+        _ = try u.sendTo(addr(lo, x), "x", .none);
+        try soon();
+        try u.connect(addr(lo, try portOf(p)), .{});
+        _ = try u.send("y", .none);
+        try settle();
+        got.r20_other_peer = recvNow(u.handle);
+        got.r20_exchange = recvNow(p.handle).n == 1;
+    }
+
+    fn row21() !void {
+        const c = try connected(try closedPort());
+        defer c.close();
+        var iov = [1]os_net.iovec_const{os_net.iovecConstFromSlice("a")};
+        got.r21_sends = .{ res(os_net.send(c.handle, &iov, .{})), res(os_net.send(c.handle, &iov, .{})) };
+        try settle();
+        got.r21_recv = .{ recvNow(c.handle), recvNow(c.handle) };
+    }
+
+    fn row22() !void {
+        const x = try closedPort();
+        const u = try bound(lo, 0);
+        const up = try portOf(u);
+        _ = try u.sendTo(addr(lo, x), "x", .none);
+        try soon();
+        u.close();
+        var v = try bound(lo, up);
+        defer v.close();
+        try v.connect(addr(lo, x), .{});
+        try settle();
+        got.r22_rebound_same_peer = recvNow(v.handle);
+    }
+
+    /// Another socket, on another address, connects to the dead address
+    /// while the sender's ICMP is in flight: not its four-tuple.
+    fn row23() !void {
+        const x = try closedPort();
+        const u = try bound(lo, 0);
+        defer u.close();
+        _ = try u.sendTo(addr(lo, x), "x", .none);
+        try soon();
+        var v = try bound(lo, 0);
+        defer v.close();
+        try v.connect(addr(lo, x), .{});
+        try settle();
+        got.r23_other_address = recvNow(v.handle);
+    }
+
+    /// The sender connects to the dead address after its ICMP came back to
+    /// it unconnected: nothing is pending.
+    fn row24() !void {
+        const x = try closedPort();
+        var u = try bound(lo, 0);
+        defer u.close();
+        _ = try u.sendTo(addr(lo, x), "x", .none);
+        try settle();
+        try u.connect(addr(lo, x), .{});
+        try settle();
+        got.r24_connect_after = recvNow(u.handle);
+    }
+
+    fn body() !void {
+        got = .{};
+        try row18();
+        try row23();
+        try row24();
+        try row19();
+        try row20();
+        try row21();
+        try row22();
+        capture();
+    }
+
+    fn check(column: []const u8) !void {
+        std.debug.print("dgram connect in-flight rows, {s} column: {any}\n", .{ column, got });
+        expectEqual(in_flight_want, got) catch |err| {
+            std.debug.print("dgram connect in-flight rows, {s} column: want {any}\n", .{ column, in_flight_want });
+            return err;
+        };
+    }
+};
+
+test "sim: dgram connect in-flight rows: a connect or a new socket while the ICMP is on its way back, on Linux with netem on loopback without sim, in a sim run with sim" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime sim.compiled_in) {
+        try t1.run(1, null, in_flight.body);
+        return in_flight.check("sim");
+    }
+    const ms = std.c.getenv("ZIO_NETEM_MS") orelse return error.SkipZigTest;
+    in_flight.delay_ms = try std.fmt.parseInt(u64, std.mem.span(ms), 10);
+    const rt = try rt_mod.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var h = try rt.spawn(in_flight.body, .{});
+    try h.join();
+    try in_flight.check("linux with netem");
 }

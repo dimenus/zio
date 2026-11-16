@@ -1832,7 +1832,12 @@ pub const Loop = struct {
     /// every such submit, as on a pipe end).
     fn simDgramMayWait(c: *Completion) bool {
         return switch (c.op) {
-            .net_recv, .net_recvfrom, .net_recvmsg => true,
+            .net_recvfrom, .net_recvmsg => true,
+            // Only on a connected socket can a NetRecv wait (round 2 of the
+            // review, finding 4): on an unconnected or closed one it ends
+            // `OperationNotSupported` at once, as before t-4167, and the
+            // one-waiter rule never sees it.
+            .net_recv => sim.dgramIsConnected(c.cast(NetRecv).handle),
             .net_poll => c.cast(NetPoll).event == .recv,
             else => false,
         };

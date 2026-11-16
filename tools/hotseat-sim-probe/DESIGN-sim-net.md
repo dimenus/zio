@@ -332,10 +332,9 @@ option, and hotseat's bridge will not; `IP_TTL` is not modelled.
 - Send flags other than `MSG_NOSIGNAL` and `MSG_DONTWAIT` (accepted with no
   effect): `MSG_OOB`, `MSG_EOR`, `MSG_DONTROUTE`, `MSG_CONFIRM`,
   `MSG_FASTOPEN`, and any flag added later.
-- On a datagram socket: a second `connect`, a disconnect, a send with an
-  address on a connected socket, a layer `poll` of a socket with a pending
-  error, `shutdown` of a connected socket (the list above `dgramConnect` in
-  `src/sim.zig`).
+- On a datagram socket: a second `connect`, a disconnect, `shutdown` of a
+  connected socket, and the rows where the kernels differ in a run with no
+  datagram profile (the list above `dgramConnect` in `src/sim.zig`).
 - The misuse class of section 8.
 - A sim fd at a native exit (section 3).
 - A real fd passed to a sim op during a run.
@@ -352,8 +351,8 @@ option, and hotseat's bridge will not; `IP_TTL` is not modelled.
 - **Send pressure** and local send failures (`EAGAIN`, `ENOBUFS`,
   `EMSGSIZE`). `AddressUnavailable` occurs only for a bad `from`.
 - **Connected UDP** is modelled (t-4167); its limits (ICMP rate limits,
-  Linux's error set before the send returns, Linux's error-first order) are
-  listed above `dgramConnect` in `src/sim.zig`.
+  Linux's error usually set before the send returns) are listed above
+  `dgramConnect` in `src/sim.zig`.
 - **TCP internals:** segments, Nagle, windows, retransmits, keepalive,
   TIME_WAIT, abortive close, kernel backlog overflow. Half-close is modelled.
 - **MTU and fragmentation.**

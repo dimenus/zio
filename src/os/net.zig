@@ -1266,7 +1266,7 @@ pub fn recv(fd: fd_t, buffers: []iovec, flags: RecvFlags) RecvError!usize {
         // unconnected one keeps the old answer (the connected-socket
         // protocol above `sim.dgramConnect`).
         if (sim.isDgramFd(fd)) {
-            if (sim.dgramPeer(fd) == null) return error.OperationNotSupported;
+            if (!sim.dgramIsConnected(fd)) return error.OperationNotSupported;
             return simRecvLen(try simRecv(fd, buffers, flags), flags);
         }
         sim.refuseSimFd(@src(), fd);
@@ -1403,7 +1403,7 @@ pub fn send(fd: fd_t, buffers: []const iovec_const, flags: SendFlags) SendError!
         // keeps the old answer (the connected-socket protocol above
         // `sim.dgramConnect`).
         if (sim.isDgramFd(fd)) {
-            if (sim.dgramPeer(fd) == null) return error.OperationNotSupported;
+            if (!sim.dgramIsConnected(fd)) return error.OperationNotSupported;
             return simSend(fd, buffers, flags, null, null);
         }
         sim.refuseSimFd(@src(), fd);
@@ -2198,9 +2198,7 @@ fn simPoll(fds: []pollfd, timeout: i32) ?usize {
         f.revents = 0;
         if (f.fd < 0) continue;
         // Refuses a pipe end or a closed socket before any event is read.
-        const readable = sim.dgramReadable(f.fd);
-        if (f.events & POLL.IN != 0 and readable) f.revents |= POLL.IN;
-        if (f.events & POLL.OUT != 0) f.revents |= POLL.OUT;
+        f.revents = sim.dgramPollRevents(f.fd, f.events);
         if (f.revents != 0) ready += 1;
     }
     return ready;
