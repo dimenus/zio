@@ -557,9 +557,11 @@ The scripts the gates below use are beside them, in `zio-sim6-tools/` there
   158ebba):** the owner's two decisions on report 10 (sections 3.2 and 8).
   The bridge test's `enet_socketset_select` and its test are gone, and
   SO_SNDBUF sits in the bridge test's shared table.
-- **Connected datagram sockets (t-4167, 7ba69f0):** `connect`, the peer
-  filter, sends and receives with no address, and ICMP port unreachable as
-  a pending `ConnectionRefused`. Protocol: the comment above
+- **Connected datagram sockets (t-4167, 7ba69f0 and e314ecf):** `connect`,
+  the peer filter, sends and receives with no address, ICMP port
+  unreachable as a pending `ConnectionRefused`, a datagram profile
+  (`setDatagramProfile`) for the rows where the kernels differ, and the
+  ICMP of a socket that connects while it is in flight. Protocol: the comment above
   `dgramConnect` in `src/sim.zig`; the kernels' answers: the parity table
   in `src/sim_dgram_connect_test.zig`.
 - **Four rounds of outside review, all closed (3727c95 to d939580), and
@@ -1178,6 +1180,23 @@ the mutants in its commits.
     - Upstream: `origin/main` moved 3 commits (#923 cancel protection,
       #924 check.sh shebang, #925 `max_executors`); none touches
       sockets or the sim. Not merged.
+  - **Sitting 38 (report 38, `j38/` and `g37/e314ecf/` in its scratch
+    folder): the outside review of 7ba69f0 (`gpt-simnet18.md`).**
+    - e314ecf: each finding shown failing first, then fixed. A NetRecv on
+      an unconnected socket, and send, recv, shutdown and NetRecv on a
+      closed fd, keep their old answers (the new paths need an open,
+      connected socket). `DatagramProfile` (`.linux`, `.macos`) for rows
+      5, 6 and 11; with none, each panics, as a stream row does. The
+      ghost-port bitset is replaced by `Ghost` (the dead datagram's
+      four-tuple, kept until its ICMP would land): a connect that makes
+      it in time gets the ICMP, exactly; under a fault rule it refuses.
+      The 2^60th send refuses.
+    - The in-flight rows (18 to 24) ran on Linux with
+      `tc ... netem delay 50ms` on loopback in a container with
+      `--cap-add NET_ADMIN` (`j38/netem3/`); macOS's needs root, so not run.
+    - Row 16 is a schedule on Linux, not a guarantee (read in v6.8's
+      softirq path); not modelled, t-4179.
+    - Promise 1 against 328d798: no run changed. 24 mutants, all killed.
   - **Next:**
     1. Slice 4 (17.16): the users. starh2's `dst-conn` accept step;
        hotseat's tests (17.15 item 7), after t-4110 and t-4111; then an
@@ -1198,8 +1217,8 @@ the mutants in its commits.
     (hotseat: its ping-send test seam calls libc on the socket handle,
     which under sim is a sim fd), t-4177 (no zio name for EISCONN), t-4178
     (the sim's answers for send and recv on an unconnected datagram
-    socket), t-4179 (a datagram OS profile, if a consumer needs Linux's
-    order).
+    socket), t-4179 (since sitting 38: only row 16, Linux's refusal before
+    the next send).
   - **What I would change, with what I know now:**
     - The parity table prints every row's answer now; a row that passes
       silently was how a measured difference could hide.
@@ -1311,7 +1330,11 @@ the mutants in its commits.
   The same works for a mutant that the runner reports NOT RUN because
   an earlier test crashed the process.
 - **The connected datagram tests:** the filter `sim: dgram connect` in a
-  sim build. `sim: dgram connect parity` also runs without sim, on real
+  sim build. The in-flight rows run on a kernel only with
+  `ZIO_NETEM_MS=<ms>` set and that delay on loopback (Linux:
+  `tc qdisc add dev lo root netem delay <ms>ms`, which needs
+  `--cap-add NET_ADMIN` and iproute2 in the image); a run with the variable
+  and no delay must fail them (the control). `sim: dgram connect parity` also runs without sim, on real
   sockets, and checks the host kernel's column; on Linux run it in an
   io_uring and an epoll binary (the gate scripts use the filter
   `parity`, which runs the stream parity too).
@@ -1552,6 +1575,13 @@ the mutants in its commits.
   progress clear** (`\r`, `ESC [0K`). `hasPanicLine` skips it since
   d461504; before, a wanted line that was the child's first output never
   matched.
+- **A promise-1 comparison proves only that existing runs are unchanged.**
+  Sitting 37's 1392 equal runs missed a new check placed before an old
+  answer on paths no test took (a NetRecv beside a parked op; calls on a
+  closed fd). For each changed line, ask what the old answer was on every
+  input, and pin it with a test.
+- **An extra ICMP that no socket takes changes no error.** Two ghost
+  mutants survived every error row; only `sim.icmpsMade()` showed them.
 - **A closed port costs a socket slot only while it is open.** A test
   that makes a closed port (bind, read the port, close) frees slot 0, so
   the next socket is fd 100032 again: a death test's expected fd moves
