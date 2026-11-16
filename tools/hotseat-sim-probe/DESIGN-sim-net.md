@@ -1216,6 +1216,19 @@ the mutants in its commits.
       sim suite 489 of 489 under each); now killed. Every run-scoped
       variable added for t-4167 has a mutant of its reset, killed by the
       test of a run made after a run that connected.
+  - **Sitting 40 (report 40, `j40/` and `g37/e807ce8/`): the outside
+    review of afdf567 (`gpt-simnet20.md`), the last round on t-4167.**
+    - e807ce8: the late harvest (a test's `advanceNs` past a wire entry,
+      with no poll) is handled by one rule. A late death of an
+      unconnected sender is exact (a rule counts only if set before the
+      death: `udp_rule_since`). Anything a late harvest would hand to a
+      connected socket panics with the remedy: poll right after the jump.
+      Round 3's catch-up paths are gone. `recvmsg` with destination
+      addresses takes a pending error first. An exact ghost's count that
+      would overflow makes it inexact.
+    - The same instant: an ICMP landing at T is harvested before any task
+      runs at T, so a connect at T comes after it (no ICMP). Pinned.
+    - Promise 1 against 328d798: unchanged. 11 mutants, all killed.
   - **Next:**
     1. Slice 4 (17.16): the users. starh2's `dst-conn` accept step;
        hotseat's tests (17.15 item 7), after t-4110 and t-4111; then an
@@ -1604,7 +1617,9 @@ the mutants in its commits.
   (sitting 39: the overflow test passed by the luck of seed 1).
 - **`sim.advanceNs` does not poll.** A landing it jumps over is harvested
   at the next poll, not at the jump; a test that wants a harvest at the
-  jump sleeps 1 ns right after it.
+  jump sleeps 1 ns right after it. A late harvest that reaches a connected
+  datagram socket panics (sitting 40). An ev op (a connect too) polls, so
+  its harvest comes after the op is applied.
 - **An extra ICMP that no socket takes changes no error.** Two ghost
   mutants survived every error row; only `sim.icmpsMade()` showed them.
 - **A closed port costs a socket slot only while it is open.** A test
