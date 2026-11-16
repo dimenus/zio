@@ -489,6 +489,72 @@ test "Event: async task signals foreign thread" {
     try std.testing.expect(reset_event.isSet());
 }
 
+test "Event: a plain thread held before its wait still times out at its deadline" {
+    // A thread can be descheduled after waitTimeout takes in its deadline and
+    // before the futex wait starts. The hold stands in for that: it keeps the
+    // thread there until the deadline has passed, so the wait has nothing
+    // left to wait for and must end at once. A wait that turns the deadline
+    // into a duration before that point and back into a deadline after it
+    // waits the whole duration again, past the deadline.
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const time = @import("../time.zig");
+    const wait_ns = std.time.ns_per_s;
+
+    const Held = struct {
+        var deadline: time.Timestamp = .zero;
+        var holds: u32 = 0;
+        var returned: time.Timestamp = .zero;
+        var result: (Timeoutable || Cancelable)!void = {};
+
+        fn hold() void {
+            holds += 1;
+            var word: std.atomic.Value(u32) = .init(0);
+            while (time.Timestamp.now(.awake).value <= deadline.value) {
+                os.thread.Futex.timedWait(&word, 0, .fromMilliseconds(5)) catch {};
+            }
+        }
+
+        fn run(event: *Event) void {
+            Waiter.test_hold_before_futex = hold;
+            defer Waiter.test_hold_before_futex = null;
+            result = event.waitTimeout(.{ .deadline = deadline });
+            returned = time.Timestamp.now(.awake);
+        }
+    };
+
+    var event = Event.init;
+    Held.deadline = time.Timestamp.now(.awake).addDuration(.fromNanoseconds(wait_ns));
+    const thread = try std.Thread.spawn(.{}, Held.run, .{&event});
+    thread.join();
+
+    const late_ns = Held.deadline.durationTo(Held.returned).toNanoseconds();
+    errdefer std.debug.print("waitTimeout returned {d} ms after its deadline (holds={d})\n", .{ late_ns / std.time.ns_per_ms, Held.holds });
+    // The hold must have run, or this test proves nothing.
+    try std.testing.expectEqual(1, Held.holds);
+    try std.testing.expectError(error.Timeout, Held.result);
+    // The defect waits about wait_ns past the deadline (never less, the clock
+    // is monotonic). Half of it leaves room for a loaded machine.
+    try std.testing.expect(late_ns < wait_ns / 2);
+}
+
+test "Event: a plain thread's timeout never ends before its deadline" {
+    // The deadline is absolute on the awake clock, so a Timeout must find
+    // that clock at or past it. The first length is under a millisecond, so a
+    // wait that gives up while time is still left fails at once. The lengths
+    // are odd, so a kernel wait whose interval was rounded down (Darwin's
+    // __ulock_wait takes microseconds) has a remainder to end early on.
+    const time = @import("../time.zig");
+    var event = Event.init;
+    var i: u64 = 0;
+    while (i < 8) : (i += 1) {
+        const deadline = time.Timestamp.now(.awake).addDuration(.fromNanoseconds(300_777 + i * 1_234_567));
+        try std.testing.expectError(error.Timeout, event.waitTimeout(.{ .deadline = deadline }));
+        const now = time.Timestamp.now(.awake);
+        errdefer std.debug.print("pass {d}: Timeout {d} ns before its deadline\n", .{ i, deadline.value - now.value });
+        try std.testing.expect(now.value >= deadline.value);
+    }
+}
+
 test "Event: a set that races the commit fence is not lost" {
     // The select's sweep holds the commit fence for another arm when set()
     // pops this arm and signals it. That signal cannot claim the winner word,
