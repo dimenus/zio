@@ -1252,16 +1252,25 @@ the mutants in its commits.
        connected socket, a connect whose four-tuple has a ghost of unknown
        fate (a fault rule, merged deaths, an overflowed bucket), and the
        2^60th send of a run that connected.
-    4. **Never jump the clock with `sim.advanceNs` past datagram traffic
-       without polling right after** (sleep 1 ns). In a run that has
-       connected a datagram socket, an overdue entry at a harvest, or a
-       socket call while one is on the wire, panics with that advice.
+    4. **Never jump the clock with `sim.advanceNs` onto or past datagram
+       traffic without polling right after** (sleep 1 ns). In a run that
+       has connected a datagram socket, an overdue entry at a harvest, or a
+       socket call while one is on the wire due now or earlier, panics with
+       that advice.
     5. A run that never connects a datagram socket and that completed
        before t-4167 completes the same, with the same events, clock,
        draws and digests.
     6. Not modelled: Linux's refusal before the next send on loopback
        (t-4179), ICMP rate limits; macOS's in-flight lookup was read, not
        run.
+  - **Sitting 42 (report 42).** t-4180: `dgramSlot` refuses at `<=`, so
+    a socket call at exactly an entry's due time after a jump refuses too
+    (3811425; a death test). Outside the sim, t-4196: a plain thread's
+    timed wait keeps its deadline on the caller's clock (ab9bcea; two
+    tests in `src/sync/Event.zig`). This changes normal-build code, so
+    the textcmp gate against 0685d39 differs for any example that links
+    that wait; report 42 compares against a26aae9 and names the
+    functions. Filed: t-4198 (Linux absolute futex wait).
   - **Next:**
     1. Slice 4 (17.16): the users. starh2's `dst-conn` accept step;
        hotseat's tests (17.15 item 7), after t-4110 and t-4111; then an
