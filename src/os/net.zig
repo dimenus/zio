@@ -1683,7 +1683,9 @@ pub fn recvmsg(
             // a control buffer. Without one the kernels disagree (measured,
             // 2026-11-14): Linux 6.8 sets MSG_CTRUNC, macOS 25.6 does not.
             if (sim.dgramDestinationAddressEnabled(fd)) {
-                // A pending error first: it returns no datagram (review 4, finding 5).
+                // After the receive's checks, a pending error first: it
+                // returns no datagram (reviews 4 and 5).
+                simRecvPreflight(fd, buffers, flags);
                 if (sim.dgramTakeRefusal(fd)) return error.ConnectionRefused;
                 sim.panic("sim: recvmsg on sim fd {d}, which asked for destination addresses, is not simulated: use recvDatagram", .{fd});
             }
@@ -2230,9 +2232,15 @@ pub fn writeSimAddr(a: sim.Ip4, out: *sockaddr, out_len: *socklen_t) void {
     out_len.* = @sizeOf(sockaddr.in);
 }
 
-fn simRecv(fd: fd_t, buffers: []iovec, flags: RecvFlags) RecvError!sim.Received {
+/// The checks every sim receive makes before it touches the socket.
+fn simRecvPreflight(fd: fd_t, buffers: []iovec, flags: RecvFlags) void {
     if (flags.peek) sim.panic("sim: MSG_PEEK on sim fd {d} is not simulated", .{fd});
     if (flags.waitall or flags.oob) sim.panic("sim: MSG_WAITALL or MSG_OOB on sim fd {d} is not simulated", .{fd});
+    sim.dgramRecvPreflight(fd, buffers.len);
+}
+
+fn simRecv(fd: fd_t, buffers: []iovec, flags: RecvFlags) RecvError!sim.Received {
+    simRecvPreflight(fd, buffers, flags);
     // The sim reads the iovecs in place and checks their count against
     // IOV_MAX (`sim.max_iovecs`).
     return sim.dgramRecv(fd, buffers, flags.dontwait);

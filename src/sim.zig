@@ -1741,7 +1741,16 @@ pub fn isRunning() bool {
     return sim_thread.load(.acquire) != 0;
 }
 
+const overdue = "harvested after a clock jump (sim.advanceNs) with no poll between, in a run that has connected a datagram socket";
+const overdue_remedy = "Poll right after the jump (for example sleep 1 ns)";
+
 fn dgramSlot(comptime what: []const u8, fd: i32) *Dgram {
+    // A call between such a jump and the poll could change where an overdue
+    // entry goes (a bind, a close, a connect) or see the state before it.
+    if (dgram_connect_used and wire.items.len != 0 and wire.items[0].due_at < clock_ns) {
+        const w = wire.items[0];
+        panic("sim: " ++ what ++ " on sim fd {d}, while {s} from port {d} to port {d} due at {d} ns is on the wire at {d} ns: overdue, after a clock jump (sim.advanceNs) with no poll between, in a run that has connected a datagram socket. " ++ overdue_remedy, .{ fd, if (w.icmp) "an ICMP" else "a datagram", w.from.port, w.to.port, w.due_at, clock_ns });
+    }
     if (fd < fd_base + max_ends or fd >= fd_base + sim_fd_count) {
         panic("sim: " ++ what ++ " on sim fd {d}, which is not a datagram socket", .{fd});
     }
@@ -1908,12 +1917,19 @@ pub fn dgramEnableDestinationAddress(fd: i32) void {
 //   four-tuple's overflow bucket, and only a connect whose four-tuple hashes
 //   to a live bucket refuses.
 // - **A late harvest** (a test jumped the clock with `advanceNs` past a wire
-//   entry and polled later; the loop's own clock never passes one): a late
-//   death whose sender is not connected to where it died is exact, as
-//   above. A late death whose sender is connected there, or a late ICMP
-//   that a connected socket would take, panics, naming the jump and the
-//   remedy (poll right after it): what the socket gets would depend on how
-//   late the harvest is.
+//   entry and polled later; the loop's own clock never passes one). One
+//   rule, in a run that has connected a datagram socket: an entry taken off
+//   the wire after its `due_at` (`land`, before any fault rule or receiver
+//   lookup), or any call on a datagram socket while such an entry is on the
+//   wire (`dgramSlot`), panics, naming the entry, its due time, the clock
+//   and the remedy: poll right after the jump. In a run that never
+//   connected, a late harvest completes as before, and a late death of an
+//   unconnected sender keeps its exact ghost (a connect made after the
+//   harvest can take it). Known limit: calls that read the sim and not a
+//   socket (`wireDigest`, `stateDigest`, `icmpsMade`,
+//   `datagramSocketsOpen`), the fault-rule setters and `socket()` do not
+//   check; the run refuses at its next socket call or poll, and `end`
+//   needs every socket closed first.
 // - **The pending error** is one slot (rows 16 and 21: two ICMPs give one
 //   error on both kernels). The next send takes it and does not send its
 //   datagram (row 7), also a send with an address (row 25, both kernels;
@@ -1950,8 +1966,9 @@ pub fn dgramEnableDestinationAddress(fd: i32) void {
 // (`AF_UNSPEC`); a connect to a port 0, a non-loopback or a wildcard
 // address; a connect that makes an inexact `Ghost`'s four-tuple (or any
 // ghost's, in a run that set a fault rule) before its bound, or whose
-// four-tuple's overflow bucket is live; a late harvest that reaches a
-// connected socket; `shutdown` of a connected socket;
+// four-tuple's overflow bucket is live; a late harvest, or a socket call
+// with an overdue entry on the wire, in a run that has connected; `shutdown`
+// of a connected socket;
 // the three profile rows with no profile; in a run that connected, its
 // 2^60th datagram send or ICMP, and a connect after 2^60 sends.
 //
@@ -2245,8 +2262,7 @@ pub const Received = struct {
 /// macOS's order on every host (the connected-socket protocol above
 /// `dgramConnect` says why).
 pub fn dgramRecv(fd: i32, dst: anytype, dont_wait: bool) error{ WouldBlock, ConnectionRefused }!Received {
-    refuseOtherThread("sim socket receive");
-    checkIovecs("a receive", fd, dst.len);
+    dgramRecvPreflight(fd, dst.len);
     const d = dgramSlot("receive", fd);
     if (dgramTakeRefusal(fd)) return error.ConnectionRefused;
     if (d.meta_len == 0) {
@@ -2276,6 +2292,12 @@ pub fn dgramRecv(fd: i32, dst: anytype, dont_wait: bool) error{ WouldBlock, Conn
     }
     d.charged -= q.len + datagram_overhead;
     return .{ .copied = copied, .len = q.len, .from = q.from, .to = if (d.dst_addr) q.to else null };
+}
+
+/// The checks of every receive before it touches the socket.
+pub fn dgramRecvPreflight(fd: i32, n: usize) void {
+    refuseOtherThread("sim socket receive");
+    checkIovecs("a receive", fd, n);
 }
 
 /// Takes `fd`'s pending error if a receive would now: queue empty, or row 11.
@@ -2645,6 +2667,8 @@ pub fn wireDigest() u64 {
 }
 
 fn land(w: WireDatagram) void {
+    // The one late-harvest rule (the protocol above `dgramConnect`).
+    if (dgram_connect_used and w.due_at < clock_ns) panic("sim: {s} from port {d} to port {d} due at {d} ns " ++ overdue ++ ": at {d} ns, what a connected socket sees would depend on how late the harvest is. " ++ overdue_remedy, .{ if (w.icmp) "an ICMP" else "a datagram", w.from.port, w.to.port, w.due_at, clock_ns });
     if (rules_len != 0) {
         if (faultInFlight(w.from, w.to)) |outcome| {
             recordLanding(w, outcome);
@@ -2706,15 +2730,7 @@ fn diedAtLanding(w: WireDatagram) void {
     const s = receiverOf(w.from) orelse return addGhost(w.from, w.to, w.due_at);
     const p = s.peer orelse return addGhost(w.from, w.to, w.due_at);
     if (!std.meta.eql(p, w.to)) return addGhost(w.from, w.to, w.due_at);
-    lateHarvest("its sender is connected to where it died", w);
     sendIcmpAt(w.to, w.from, clock_ns + wire_latency_ns);
-}
-
-/// A wire entry processed after its `due_at` (a test's `advanceNs` jumped
-/// past it; the loop's clock never does) refuses to reach a connected socket.
-fn lateHarvest(comptime what: []const u8, w: WireDatagram) void {
-    if (w.due_at >= clock_ns) return;
-    panic("sim: a datagram from port {d} to port {d} due at {d} ns was harvested at {d} ns, after a clock jump (sim.advanceNs) with no poll between; " ++ what ++ ", and what a connected socket gets would depend on how late the harvest is: not simulated. Poll right after the jump (for example sleep 1 ns)", .{ w.from.port, w.to.port, w.due_at, clock_ns });
 }
 
 /// Puts an ICMP port unreachable from `from` (the address where a datagram
@@ -2754,7 +2770,6 @@ fn landIcmp(w: WireDatagram) void {
     const d = receiverOf(w.to) orelse return recordLanding(w, .no_socket);
     const p = d.peer orelse return recordLanding(w, .no_socket);
     if (!std.meta.eql(p, w.from)) return recordLanding(w, .no_socket);
-    lateHarvest("it is an ICMP that a connected socket would take", w);
     recordLanding(w, .landed);
     d.refused = true;
     d.stats.refusals += 1;
