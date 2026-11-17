@@ -1304,14 +1304,42 @@ the mutants in its commits.
   the same as would-block, so ENet's receive loop stops there for that
   service call. Later datagrams wait for the next call.
 
-### Upstream: merged in, never rebased (ZIOSYNC1 and 2)
+### Upstream: merged in, never rebased (ZIOSYNC1 to 3)
 
-- **The branch contains upstream zio 5357759 (v0.20.1) by merge commit
-  f0396b1** (upstream into the sim line at 5315249; 23 conflict hunks in 5
-  files, each named in its message), and the later sim work by merge
-  commit 2559c02 (6e854fc into f0396b1, no conflicts). The next upstream
+- **The branch contains upstream zio e53caa9 (#923 to #929, after v0.20.1)
+  by merge commit b2d713f** on `hotseat/upstream-sync`: the sim line at
+  b87eb53 came in first by merge commit de28ce6 (no conflicts), then
+  `origin/main` (2 conflict hunks, in `Async.notify` and `Loop.deinit`,
+  each named in its message). Before that, upstream 5357759 (v0.20.1) came
+  in by f0396b1 and the sim work of then by 2559c02. The next upstream
   catch-up is the same: `git merge origin/main`, never a rebase.
-- **Gates on 2559c02:** sim tests on macOS 275 passed, 2 skipped, 250
+- **Gates on c2f5281 (b2d713f plus the `ev.Async` sim test), ZIOSYNC3:**
+  sim tests on macOS 521 passed, 2 skipped (the real-sockets interrupt
+  test and `epoll_pwait2`), 3 verbose runs; b87eb53 alone 520 and 2, the
+  name lists differing only by the new test. `check.sh --ci --verbose` 873
+  passed, 524 skipped, 3 runs, identical skip lists; b87eb53 alone 864 and
+  523, the difference being upstream's 9 new tests and the new sim test.
+  Linux in colima, sim build 511 passed, 1 skipped, and without sim 889 of
+  891, 508 skipped, the two failures being the DNS lookups that fail the
+  same way on plain e53caa9 in that container (3 runs each). The Windows
+  test binary compiles. The bridge tests 12 OK without sim and 11 OK, 1
+  skip with it, on macOS and Linux. starh2's three steps exit 0, dst-zio 54
+  of 54 keys equal to the reference over 10 runs, trace digest
+  c05b7576d516675ee650676f4af38437 (b87eb53 alone gives the same). The
+  structural test counts 132 fd-taking functions (71 refuse first, 23 sim
+  branch, 2 delegate, 36 covered by callers), the same as b87eb53.
+- **Machine code without sim, ZIOSYNC3:** the eight examples differ from
+  e53caa9 in 123 function names (normalized union), and b87eb53 differs
+  from 5357759 in the same 123 names (`comm -3` of the lists is empty):
+  the merge adds and removes no difference in a normal build.
+- **#928 under sim:** `Async.notify` keeps the refusal of other threads as
+  its first line, so a sim loop never sees `busy` (the notifier sets and
+  clears it before it returns, on the loop's own thread). What changed is
+  that a notify on a handle out of the list (before `add`, after it
+  completed) only latches and sets no wake bit, so the sim clock may move;
+  pinned by `sim: ev.Async: an armed notify is taken at its instant, a
+  disarmed one latches without a wake`.
+- **Gates on 2559c02 (ZIOSYNC2):** sim tests on macOS 275 passed, 2 skipped, 250
   named `sim:` tests (3 verbose runs; 6e854fc alone gives the same);
   `check.sh --ci` 858 passed, 282 skipped (3 verbose runs); Linux in
   colima, sim build 265 passed, 1 skipped, and without sim 874 of 876, the
@@ -1323,7 +1351,7 @@ the mutants in its commits.
   c05b7576d516675ee650676f4af38437 (6e854fc alone gives the same); the
   structural test counts 129 fd-taking functions (71 refuse first, 21 sim
   branch, 2 delegate, 35 covered by callers), as before the merge.
-- **Machine code without sim:** against origin/main, the eight examples
+- **Machine code without sim (ZIOSYNC1 and 2):** against origin/main, the eight examples
   differ in the functions the fork already differed in against its base
   c5716c4, less `LocalRunQueue` push and refill (upstream took our fix as
   #914), plus `AnyTask.releaseCoro`, `Executor.deinit` and
@@ -1335,7 +1363,11 @@ the mutants in its commits.
   `allocator` parameter from 19 `src/os` path functions, each of which
   carries the refusal line; keep upstream's signature and put the line
   first. A new fd-taking function upstream fails the structural test until
-  it gets the line.
+  it gets the line. Upstream #928 rewrote `Async.notify` and `Loop.deinit`:
+  keep upstream's body, with `sim.refuseOtherThread` first in `notify` and
+  the `comptime !zio_options.sim` guard on `backend.deinit`. Open upstream
+  PR #930 changes `setsockopt` in `src/os/net.zig` below the sim branch;
+  `git merge-tree` against b2d713f shows no conflict.
 
 ### Decided by the design's owner (2026-11-14, after reports 6-8)
 
@@ -1674,6 +1706,13 @@ the mutants in its commits.
   macOS later. A real-socket row that sends twice back to back to a
   closed port gets two different answers (row 16 of the connected
   table). Measure both before you write what "the kernel" does.
+- **A busy `ev.Async` hangs a sim run's teardown; it does not panic.**
+  Upstream #928's `disarmAsync` (`Loop.deinit`, cancel) waits with
+  `os.thread.yield` until `busy` clears, and under sim no other thread can
+  clear it. The mutant "notify never clears busy" printed its test error,
+  then spun at 99% CPU in `Loop.deinit` until the 30 s child timeout
+  (t-4203). A test that leaves an `Async` busy reads as `Timeout`, not as
+  its own error: run the child by hand and `sample` it.
 - **A random test's floor that only says "not 0" sits thin.** The pull
   cases had floors of 1 and stayed at 1 per profile; the pull seeds'
   counts have floors of 10. Steering old seeds moved their digests and
