@@ -19,6 +19,8 @@ const FileRead = @import("completion.zig").FileRead;
 const NetSend = @import("completion.zig").NetSend;
 const NetRecv = @import("completion.zig").NetRecv;
 const NetClose = @import("completion.zig").NetClose;
+const NetConnect = @import("completion.zig").NetConnect;
+const NetAccept = @import("completion.zig").NetAccept;
 const NetShutdown = @import("completion.zig").NetShutdown;
 const NetSendTo = @import("completion.zig").NetSendTo;
 const NetRecvFrom = @import("completion.zig").NetRecvFrom;
@@ -1257,6 +1259,7 @@ pub const Loop = struct {
                 for (batch[0..batch_count]) |timer| {
                     if (comptime zio_options.sim) {
                         sim.emit(.timer_fire, @backingInt(clock), @truncate(timer.deadline.value));
+                        sim.noteTimerFire(@backingInt(clock), timer.deadline.value);
                     }
                     self.state.markCompleted(&timer.c);
                     fired = true;
@@ -1622,6 +1625,9 @@ pub const Loop = struct {
         if (self.done()) return;
 
         const wait = wait_cap.value != 0;
+        // Sim: a pass at a virtual instant the clock has not left; too many
+        // is a spin (`sim.notePoll`, t-4133).
+        if (comptime zio_options.sim) sim.notePoll();
 
         self.state.updateNow();
         const timer_result = self.checkTimers();
@@ -1762,6 +1768,7 @@ pub const Loop = struct {
         sim.claimLoopGroup(self.loop_group, "a loop of another group submitted an op");
         if (simOpHandle(c)) |h| {
             if (!sim.isSimFd(h)) sim.panic("sim: a real fd {d} reached sim op {s} during a run", .{ h, @tagName(c.op) });
+            if (sim.isStreamFd(h)) return submitSimStream(c, h);
             if (sim.isDgramFd(h)) return submitSimDgram(c);
         } else if (c.op == .net_open) {
             return submitSimDgram(c);
@@ -1826,6 +1833,11 @@ pub const Loop = struct {
     fn simDgramMayWait(c: *Completion) bool {
         return switch (c.op) {
             .net_recvfrom, .net_recvmsg => true,
+            // Only on a connected socket can a NetRecv wait (round 2 of the
+            // review, finding 4): on an unconnected or closed one it ends
+            // `OperationNotSupported` at once, as before t-4167, and the
+            // one-waiter rule never sees it.
+            .net_recv => sim.dgramIsConnected(c.cast(NetRecv).handle),
             .net_poll => c.cast(NetPoll).event == .recv,
             else => false,
         };
@@ -1876,6 +1888,105 @@ pub const Loop = struct {
         }
     }
 
+    /// Sim: an ev op on a sim stream socket (design section 17; slices 1
+    /// and 2). Bind, listen, shutdown and close go through the socket layer
+    /// as on a datagram socket, and are due now. Connect, accept, receive
+    /// and send are the sim's own (`sim.streamConnect`, `streamAccept`,
+    /// `streamRecv`, `streamSend`): each has its result now or parks on the
+    /// socket until a landing, a setting or a call wakes it, and its harvest
+    /// evaluates it again (`harvestSimStream`). Poll and the datagram calls
+    /// refuse by name.
+    fn submitSimStream(c: *Completion, h: i32) void {
+        const id = sim.streamOpStart(c, h);
+        switch (c.op) {
+            .net_bind => common.handleNetBind(c),
+            .net_listen => common.handleNetListen(c),
+            .net_close => common.handleNetClose(c),
+            .net_connect => {
+                const op = c.cast(NetConnect);
+                // Parked unless it failed before its SYN.
+                sim.streamConnect(h, net.simAddr("connect", op.addr, op.addr_len), c, id) catch |err| {
+                    c.setError(err);
+                    sim.streamOpDone(c, id);
+                };
+                return;
+            },
+            .net_accept => {
+                const op = c.cast(NetAccept);
+                const a = sim.streamAccept(h, c, id, op.flags.nonblocking) orelse return;
+                simAccepted(op, a);
+            },
+            .net_poll => sim.panic("sim: NetPoll on sim stream socket {d} is refused: no supported stream path polls (design 17.4)", .{h}),
+            .net_recv => {
+                const op = c.cast(NetRecv);
+                refuseSimStreamFlags("receive", op.flags, h);
+                if (!simStreamResult(c, sim.streamRecv(h, op.buffers.iovecs, c, id))) return;
+            },
+            .net_send => {
+                const op = c.cast(NetSend);
+                refuseSimStreamFlags("send", op.flags, h);
+                if (!simStreamResult(c, sim.streamSend(h, op.buffer.iovecs, c, id))) return;
+            },
+            .net_shutdown => common.handleNetShutdown(c),
+            else => sim.panic("sim: {s} on sim stream socket {d} is not simulated", .{ @tagName(c.op), h }),
+        }
+        sim.streamOpDone(c, id);
+    }
+
+    /// Sim: sets a receive's or a send's result; false when it parked.
+    fn simStreamResult(c: *Completion, r: sim.StreamResult) bool {
+        switch (r) {
+            .n => |n| switch (c.op) {
+                .net_recv => c.setResult(.net_recv, n),
+                .net_send => c.setResult(.net_send, n),
+                else => unreachable,
+            },
+            .err => |err| c.setError(err),
+            .park => return false,
+        }
+        return true;
+    }
+
+    /// Sim: a stream socket models a receive and a send with the default
+    /// flags only (design 17.4). Every other flag refuses by name, from the
+    /// type, as on a pipe: `dontwait` would need a would-block answer the
+    /// stream ops never give, and the rest have no meaning the sim gives
+    /// them.
+    fn refuseSimStreamFlags(comptime what: []const u8, flags: anytype, fd: i32) void {
+        const T = @TypeOf(flags);
+        const defaults: T = .{};
+        inline for (comptime std.meta.fieldNames(T)) |name| {
+            if (@field(flags, name) != @field(defaults, name)) {
+                sim.panic("sim: " ++ what ++ " flag " ++ name ++ " on sim stream socket {d} is not simulated", .{fd});
+            }
+        }
+    }
+
+    fn simAccepted(op: *NetAccept, a: sim.Accepted) void {
+        if (op.addr) |out| net.writeSimAddr(a.peer, out, op.addr_len orelse sim.panic("sim: accept with an address but no length", .{}));
+        op.c.setResult(.net_accept, a.fd);
+    }
+
+    /// Sim: a woken connect or accept at its harvest (design 17.6, the
+    /// harvest lists): its socket's generation first, then its result.
+    fn harvestSimStream(c: *Completion, id: u32) void {
+        const h = simOpHandle(c).?;
+        if (!sim.streamOpOnItsSocket(c, id, h)) return c.setError(error.FileDescriptorNotASocket);
+        switch (c.op) {
+            .net_connect => {
+                sim.streamHarvestConnect(h) catch |err| return c.setError(err);
+                c.setResult(.net_connect, {});
+            },
+            .net_accept => {
+                const op = c.cast(NetAccept);
+                simAccepted(op, sim.streamHarvestAccept(h, op.flags.nonblocking));
+            },
+            .net_recv => _ = simStreamResult(c, sim.streamHarvestRecv(h, c.cast(NetRecv).buffers.iovecs)),
+            .net_send => _ = simStreamResult(c, sim.streamHarvestSend(h, c.cast(NetSend).buffer.iovecs)),
+            else => sim.panic("sim: a woken {s} on a stream socket: only a connect, an accept, a receive or a send waits", .{@tagName(c.op)}),
+        }
+    }
+
     /// Does a datagram op now if it can; false when it must wait for a
     /// datagram. The socket layer's receive is called with `dontwait`: the
     /// op parks instead of the layer refusing a blocking receive.
@@ -1890,8 +2001,21 @@ pub const Loop = struct {
                 if (net.send(op.handle, op.buffer.iovecs, op.flags)) |n| c.setResult(.net_send, n) else |err| c.setError(err);
             },
             .net_recv => {
+                // On a connected socket it waits as a NetRecvFrom does; on
+                // an unconnected one the layer answers at once.
                 const op = c.cast(NetRecv);
-                if (net.recv(op.handle, op.buffers.iovecs, op.flags)) |n| c.setResult(.net_recv, n) else |err| c.setError(err);
+                var flags = op.flags;
+                flags.dontwait = true;
+                if (net.recv(op.handle, op.buffers.iovecs, flags)) |n| {
+                    c.setResult(.net_recv, n);
+                } else |err| switch (err) {
+                    error.WouldBlock => if (op.flags.dontwait) c.setError(err) else return false,
+                    else => c.setError(err),
+                }
+            },
+            .net_connect => {
+                const op = c.cast(NetConnect);
+                if (net.connect(op.handle, op.addr, op.addr_len)) |_| c.setResult(.net_connect, {}) else |err| c.setError(err);
             },
             .net_sendto => {
                 const op = c.cast(NetSendTo);
@@ -1925,8 +2049,9 @@ pub const Loop = struct {
             },
             .net_poll => {
                 const op = c.cast(NetPoll);
-                // Read for every event: it refuses a closed socket.
-                const readable = sim.dgramReadable(op.handle);
+                // Read for every event: it refuses a closed socket. A
+                // pending error counts as ready, as both kernels wake it.
+                const readable = sim.dgramPollReady(op.handle);
                 if (op.event == .recv and !readable) return false;
                 c.setResult(.net_poll, {});
             },
@@ -1960,6 +2085,7 @@ pub const Loop = struct {
             // exact submit (pointer and op id) is still live.
             if (!sim.isLive(buf[i].c, buf[i].id)) continue;
             const c: *Completion = @ptrCast(@alignCast(buf[i].c));
+            if (!c.has_result and sim.isStreamOp(buf[i].c, buf[i].id)) harvestSimStream(c, buf[i].id);
             if (!c.has_result) dgram: {
                 // A parked datagram op that a landing or a close made due. It
                 // must still have the socket it was submitted on: an earlier

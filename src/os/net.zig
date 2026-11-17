@@ -161,6 +161,7 @@ pub fn poll(fds: []pollfd, timeout: i32) PollError!usize {
 
 pub fn close(fd: fd_t) void {
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return sim.streamClose(fd);
         if (sim.isDgramFd(fd)) return sim.dgramClose(fd);
         sim.refuseSimFd(@src(), fd);
     }
@@ -203,8 +204,16 @@ pub const ShutdownError = error{
 
 pub fn shutdown(fd: fd_t, how: ShutdownHow) ShutdownError!void {
     if (comptime sim_layer) {
-        // An unconnected UDP socket: ENOTCONN, as Linux answers.
-        if (sim.isDgramFd(fd)) return error.SocketUnconnected;
+        if (sim.isStreamFd(fd)) return sim.streamShutdown(fd, switch (how) {
+            .receive => .receive,
+            .send => .send,
+            .both => .both,
+        });
+        // An unconnected or closed UDP socket: ENOTCONN, as Linux answers.
+        if (sim.isDgramFd(fd)) {
+            if (sim.dgramIsConnected(fd)) sim.panic("sim: shutdown of connected sim datagram socket {d} is not simulated", .{fd});
+            return error.SocketUnconnected;
+        }
         sim.refuseSimFd(@src(), fd);
     }
     switch (builtin.os.tag) {
@@ -345,8 +354,11 @@ fn disableUdpResetReports(sock: fd_t) void {
 pub fn socket(domain: Domain, socket_type: Type, protocol: Protocol, flags: OpenFlags) OpenError!fd_t {
     if (comptime sim_layer) {
         if (sim.isRunning()) {
+            if (domain == .ipv4 and socket_type == .stream and (protocol == .ip or protocol == .tcp)) {
+                return sim.streamOpen(flags.nonblocking);
+            }
             if (domain != .ipv4 or socket_type != .dgram or (protocol != .ip and protocol != .udp)) {
-                sim.panic("sim: socket({t}, {t}, {t}) during a sim run: only IPv4 datagram sockets are simulated", .{ domain, socket_type, protocol });
+                sim.panic("sim: socket({t}, {t}, {t}) during a sim run: only IPv4 datagram and stream sockets are simulated", .{ domain, socket_type, protocol });
             }
             return sim.dgramOpen(flags.nonblocking);
         }
@@ -549,6 +561,7 @@ pub fn errnoToBindError(err: E) BindError {
 
 pub fn bind(fd: fd_t, addr: *const sockaddr, addr_len: socklen_t) BindError!void {
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return sim.streamBind(fd, simAddr("bind", addr, addr_len));
         if (sim.isSimFd(fd)) return sim.dgramBind(fd, simAddr("bind", addr, addr_len));
     }
     switch (builtin.os.tag) {
@@ -613,6 +626,7 @@ pub fn errnoToListenError(err: E) ListenError {
 
 pub fn listen(fd: fd_t, backlog: u31) ListenError!void {
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return sim.streamListen(fd, backlog);
         if (sim.isDgramFd(fd)) return error.OperationNotSupported;
         sim.refuseSimFd(@src(), fd);
     }
@@ -663,7 +677,13 @@ pub const ConnectError = error{
 
 pub fn connect(fd: fd_t, addr: *const sockaddr, addr_len: socklen_t) ConnectError!void {
     if (comptime sim_layer) {
-        if (sim.isDgramFd(fd)) sim.panic("sim: connect on sim datagram socket {d}: connected UDP is not simulated", .{fd});
+        // Under sim the loop dispatches NetConnect itself (`sim.streamConnect`);
+        // only the native backends call this.
+        if (sim.isStreamFd(fd)) sim.panic("sim: the socket layer's connect on sim stream socket {d}: not reached under sim (only the native backends call it)", .{fd});
+        if (sim.isDgramFd(fd)) {
+            if (addr_len >= @sizeOf(sockaddr) and addr.family == AF.UNSPEC) sim.panic("sim: connect with AF_UNSPEC (a disconnect) on sim datagram socket {d} is not simulated", .{fd});
+            return sim.dgramConnect(fd, simAddr("connect", addr, addr_len));
+        }
         sim.refuseSimFd(@src(), fd);
     }
     switch (builtin.os.tag) {
@@ -705,6 +725,8 @@ pub const AcceptError = error{
 
 pub fn accept(fd: fd_t, addr: ?*sockaddr, addr_len: ?*socklen_t, flags: OpenFlags) AcceptError!fd_t {
     if (comptime sim_layer) {
+        // Under sim the loop dispatches NetAccept itself (`sim.streamAccept`).
+        if (sim.isStreamFd(fd)) sim.panic("sim: the socket layer's accept on sim stream socket {d}: not reached under sim (only the native backends call it)", .{fd});
         if (sim.isDgramFd(fd)) return error.OperationNotSupported;
         sim.refuseSimFd(@src(), fd);
     }
@@ -786,6 +808,7 @@ pub const GetSockNameError = error{Unexpected};
 
 pub fn getsockname(fd: fd_t, addr: *sockaddr, addr_len: *socklen_t) GetSockNameError!void {
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return writeSimAddr(sim.streamLocal(fd), addr, addr_len);
         if (sim.isSimFd(fd)) return writeSimAddr(sim.dgramLocal(fd), addr, addr_len);
     }
     switch (builtin.os.tag) {
@@ -804,6 +827,70 @@ pub fn getsockname(fd: fd_t, addr: *sockaddr, addr_len: *socklen_t) GetSockNameE
     }
 }
 
+pub const GetPeerNameError = error{ SocketUnconnected, Unexpected };
+
+/// `getpeername`: the connected peer's address. ENOTCONN, and EINVAL (macOS
+/// answers it after a reset, Linux ENOTCONN: design 17.13 row 9), are both
+/// `SocketUnconnected` in every build, so a caller sees one answer. Under
+/// sim, a stream endpoint that is established and has not received a
+/// reset has a peer; every other stream socket is `SocketUnconnected`.
+pub fn getpeername(fd: fd_t, addr: *sockaddr, addr_len: *socklen_t) GetPeerNameError!void {
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return writeSimAddr(sim.streamPeer(fd) orelse return error.SocketUnconnected, addr, addr_len);
+        if (sim.isDgramFd(fd)) return writeSimAddr(sim.dgramPeer(fd) orelse return error.SocketUnconnected, addr, addr_len);
+        sim.refuseSimFd(@src(), fd);
+    }
+    switch (builtin.os.tag) {
+        .windows => {
+            const rc = windows.getpeername(fd, @ptrCast(addr), @ptrCast(addr_len));
+            if (rc != 0) {
+                const err = windows.WSAGetLastError();
+                if (err == .ENOTCONN) return error.SocketUnconnected;
+                return unexpectedError(err);
+            }
+        },
+        else => {
+            const rc = posix.system.getpeername(fd, addr, addr_len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {},
+                .NOTCONN, .INVAL => return error.SocketUnconnected,
+                else => |err| return unexpectedError(err),
+            }
+        },
+    }
+}
+
+pub const BytesReadableError = error{Unexpected};
+
+/// std's `T` has FIONREAD on Linux and the BSDs, not on Darwin, whose value
+/// is the BSDs' `_IOR('f', 127, int)`.
+const fionread: u32 = if (builtin.os.tag != .windows and @hasDecl(posix.system.T, "FIONREAD")) posix.system.T.FIONREAD else 0x4004667f;
+
+/// `FIONREAD`: the bytes a stream socket can read now without waiting.
+/// Under sim, a stream endpoint's landed, unread bytes (design 17.4).
+pub fn bytesReadable(fd: fd_t) BytesReadableError!usize {
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return sim.streamBytesReadable(fd);
+        if (sim.isDgramFd(fd)) sim.panic("sim: bytesReadable (FIONREAD) on sim datagram socket {d} is not simulated", .{fd});
+        sim.refuseSimFd(@src(), fd);
+    }
+    switch (builtin.os.tag) {
+        .windows => {
+            var n: u32 = 0;
+            if (windows.ioctlsocket(fd, windows.FIONREAD, &n) != 0) return unexpectedError(windows.WSAGetLastError());
+            return n;
+        },
+        else => {
+            var n: c_int = 0;
+            const rc = posix.system.ioctl(fd, @bitCast(@as(u32, fionread)), @intFromPtr(&n));
+            switch (posix.errno(rc)) {
+                .SUCCESS => return @intCast(n),
+                else => |err| return unexpectedError(err),
+            }
+        },
+    }
+}
+
 pub const GetSockErrorError = error{Unexpected};
 
 pub fn getSockError(fd: fd_t) GetSockErrorError!i32 {
@@ -816,6 +903,7 @@ pub const SetsockoptError = error{ OptionNotSupported, Unexpected };
 
 pub fn setsockopt(fd: fd_t, level: i32, optname: u32, optval: []const u8) SetsockoptError!void {
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return sim.streamSetOption(fd, level, optname, optval);
         if (sim.isSimFd(fd)) return sim.dgramSetOption(fd, level, optname, optval);
     }
     switch (builtin.os.tag) {
@@ -847,6 +935,7 @@ pub const GetsockoptError = error{Unexpected};
 
 pub fn getsockopt(fd: fd_t, level: i32, optname: u32, optval: []u8) GetsockoptError!void {
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return sim.streamGetOption(fd, level, optname, optval);
         if (sim.isSimFd(fd)) return sim.dgramGetOption(fd, level, optname, optval);
     }
     switch (builtin.os.tag) {
@@ -1164,9 +1253,21 @@ pub const RecvError = error{
 };
 
 pub fn recv(fd: fd_t, buffers: []iovec, flags: RecvFlags) RecvError!usize {
+    // Before the empty-list return: with no buffers a sim stream socket
+    // would otherwise succeed here, and a receive would look like end of
+    // stream (outside review 5 of the stream track, finding 1).
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's receive", fd);
+    }
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
-        if (sim.isDgramFd(fd)) return error.OperationNotSupported;
+        // A connected datagram socket receives from its peer; an
+        // unconnected one keeps the old answer (the connected-socket
+        // protocol above `sim.dgramConnect`).
+        if (sim.isDgramFd(fd)) {
+            if (!sim.dgramIsConnected(fd)) return error.OperationNotSupported;
+            return simRecvLen(try simRecv(fd, buffers, flags), flags);
+        }
         sim.refuseSimFd(@src(), fd);
     }
 
@@ -1289,9 +1390,21 @@ pub const SendError = error{
 };
 
 pub fn send(fd: fd_t, buffers: []const iovec_const, flags: SendFlags) SendError!usize {
+    // Before the empty-list return: with no buffers a sim stream socket
+    // would otherwise succeed here, and a receive would look like end of
+    // stream (outside review 5 of the stream track, finding 1).
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's send", fd);
+    }
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
-        if (sim.isDgramFd(fd)) return error.OperationNotSupported;
+        // A connected datagram socket sends to its peer; an unconnected one
+        // keeps the old answer (the connected-socket protocol above
+        // `sim.dgramConnect`).
+        if (sim.isDgramFd(fd)) {
+            if (!sim.dgramIsConnected(fd)) return error.OperationNotSupported;
+            return simSend(fd, buffers, flags, null, null);
+        }
         sim.refuseSimFd(@src(), fd);
     }
 
@@ -1364,6 +1477,12 @@ pub fn recvfrom(
     addr: ?*sockaddr,
     addr_len: ?*socklen_t,
 ) RecvError!usize {
+    // Before the empty-list return: with no buffers a sim stream socket
+    // would otherwise succeed here, and a receive would look like end of
+    // stream (outside review 5 of the stream track, finding 1).
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's recvfrom", fd);
+    }
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
         if (sim.isSimFd(fd)) {
@@ -1453,6 +1572,12 @@ pub fn sendto(
     addr: *const sockaddr,
     addr_len: socklen_t,
 ) SendError!usize {
+    // Before the empty-list return: with no buffers a sim stream socket
+    // would otherwise succeed here, and a receive would look like end of
+    // stream (outside review 5 of the stream track, finding 1).
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's sendto", fd);
+    }
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
         if (sim.isSimFd(fd)) return simSend(fd, buffers, flags, simAddr("sendto", addr, addr_len), null);
@@ -1543,6 +1668,12 @@ pub fn recvmsg(
     addr_len: ?*socklen_t,
     control: ?[]u8,
 ) RecvError!RecvMsgResult {
+    // Before the empty-list return: with no buffers a sim stream socket
+    // would otherwise succeed here, and a receive would look like end of
+    // stream (outside review 5 of the stream track, finding 1).
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's recvmsg", fd);
+    }
     if (buffers.len == 0) return .{ .len = 0, .flags = 0, .controllen = 0 };
     if (comptime sim_layer) {
         if (sim.isSimFd(fd)) {
@@ -1552,6 +1683,10 @@ pub fn recvmsg(
             // a control buffer. Without one the kernels disagree (measured,
             // 2026-11-14): Linux 6.8 sets MSG_CTRUNC, macOS 25.6 does not.
             if (sim.dgramDestinationAddressEnabled(fd)) {
+                // After the receive's checks, a pending error first: it
+                // returns no datagram (reviews 4 and 5).
+                simRecvPreflight(fd, buffers, flags);
+                if (sim.dgramTakeRefusal(fd)) return error.ConnectionRefused;
                 sim.panic("sim: recvmsg on sim fd {d}, which asked for destination addresses, is not simulated: use recvDatagram", .{fd});
             }
             const r = try simRecv(fd, buffers, flags);
@@ -1757,14 +1892,21 @@ pub fn sendmsg(
     addr_len: socklen_t,
     control: ?[]const u8,
 ) SendError!usize {
+    // Before the empty-list return: with no buffers a sim stream socket
+    // would otherwise succeed here, and a receive would look like end of
+    // stream (outside review 5 of the stream track, finding 1).
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's sendmsg", fd);
+    }
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
         if (sim.isSimFd(fd)) {
             if (control != null and control.?.len > 0) {
                 sim.panic("sim: sendmsg with control data on sim fd {d}: use sendDatagram for a source address", .{fd});
             }
-            const a = addr orelse sim.panic("sim: sendmsg with no address on sim fd {d}: connected UDP is not simulated", .{fd});
-            return simSend(fd, buffers, flags, simAddr("sendmsg", a, addr_len), null);
+            // With no address: to a connected socket's peer
+            // (`sim.dgramSend` refuses it on an unconnected one).
+            return simSend(fd, buffers, flags, if (addr) |a| simAddr("sendmsg", a, addr_len) else null, null);
         }
     }
 
@@ -1821,6 +1963,7 @@ pub fn sendmsg(
 pub fn setNonBlocking(fd: fd_t, on: bool) error{Unexpected}!void {
     if (comptime builtin.os.tag == .windows) @compileError("setNonBlocking: not on Windows yet");
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return sim.streamSetNonBlocking(fd, on);
         if (sim.isSimFd(fd)) return sim.dgramSetNonBlocking(fd, on);
     }
     const fl = posix.system.fcntl(fd, posix.system.F.GETFL, @as(c_int, 0));
@@ -1843,6 +1986,7 @@ pub fn setNonBlocking(fd: fd_t, on: bool) error{Unexpected}!void {
 pub fn isNonBlocking(fd: fd_t) error{Unexpected}!bool {
     if (comptime builtin.os.tag == .windows) @compileError("isNonBlocking: Windows cannot read a socket's blocking mode back");
     if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) return sim.streamIsNonBlocking(fd);
         if (sim.isSimFd(fd)) return sim.dgramIsNonBlocking(fd);
     }
     const fl = posix.system.fcntl(fd, posix.system.F.GETFL, @as(c_int, 0));
@@ -1887,6 +2031,12 @@ pub const DatagramInfo = struct {
 /// empty datagram, pass one empty buffer.
 pub fn recvDatagram(fd: fd_t, buffers: []iovec, flags: RecvFlags, from: ?*sockaddr.in) RecvError!DatagramInfo {
     if (comptime builtin.os.tag == .windows) @compileError("recvDatagram: not on Windows yet");
+    // Before the empty-list return: with no buffers a sim stream socket
+    // would otherwise succeed here, and a receive would look like end of
+    // stream (outside review 5 of the stream track, finding 1).
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's recvDatagram", fd);
+    }
     if (buffers.len == 0) return .{ .len = 0, .truncated = false, .to = null };
     if (comptime sim_layer) {
         if (sim.isSimFd(fd)) {
@@ -1916,6 +2066,12 @@ pub fn recvDatagram(fd: fd_t, buffers: []iovec, flags: RecvFlags, from: ?*sockad
 /// empty datagram, pass one empty buffer.
 pub fn sendDatagram(fd: fd_t, buffers: []const iovec_const, flags: SendFlags, to: *const sockaddr.in, from: ?[4]u8) SendError!usize {
     if (comptime builtin.os.tag == .windows) @compileError("sendDatagram: not on Windows yet");
+    // Before the empty-list return: with no buffers a sim stream socket
+    // would otherwise succeed here, and a receive would look like end of
+    // stream (outside review 5 of the stream track, finding 1).
+    if (comptime sim_layer) {
+        if (sim.isStreamFd(fd)) sim.refuseStream("the socket layer's sendDatagram", fd);
+    }
     if (buffers.len == 0) return 0;
     if (comptime sim_layer) {
         if (sim.isSimFd(fd)) return simSend(fd, buffers, flags, simAddrIn("sendDatagram", to), from);
@@ -2045,15 +2201,13 @@ fn simPoll(fds: []pollfd, timeout: i32) ?usize {
         f.revents = 0;
         if (f.fd < 0) continue;
         // Refuses a pipe end or a closed socket before any event is read.
-        const readable = sim.dgramReadable(f.fd);
-        if (f.events & POLL.IN != 0 and readable) f.revents |= POLL.IN;
-        if (f.events & POLL.OUT != 0) f.revents |= POLL.OUT;
+        f.revents = sim.dgramPollRevents(f.fd, f.events);
         if (f.revents != 0) ready += 1;
     }
     return ready;
 }
 
-fn simAddr(comptime what: []const u8, addr: *const sockaddr, len: socklen_t) sim.Ip4 {
+pub fn simAddr(comptime what: []const u8, addr: *const sockaddr, len: socklen_t) sim.Ip4 {
     // The family is checked once, in `simAddrIn`, before anything else reads
     // the address as IPv4.
     if (len < @sizeOf(sockaddr.in)) sim.panic("sim: " ++ what ++ " with an address of {d} bytes", .{len});
@@ -2071,16 +2225,22 @@ fn simSockaddr(a: sim.Ip4) sockaddr.in {
 
 /// As the kernel does: copies as much of the address as fits, and sets the
 /// length to the address's full size.
-fn writeSimAddr(a: sim.Ip4, out: *sockaddr, out_len: *socklen_t) void {
+pub fn writeSimAddr(a: sim.Ip4, out: *sockaddr, out_len: *socklen_t) void {
     const in = simSockaddr(a);
     const n = @min(@as(usize, @intCast(out_len.*)), @sizeOf(sockaddr.in));
     @memcpy(@as([*]u8, @ptrCast(out))[0..n], std.mem.asBytes(&in)[0..n]);
     out_len.* = @sizeOf(sockaddr.in);
 }
 
-fn simRecv(fd: fd_t, buffers: []iovec, flags: RecvFlags) RecvError!sim.Received {
+/// The checks every sim receive makes before it touches the socket.
+fn simRecvPreflight(fd: fd_t, buffers: []iovec, flags: RecvFlags) void {
     if (flags.peek) sim.panic("sim: MSG_PEEK on sim fd {d} is not simulated", .{fd});
     if (flags.waitall or flags.oob) sim.panic("sim: MSG_WAITALL or MSG_OOB on sim fd {d} is not simulated", .{fd});
+    sim.dgramRecvPreflight(fd, buffers.len);
+}
+
+fn simRecv(fd: fd_t, buffers: []iovec, flags: RecvFlags) RecvError!sim.Received {
+    simRecvPreflight(fd, buffers, flags);
     // The sim reads the iovecs in place and checks their count against
     // IOV_MAX (`sim.max_iovecs`).
     return sim.dgramRecv(fd, buffers, flags.dontwait);
@@ -2097,7 +2257,7 @@ fn simRecvLen(r: sim.Received, flags: RecvFlags) usize {
 /// stream socket; ENet passes MSG_NOSIGNAL on every send) and `dontwait` (a
 /// sim send never waits). Every other flag refuses, by name: a flag added to
 /// `SendFlags` later refuses too until someone decides what it means here.
-fn simSend(fd: fd_t, buffers: []const iovec_const, flags: SendFlags, to: sim.Ip4, from: ?[4]u8) SendError!usize {
+fn simSend(fd: fd_t, buffers: []const iovec_const, flags: SendFlags, to: ?sim.Ip4, from: ?[4]u8) SendError!usize {
     inline for (comptime std.meta.fieldNames(SendFlags)) |name| {
         const accepted = comptime std.mem.eql(u8, name, "no_signal") or std.mem.eql(u8, name, "dontwait");
         if (!accepted and @field(flags, name)) sim.panic("sim: send flag " ++ name ++ " on sim fd {d} is not simulated", .{fd});

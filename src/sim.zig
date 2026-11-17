@@ -23,6 +23,12 @@ pub const EventKind = enum(u8) {
     /// outcome (`LandOutcome`) in bits 16-23. `b`: the destination port in
     /// the high 16 bits, the length in the low 16 (at most 65507).
     dgram = 7,
+    /// A TCP entry reached its landing time (`landStream`). `a`: the
+    /// `conn_id`'s low 16 bits, the kind (`TcpKind`) in bits 16-19, the
+    /// direction in bit 20, the outcome (`StreamOutcome`) in bits 21-23.
+    /// `b`: the sequence's low 16 bits in the high 16, the payload length in
+    /// the low 16 (0 until slice 2).
+    stream = 8,
 };
 
 var begun: bool = false;
@@ -136,6 +142,10 @@ pub const DueKind = enum(u8) {
     /// close that wakes a parked op). An op without a result is checked
     /// against its socket's generation at the harvest (`dgramOpOnItsSocket`).
     dgram = 5,
+    /// Any ev op on a sim stream socket: due now, like `dgram`, and checked
+    /// against its socket's generation at the harvest when it has no result
+    /// (`streamOpOnItsSocket`).
+    stream = 6,
 };
 
 const Due = struct {
@@ -185,6 +195,10 @@ const LiveOp = struct {
     /// For an ev op on a sim datagram socket: the socket slot's generation
     /// when the op was submitted (`dgramOpStart`). 0 for every other op.
     sock_gen: u32 = 0,
+    /// An ev op on a sim stream socket (`streamOpStart`): the harvest
+    /// checks it with `streamOpOnItsSocket`, and `end`'s teardown check
+    /// lists it if it is still live.
+    on_stream: bool = false,
 };
 
 var live: [max_live]LiveOp = undefined;
@@ -260,6 +274,7 @@ pub fn begin(seed_value: u64) void {
     hasher = std.hash.Wyhash.init(0);
     event_count = 0;
     next_task_id = 1;
+    resetInstant();
     resetIo();
     establishFdNamespace();
     // Last, so a thread that sees the owner also sees the seed.
@@ -388,6 +403,11 @@ fn resetIo() void {
 
 pub fn end() void {
     refuseOtherThread("sim.end");
+    // Open datagram sockets are listed first, so a run that also leaves
+    // stream objects shows both before either check panics.
+    const dgrams_open = dgramTeardownList();
+    if (stream_used) streamTeardownCheck();
+    if (dgrams_open != 0) panic("sim: datagram teardown: {d} datagram sockets are open at sim.end (listed above): close every datagram socket before sim.end", .{dgrams_open});
     freeNet();
     restoreFdNamespace();
     sim_thread.store(0, .release);
@@ -463,9 +483,110 @@ pub fn tasksSeen() u32 {
     return next_task_id - 1;
 }
 
+// ---- A spin at one virtual instant (t-4133) ----
+//
+// The rule: a run whose loops pass through `Loop.poll` more than
+// `instant_poll_limit` times while `clock_ns` stands still panics, and the
+// line names the spin. Under sim, work takes no virtual time. A task that
+// keeps arming a timer for a moment already past is woken at once, at the
+// same instant, and a task that yields until the clock moves never sees it
+// move; either loops at one instant for ever, at full CPU and with no
+// message. On a real clock the same loop ends when real time passes, so
+// under sim it is a hang that only a wall-time alarm outside the run sees.
+//
+// What is counted: each pass of `Loop.poll` (`notePoll`, first in it once
+// the loop is known not done). Every scheduler turn of every executor goes
+// through it: a full wait, the `.zero` poll after a spent tick budget, each
+// loop of `simPollAll`, and a bare `ev.Loop` test's own polls. The count
+// starts again when the clock has moved since the last pass. Trace events
+// were measured and rejected: a main task that only yields makes no task
+// switch and no wake, so they stop while the polls go on, and a burst of
+// datagram landings at one instant gives hundreds of them in a correct run.
+//
+// The bound is a margin over a measurement, not a count of anything a
+// program asks for: the commit that added it has the largest count seen in
+// a correct run and the wall time a spin takes to reach the bound.
+// `setInstantPollLimit` changes it for one run.
+//
+// The check reads the clock and counts. It draws nothing and emits nothing,
+// so a run that stays under the bound keeps every trace and digest.
+
+/// Loop polls allowed at one virtual instant before the run panics (t-4133).
+pub const default_instant_poll_limit: u64 = 100_000;
+var instant_poll_limit: u64 = default_instant_poll_limit;
+/// The virtual time the counts below belong to.
+var instant_ns: u64 = 0;
+var instant_polls: u64 = 0;
+var instant_timer_fires: u64 = 0;
+/// For the panic line: the trace id of the task that last ran or was woken,
+/// and the last timer that fired (its clock and deadline, and when).
+var last_task_trace_id: u32 = 0;
+var last_timer: ?struct { clock: u8, deadline_ns: u64, fired_ns: u64 } = null;
+
+fn resetInstant() void {
+    instant_poll_limit = default_instant_poll_limit;
+    instant_ns = 0;
+    instant_polls = 0;
+    instant_timer_fires = 0;
+    last_task_trace_id = 0;
+    last_timer = null;
+}
+
+fn rollInstant() void {
+    if (clock_ns == instant_ns) return;
+    instant_ns = clock_ns;
+    instant_polls = 0;
+    instant_timer_fires = 0;
+}
+
+/// Sets the bound of the rule above for this run; `begin` restores
+/// `default_instant_poll_limit`. A run that does a great deal of zero-time
+/// work at one instant raises it; a test that wants a spin caught early
+/// lowers it. 0 is refused: no run can poll less than once.
+pub fn setInstantPollLimit(n: u64) void {
+    if (comptime !compiled_in) return;
+    refuseOtherThread("sim.setInstantPollLimit");
+    if (!begun) panic("sim: setInstantPollLimit before begin", .{});
+    if (n == 0) panic("sim: setInstantPollLimit(0): a run polls at least once", .{});
+    instant_poll_limit = n;
+}
+
+/// Called by `Loop.poll` under sim, once per pass (the rule above).
+pub fn notePoll() void {
+    if (comptime !compiled_in) return;
+    if (!begun) return;
+    rollInstant();
+    instant_polls += 1;
+    if (instant_polls > instant_poll_limit) spinPanic();
+}
+
+/// Called by `Loop.checkTimers` under sim for each timer it fires.
+pub fn noteTimerFire(clock_idx: u8, deadline_ns: u64) void {
+    if (comptime !compiled_in) return;
+    if (!begun) return;
+    rollInstant();
+    instant_timer_fires += 1;
+    last_timer = .{ .clock = clock_idx, .deadline_ns = deadline_ns, .fired_ns = clock_ns };
+}
+
+fn spinPanic() noreturn {
+    var task_buf: [64]u8 = undefined;
+    // Trace id 0: no task has been switched to or woken yet, which is a
+    // main task that only yields.
+    const task = if (last_task_trace_id == 0)
+        "no task has been switched to or woken in this run (the main task?)"
+    else
+        std.fmt.bufPrint(&task_buf, "the last task run or woken has trace id {d}", .{last_task_trace_id}) catch unreachable;
+    const head = "sim: {d} loop polls at virtual time {d} ns with the clock not moving (the limit is {d}, sim.setInstantPollLimit): a task spins without virtual time passing (t-4133); {s}; ";
+    const lt = last_timer orelse panic(head ++ "no timer has fired in this run", .{ instant_polls, clock_ns, instant_poll_limit, task });
+    if (lt.fired_ns != clock_ns) panic(head ++ "no timer fired at this instant (the last fired at {d} ns)", .{ instant_polls, clock_ns, instant_poll_limit, task, lt.fired_ns });
+    panic(head ++ "{d} timers fired at this instant, the last with deadline {d} ns on clock {d}", .{ instant_polls, clock_ns, instant_poll_limit, task, instant_timer_fires, lt.deadline_ns, lt.clock });
+}
+
 pub fn emit(kind: EventKind, a: u32, b: u32) void {
     if (comptime !compiled_in) return;
     if (!begun) return;
+    if (kind == .task_switch or kind == .wake) last_task_trace_id = a;
     var word: [8]u8 = undefined;
     word[0] = @backingInt(kind);
     std.mem.writeInt(u24, word[1..4], @truncate(a), .little);
@@ -540,6 +661,7 @@ pub fn stateDigest() u64 {
     }
     if (net_used) digestNet(&h);
     if (rule_history_len != 0) digestFaults(&h);
+    if (stream_used) digestStreams(&h);
     return h.final();
 }
 
@@ -591,6 +713,29 @@ fn digestNet(h: *std.hash.Wyhash) void {
             pk[4] = @backingInt(p.wait);
         }
         h.update(&pk);
+    }
+    // Only for a run that connected a socket (a run without keeps its
+    // digests): the ICMP count, and each socket's peer, pending error,
+    // filter drops and refusals.
+    if (dgram_connect_used) {
+        std.mem.writeInt(u64, &b, icmp_seq, .little);
+        h.update(&b);
+        // The profile decides what a later call does. The ghosts need no
+        // entry: each is a death the wire digest records, alive until a
+        // time its record and the clock give.
+        h.update(&.{if (dgram_profile) |pr| @backingInt(pr) else 0});
+        for (dgrams) |s| {
+            var e: [24]u8 = @splat(0);
+            if (s.peer) |p| {
+                e[0] = 1;
+                @memcpy(e[1..5], &p.ip);
+                std.mem.writeInt(u16, e[5..7], p.port, .little);
+            }
+            e[7] = @intFromBool(s.refused);
+            std.mem.writeInt(u64, e[8..16], s.stats.dropped_not_peer, .little);
+            std.mem.writeInt(u64, e[16..24], s.stats.refusals, .little);
+            h.update(&e);
+        }
     }
 }
 
@@ -745,6 +890,17 @@ fn resolve(c: *anyopaque, id: u32) void {
             if (u.c == c and u.id == id) d.unresolved = null;
         }
     }
+    for (&streams) |*t| {
+        if (t.unresolved) |u| {
+            if (u.c == c and u.id == id) t.unresolved = null;
+        }
+        if (t.unresolved_recv) |u| {
+            if (u.c == c and u.id == id) t.unresolved_recv = null;
+        }
+        if (t.unresolved_send) |u| {
+            if (u.c == c and u.id == id) t.unresolved_send = null;
+        }
+    }
 }
 
 /// A sim pipe end takes one unresolved ev receive and one unresolved ev
@@ -769,6 +925,7 @@ fn pushDueAt(c: *anyopaque, kind: DueKind, id: u32, at: u64) void {
     // a closed and reopened number from reaching it; this is a second guard
     // that keeps the window to one batch. See `wakeParked`.
     if (kind == .dgram and at != clock_ns) panic("sim: a datagram op made due at {d} ns, not now ({d} ns)", .{ at, clock_ns });
+    if (kind == .stream and at != clock_ns) panic("sim: a stream op made due at {d} ns, not now ({d} ns)", .{ at, clock_ns });
     due[due_len] = .{
         .c = c,
         .due_at = at,
@@ -801,6 +958,19 @@ pub fn nextDueIoRemaining() ?u64 {
         if (w.due_at <= clock_ns) continue;
         if (min_at == null or w.due_at < min_at.?) min_at = w.due_at;
         break;
+    }
+    // The TCP wire too: it is sorted by landing time first.
+    for (tcp_wire.items) |w| {
+        if (w.due_at <= clock_ns) continue;
+        if (min_at == null or w.due_at < min_at.?) min_at = w.due_at;
+        break;
+    }
+    // And owed credit departures (design 17.10: sim-internal times the
+    // poll's clock must stop at).
+    if (stream_used) {
+        if (nextOwedCredit()) |t| {
+            if (min_at == null or t < min_at.?) min_at = t;
+        }
     }
     if (min_at) |at| return at - clock_ns;
     return null;
@@ -998,8 +1168,18 @@ fn atEof(i: u8) bool {
     return ends[i].buf_len == 0 and (ends[i].closed or ends[i].rd_shut or ends[p].closed or ends[p].wr_shut);
 }
 
+/// An ev receive on a sim pipe end, at its submit.
+///
+/// A receive with no buffer room (total length 0) is refused, before any
+/// side effect (t-4096, decided yes; design 17.4 refuses the same on a
+/// stream socket). The sim parked it on an empty pipe until bytes or end of
+/// stream came, and gave 0 at once on a pipe holding bytes; a kernel's
+/// `recv(fd, buf, 0)` was not measured, and on Linux it is expected to give
+/// 0 at once in both cases. So the sim's answer could differ from the
+/// kernel's, silently. No user of the sim submits one.
 pub fn recvInto(fd: i32, dst: anytype, recv_c: *anyopaque, dont_wait: bool) IoSubmit {
     checkIovecs("a receive", fd, dst.len);
+    if (totalLen(dst) == 0) panic("sim: a receive of 0 bytes on sim pipe fd {d} is refused (t-4096): what a kernel answers is not measured, and the sim would park it on an empty pipe", .{fd});
     const id = allocOpId(recv_c);
     const i = endIndex(fd) orelse {
         pushDueKind(recv_c, .recv, id);
@@ -1022,8 +1202,8 @@ pub fn recvInto(fd: i32, dst: anytype, recv_c: *anyopaque, dont_wait: bool) IoSu
     }
     const n = drainBuf(fd, dst);
     pushDueKind(recv_c, .recv, id);
-    // A receive with no room takes nothing and frees no room.
-    if (n > 0) wakeSender(i);
+    // It has room (above) and the pipe has bytes, so it took some.
+    wakeSender(i);
     return .{ .due = n };
 }
 
@@ -1056,7 +1236,7 @@ pub fn drainBuf(fd: i32, dst: anytype) usize {
 }
 
 /// A woken pipe receive at its harvest, not reset and not at end of stream:
-/// its bytes. A receive with no buffer room completes with 0 (t-4096).
+/// its bytes. It has room: `recvInto` refuses one without (t-4096).
 ///
 /// Its bytes are still there: only an ev receive takes a pipe's bytes (the
 /// socket layer refuses a sim pipe fd), and a second one on this end refuses
@@ -1065,8 +1245,7 @@ pub fn drainBuf(fd: i32, dst: anytype) usize {
 /// again (7c0c22e); now an empty end here is a broken invariant.
 pub fn harvestRecv(fd: i32, dst: anytype) usize {
     const i = endIndex(fd) orelse panic("sim: a harvested receive on sim fd {d}, which is not a pipe end", .{fd});
-    const room = totalLen(dst);
-    if (ends[i].buf_len == 0 and room > 0) panic("sim: a woken ev receive on sim pipe fd {d} found no bytes, no end of stream and no reset: only another ev receive takes bytes, and that refuses while this one is unresolved", .{fd});
+    if (ends[i].buf_len == 0) panic("sim: a woken ev receive on sim pipe fd {d} found no bytes, no end of stream and no reset: only another ev receive takes bytes, and that refuses while this one is unresolved", .{fd});
     return drainForRecv(fd, dst);
 }
 
@@ -1164,6 +1343,17 @@ pub fn cancelIo(c: *anyopaque) ?u32 {
             if (p.c == c) d.parked = null;
         }
     }
+    for (&streams) |*t| {
+        if (t.parked) |p| {
+            if (p.c == c) t.parked = null;
+        }
+        if (t.parked_recv) |p| {
+            if (p.c == c) t.parked_recv = null;
+        }
+        if (t.parked_send) |p| {
+            if (p.c == c) t.parked_send = null;
+        }
+    }
     for (&ends) |*e| {
         if (e.pending_recv) |p| {
             if (p.c == c) e.pending_recv = null;
@@ -1188,6 +1378,8 @@ pub fn cancelIo(c: *anyopaque) ?u32 {
 /// the list.
 pub fn takeDue(out: []TakenDue) usize {
     landDue();
+    landStreamDue();
+    if (stream_used) departOwedCredits();
     var n: usize = 0;
     var w: usize = 0;
     var i: usize = 0;
@@ -1281,6 +1473,13 @@ pub const DatagramStats = struct {
     received: u64 = 0,
     /// Datagrams addressed to this socket that did not fit its queue.
     dropped_rcvbuf: u64 = 0,
+    /// Datagrams addressed to this connected socket from another source:
+    /// dropped at the landing (the connected-socket protocol below).
+    dropped_not_peer: u64 = 0,
+    /// ICMP port unreachables that reached this connected socket. Each sets
+    /// the one pending error; a second before a call takes it is counted
+    /// here and still leaves one error.
+    refusals: u64 = 0,
 };
 
 const Queued = struct { off: usize, len: usize, from: Ip4, to: [4]u8 };
@@ -1310,6 +1509,13 @@ const Dgram = struct {
     /// That op until it has its result: parked, or woken and not yet
     /// harvested. One at a time (`dgramRefuseSecondWaiter`).
     unresolved: ?DgramParked = null,
+    /// The peer `connect` fixed (`dgramConnect`); null for an unconnected
+    /// socket.
+    peer: ?Ip4 = null,
+    /// The pending error of a connected socket: an ICMP port unreachable
+    /// landed, and the next send or receive takes it (`ConnectionRefused`).
+    /// One slot, as both kernels keep it (`so_error`, `sk_err`).
+    refused: bool = false,
 };
 
 const WireDatagram = struct {
@@ -1321,6 +1527,10 @@ const WireDatagram = struct {
     /// The second copy of a duplicated datagram (`dup_ppm`). Its records
     /// set bit 0x80 of the outcome.
     copy: bool = false,
+    /// An ICMP port unreachable, not a datagram: `from` is the closed
+    /// address, `to` the sender of the datagram that died there, and it has
+    /// no bytes. Its records set bit 0x40 of the outcome.
+    icmp: bool = false,
 };
 
 /// Socket queues and datagrams on the wire. Not the runtime's allocator: the
@@ -1344,6 +1554,11 @@ var dgrams: [max_dgram]Dgram = @splat(.{});
 /// check, and holds in every build mode.
 var dgram_gen: [max_dgram]u32 = @splat(0);
 
+pub fn testSetWireSeq(n: u64) void {
+    if (comptime !builtin.is_test) @compileError("testSetWireSeq is for tests");
+    wire_seq = n;
+}
+
 fn testSetDgramGen(slot: usize, gen: u32) void {
     if (comptime !builtin.is_test) @compileError("testSetDgramGen is for tests");
     dgram_gen[slot] = gen;
@@ -1361,22 +1576,117 @@ var wire_hasher: std.hash.Wyhash = std.hash.Wyhash.init(0);
 /// Datagrams not yet landed, sorted by (due_at, seq): landing order.
 var wire: std.ArrayList(WireDatagram) = .empty;
 var wire_seq: u64 = 0;
+/// Whether this run connected a datagram socket. Only then does
+/// `stateDigest` cover the connected state and an ICMP go on the wire, so a
+/// run with no connect keeps every digest it had before (promise 1).
+var dgram_connect_used: bool = false;
+/// ICMP port unreachables made in this run; the fault draws of the next
+/// one use `icmp_send_base + icmp_seq` as its send number.
+var icmp_seq: u64 = 0;
+/// An ICMP's send number for the fault draws is in its own range, so it
+/// never draws what a datagram draws, and making one moves no datagram's
+/// fate. `faultDraw` multiplies the number by 8 (mod 2^64): bit 60 is the
+/// highest bit that survives that, so the ranges stay apart below 2^60 sends.
+/// A run that reaches 2^60 datagram sends or ICMPs refuses (`dgramSend`,
+/// `sendIcmpAt`) before the ranges could meet.
+const icmp_send_base: u64 = 1 << 60;
+
+/// ICMPs the sim did not make: datagrams from `sender` died at `dead`
+/// while no socket bound at `sender` was connected to `dead`, so nothing
+/// could take their error then. A kernel's ICMP would still be on its way
+/// back until `arrival`, and a socket that holds that four-tuple when it
+/// arrives takes the error (rows 18, 19 and 22 of the in-flight table, ran on
+/// Linux with the change made between the death and the arrival).
+/// `dgramConnect` makes those ICMPs then (`takeGhosts`). Kept only until
+/// `arrival`; never in a digest: a ghost is a function of the death records
+/// in the wire digest (each death at its `due_at`) and the clock.
+const Ghost = struct {
+    sender: Ip4,
+    dead: Ip4,
+    /// `exact`: when its ICMPs land, `death + wire_latency_ns`. Else an upper
+    /// bound of the latest one's arrival (saturating).
+    arrival: u64,
+    /// Deaths merged here: an exact ghost makes this many ICMPs.
+    count: u32,
+    /// No fault rule was set at any of its deaths, and all of them were at
+    /// one instant. Else its ICMPs' fates (loss, delay, jitter, order) or
+    /// their separate times are not known, and a connect that makes its
+    /// four-tuple before `arrival` refuses.
+    exact: bool,
+};
+pub const max_ghosts = 256;
+/// The most deaths an exact ghost counts (`testSetGhostCountMax`).
+var ghost_count_max: u32 = std.math.maxInt(u32);
+
+pub fn testSetGhostCountMax(n: u32) void {
+    if (comptime !builtin.is_test) @compileError("testSetGhostCountMax is for tests");
+    ghost_count_max = n;
+}
+var ghosts: [max_ghosts]Ghost = undefined;
+var ghosts_len: usize = 0;
+/// When the table is full even after merging each four-tuple into one
+/// entry, a death goes to the bucket of its four-tuple's hash, which keeps
+/// the latest arrival among the deaths it took. A connect refuses only while
+/// its own four-tuple's bucket is live, so a connect whose four-tuple was
+/// never dropped is refused only if it shares a bucket with one that was.
+pub const ghost_buckets = 1024;
+var ghost_bucket_until: [ghost_buckets]u64 = @splat(0);
 
 fn resetNet() void {
     for (dgrams) |d| {
         if (d.used) panic("sim: a datagram socket outlived the last run", .{});
     }
     if (wire.items.len != 0) panic("sim: datagrams on the wire outlived the last run", .{});
+    resetStreams();
     next_port = first_ephemeral_port;
     dgram_gen = @splat(0);
     dropped_no_socket = 0;
     wire_seq = 0;
     net_used = false;
+    dgram_connect_used = false;
+    dgram_profile = null;
+    icmp_seq = 0;
+    ghosts_len = 0;
+    ghost_bucket_until = @splat(0);
     wire_hasher = std.hash.Wyhash.init(0);
     rules_len = 0;
     rule_history_len = 0;
+    udp_rule_since = no_rule;
+    tcp_rule_set = false;
     fault_stats = .{};
     fault_draws = 0;
+}
+
+/// Datagram sockets open now in this run (t-4136): a consumer can check
+/// them before `end` and word its own failure. 0 outside a run.
+///
+/// `end` refuses a run that leaves one open (t-4142): it lists each one's
+/// fd (`sim: datagram teardown: sim fd N is an open datagram socket`) and
+/// panics, as it does for stream objects, so a program that forgets a
+/// close (for example, destroys an ENet host without closing its socket)
+/// fails its test instead of passing. Close each socket before `end`. The
+/// layer's close (`os_net.close`, which calls `dgramClose`) draws nothing
+/// from the run's RNG and does not move the clock, and on a socket with no
+/// parked op it records nothing in the trace or the wire digest (a parked
+/// op would complete, which the trace records). So a test that closes its
+/// idle sockets after its last digest read keeps every digest it records.
+pub fn datagramSocketsOpen() usize {
+    if (comptime !compiled_in) return 0;
+    if (!begun) return 0;
+    var n: usize = 0;
+    for (dgrams) |d| n += @intFromBool(d.used);
+    return n;
+}
+
+/// Prints one line per datagram socket still open, and returns how many.
+fn dgramTeardownList() usize {
+    var n: usize = 0;
+    for (dgrams, 0..) |d, i| {
+        if (!d.used) continue;
+        n += 1;
+        std.debug.print("sim: datagram teardown: sim fd {d} is an open datagram socket\n", .{fd_base + max_ends + @as(i32, @intCast(i))});
+    }
+    return n;
 }
 
 /// Frees every socket and every datagram still on the wire, at `end`.
@@ -1387,6 +1697,7 @@ fn freeNet() void {
     }
     for (wire.items) |w| net_alloc.free(w.bytes);
     wire.clearAndFree(net_alloc);
+    freeStreams();
 }
 
 fn freeQueue(d: *Dgram) void {
@@ -1430,11 +1741,26 @@ pub fn isRunning() bool {
     return sim_thread.load(.acquire) != 0;
 }
 
+const overdue = "harvested after a clock jump (sim.advanceNs) with no poll between, in a run that has connected a datagram socket";
+const overdue_remedy = "Poll right after the jump (for example sleep 1 ns)";
+
 fn dgramSlot(comptime what: []const u8, fd: i32) *Dgram {
+    // A call between such a jump and the poll could change where an overdue
+    // entry goes (a bind, a close, a connect) or see the state before it.
+    // An entry due exactly now counts too: on time, the poll that moves the
+    // clock to its due time lands it before any task runs at that instant,
+    // and no send is due sooner than `wire_latency_ns` after it leaves, so no
+    // on-time call sees it here. (`land` keeps `<`: the poll at the due time
+    // is the on-time landing.)
+    if (dgram_connect_used and wire.items.len != 0 and wire.items[0].due_at <= clock_ns) {
+        const w = wire.items[0];
+        panic("sim: " ++ what ++ " on sim fd {d}, while {s} from port {d} to port {d} due at {d} ns is on the wire at {d} ns: overdue, after a clock jump (sim.advanceNs) with no poll between, in a run that has connected a datagram socket. " ++ overdue_remedy, .{ fd, if (w.icmp) "an ICMP" else "a datagram", w.from.port, w.to.port, w.due_at, clock_ns });
+    }
     if (fd < fd_base + max_ends or fd >= fd_base + sim_fd_count) {
         panic("sim: " ++ what ++ " on sim fd {d}, which is not a datagram socket", .{fd});
     }
     const d = &dgrams[@intCast(fd - fd_base - max_ends)];
+    if (streams[@intCast(fd - fd_base - max_ends)].used) panic("sim: " ++ what ++ " on sim fd {d}, which is a stream socket: not simulated on a stream socket (the protocol above `pub const StreamProfile` in sim.zig)", .{fd});
     if (!d.used) panic("sim: " ++ what ++ " on sim fd {d}, which is closed", .{fd});
     return d;
 }
@@ -1476,7 +1802,7 @@ pub fn dgramOpen(nonblocking: bool) error{SystemResources}!i32 {
     if (comptime builtin.os.tag == .windows) panic("sim: sim sockets are not supported on Windows", .{});
     checkFdNamespace();
     var j: usize = 0;
-    while (j < max_dgram and dgrams[j].used) j += 1;
+    while (j < max_dgram and (dgrams[j].used or streams[j].used)) j += 1;
     if (j == max_dgram) panic("sim: the datagram socket table is full ({d} sockets)", .{max_dgram});
     const gen = std.math.add(u32, dgram_gen[j], 1) catch panic("sim: datagram socket slot {d} was opened {d} times in this run: its generation would wrap, and an op of an old socket could act on a new one", .{ j, dgram_gen[j] });
     const ring = net_alloc.alloc(u8, default_rcvbuf_bytes) catch return error.SystemResources;
@@ -1527,15 +1853,316 @@ pub fn dgramEnableDestinationAddress(fd: i32) void {
     dgramSlot("enableDestinationAddress", fd).dst_addr = true;
 }
 
+// ---- Connected datagram sockets (t-4167) ----
+//
+// What `connect` on a sim datagram socket does, and what the sim refuses.
+// Every row that cites a number is a row of the parity table in
+// `sim_dgram_connect_test.zig` (rows 1 to 17), or of its in-flight table
+// (rows 18 to 24). The parity table runs through zio's API on real loopback
+// sockets in a build without sim (macOS, and Linux with io_uring and with
+// epoll) and in sim runs in a sim build, and checks each against its
+// column. The in-flight rows need a delay on loopback: they ran on Linux
+// with netem; macOS's lookup at the ICMP's arrival was read in XNU's
+// `udp_ctlinput`, not run (dummynet needs root).
+//
+// How to use it: `zio.net.Socket.connect` (or std.Io's `connect` with
+// `.dgram`, or the layer's `connect`), then `Socket.send` and
+// `Socket.receive` (the ev ops NetSend and NetRecv), the layer's `send`,
+// `recv`, `sendmsg` with no address, or any receive that also gives the
+// source (`recvfrom`, `recvmsg`, `recvDatagram`, NetRecvFrom, NetRecvMsg).
+// A run whose program can meet a row where the kernels differ sets a
+// datagram profile first (`setDatagramProfile(.linux or .macos)`).
+//
+// - **The peer.** `connect` fixes it (row 1). A socket bound to the wildcard
+//   address now has 127.0.0.1 as its local address, with its port; an
+//   unbound socket is bound to 127.0.0.1 and the next port (rows 1 and 2).
+//   `getpeername` reads the peer back; on an unconnected socket it is
+//   `SocketUnconnected`. Datagrams already queued stay, from whatever source
+//   (row 14: neither kernel drops them).
+// - **The filter.** A datagram that lands at a connected socket from any
+//   other address or port is dropped and counted in
+//   `DatagramStats.dropped_not_peer`, recorded as `LandOutcome.not_peer` in
+//   the trace and the wire digest (row 3). To the kernel that datagram found
+//   no socket, so it is a dead landing like one to a closed port (row 17).
+// - **Sends and receives with no address** go to and come from the peer
+//   (row 4). On an unconnected socket, and on a closed fd, the layer's
+//   `send` and `recv` and a NetRecv keep their answers from before
+//   (`OperationNotSupported`), and so does `shutdown` (`SocketUnconnected`):
+//   every new path is taken only for an open, connected socket.
+// - **ICMP port unreachable.** A datagram that dies at its landing (no
+//   socket bound to its destination, or the filter above) makes an ICMP
+//   back to its sender's address when a socket bound there is connected to
+//   that destination. It meets the fault rules as a datagram on that
+//   reversed path does: silence, partition, loss, burst, delay, jitter, the
+//   order clamp and duplication, with its own range of send numbers for the
+//   draws (`icmp_send_base`), and the rules' counts include it. So it lands
+//   one path latency after the death, a full round trip after the send. At
+//   its landing, the socket that holds the four-tuple then (bound to the
+//   sender's address, connected to the ICMP's source) takes it: its pending
+//   error is set (`Dgram.refused`, `DatagramStats.refusals`) and an ev op
+//   parked on it is woken. That socket can be another than the sender: a
+//   new socket bound to the same address and connected to the same peer
+//   while the ICMP is in flight (rows 18, 22). Recorded with bit 0x40 of
+//   the outcome: `landed` when it set an error, `no_socket` when no socket
+//   held the four-tuple. No datagram that dies otherwise (a full queue, a
+//   fault) makes one, as no kernel does.
+// - **A death no socket could take yet** (no socket at the sender's address
+//   was connected to the destination) makes no ICMP, so a run that never
+//   connects keeps every record. It is kept as a `Ghost` until its ICMP
+//   would have landed (the death is at the datagram's `due_at`; it was
+//   under a fault rule only if one was set before then); a `connect` that
+//   makes its four-tuple before then makes the ICMP, due at that time
+//   (row 19). An exact ghost whose count would overflow becomes inexact. A connect to another peer (row 20), from another
+//   address (row 23), or after that time (row 24) makes none. Ghosts of one
+//   four-tuple are merged: deaths at one instant into one entry with a
+//   count; with a fault rule set, or when the table is full, into one
+//   inexact entry with the latest bound. A connect that makes an inexact
+//   ghost's four-tuple before its bound refuses (the ICMPs' fates or times
+//   are not known). A table full even then puts the death in its
+//   four-tuple's overflow bucket, and only a connect whose four-tuple hashes
+//   to a live bucket refuses.
+// - **A late harvest** (a test jumped the clock with `advanceNs` past a wire
+//   entry and polled later; the loop's own clock never passes one). One
+//   rule, in a run that has connected a datagram socket: an entry taken off
+//   the wire after its `due_at` (`land`, before any fault rule or receiver
+//   lookup), or any call on a datagram socket while such an entry is on the
+//   wire (`dgramSlot`), panics, naming the entry, its due time, the clock
+//   and the remedy: poll right after the jump. In a run that never
+//   connected, a late harvest completes as before, and a late death of an
+//   unconnected sender keeps its exact ghost (a connect made after the
+//   harvest can take it). Known limit: calls that read the sim and not a
+//   socket (`wireDigest`, `stateDigest`, `icmpsMade`,
+//   `datagramSocketsOpen`), the fault-rule setters and `socket()` do not
+//   check; the run refuses at its next socket call or poll, and `end`
+//   needs every socket closed first.
+// - **The pending error** is one slot (rows 16 and 21: two ICMPs give one
+//   error on both kernels). The next send takes it and does not send its
+//   datagram (row 7), also a send with an address (row 25, both kernels;
+//   before row 5's profile question arises); a receive takes it when the queue is empty (rows 6,
+//   9). A parked receive is woken with it (row 9). A parked NetPoll for
+//   reading is woken and completes with success, and the error stays (row
+//   10). `getsockopt` `SO_ERROR` returns ECONNREFUSED and clears it (row 8).
+//   `recvmsg` on a socket with destination addresses on takes it too; it
+//   still refuses a call that would return a datagram or would block.
+//   An unconnected socket never has one (row 12).
+// - **The datagram profile** (`DatagramProfile`), where the kernels differ:
+//   - row 5, a send with an address on a connected socket: `.macos` fails it
+//     `Unexpected` (macOS's EISCONN, as zio maps it: `SendError` has no name
+//     for it, t-4177), `.linux` sends to that address from the socket's
+//     local address;
+//   - row 6, a layer `poll` with an error pending: `.macos` reports POLLIN
+//     (if asked), `.linux` reports POLLERR (always, as the kernel does);
+//   - row 11, a receive with a datagram queued and an error pending:
+//     `.macos` gives the datagram first, `.linux` the error first.
+//   With no profile each of the three panics, as a stream row does with no
+//   `StreamProfile`; a run that never meets one of them needs none. A run
+//   that connects nothing can meet none (each needs a connected socket or a
+//   pending error).
+// - **The promise to a run that never connects a datagram socket**: if it
+//   completed before t-4167, it completes the same, with the same events,
+//   clock, draws and digests (sitting 37's and later end-of-run
+//   comparisons against 328d798). A run that panicked before may panic with
+//   another text or get an answer (`getpeername` on an unconnected socket
+//   now answers `SocketUnconnected`; `sendmsg` with no address panics with
+//   another text, after the send flags and the fd are checked).
+//
+// Refused by name (a panic): a second connect, to any peer (both kernels
+// allow it and replace the peer, row 13: not simulated); a disconnect
+// (`AF_UNSPEC`); a connect to a port 0, a non-loopback or a wildcard
+// address; a connect that makes an inexact `Ghost`'s four-tuple (or any
+// ghost's, in a run that set a fault rule) before its bound, or whose
+// four-tuple's overflow bucket is live; a late harvest, or a socket call
+// with an overdue entry on the wire, in a run that has connected; `shutdown`
+// of a connected socket;
+// the three profile rows with no profile; in a run that connected, its
+// 2^60th datagram send or ICMP, and a connect after 2^60 sends.
+//
+// Fidelity limits: ICMP rate limits (Linux allows 1000 a second with a
+// burst of 50, macOS's `icmplim`) are not modelled. Linux usually sets the
+// error on loopback before the send returns (row 16: its second
+// back-to-back send is refused), because the sending task runs the receive
+// softirq itself; that is a schedule, not a guarantee (RPS, or softirq work
+// handed to ksoftirqd, defers it). The sim always takes a round trip, under
+// either profile: a datagram lands only at a harvest, `wire_latency_ns`
+// after its send, and that order is what the per-flow FIFO and the fault
+// rules rest on (t-4179 has the rest).
+
+/// Where the kernels differ for a connected datagram socket (the
+/// connected-socket protocol above). One per run, set before its first
+/// datagram socket opens; none by default.
+pub const DatagramProfile = enum(u8) { linux = 1, macos = 2 };
+
+var dgram_profile: ?DatagramProfile = null;
+
+pub fn setDatagramProfile(p: DatagramProfile) void {
+    if (comptime !compiled_in) unreachable;
+    refuseOtherThread("sim.setDatagramProfile");
+    if (!begun) panic("sim: setDatagramProfile outside a run", .{});
+    if (net_used) panic("sim: setDatagramProfile({t}) after the run's first datagram socket opened: set it before", .{p});
+    if (dgram_profile) |old| panic("sim: setDatagramProfile({t}) after setDatagramProfile({t}): a run has one profile", .{ p, old });
+    dgram_profile = p;
+}
+
+pub fn datagramProfile() ?DatagramProfile {
+    return dgram_profile;
+}
+
+/// The profile, at a row where the kernels differ. With none, panics and
+/// names the row.
+fn needDgramProfile(comptime row: []const u8, fd: i32) DatagramProfile {
+    return dgram_profile orelse panic("sim: " ++ row ++ " on sim datagram socket {d}: the kernels differ here, and this run set no datagram profile (sim.setDatagramProfile(.linux or .macos), before its first datagram socket)", .{fd});
+}
+
+/// `connect` on a datagram socket: fixes the peer (the connected-socket
+/// protocol above). `to` is the address the caller gave.
+pub fn dgramConnect(fd: i32, to: Ip4) void {
+    refuseOtherThread("sim socket connect");
+    const d = dgramSlot("connect", fd);
+    if (d.peer != null) panic("sim: a second connect on sim datagram socket {d}: both kernels allow it and replace the peer; not simulated", .{fd});
+    refuseNonLoopback("connect to", to.ip);
+    if (to.port == 0) panic("sim: connect of sim datagram socket {d} to port 0", .{fd});
+    const port = if (d.bound) d.local.port else ephemeralPort(.{ 0, 0, 0, 0 }) catch panic("sim: no free ephemeral port to bind sim fd {d} for its connect", .{fd});
+    // The local address the kernels choose (rows 1 and 2): the wildcard
+    // becomes 127.0.0.1, the address a wildcard socket sends from here.
+    const local: Ip4 = .{ .ip = if (isWildcard(d.local.ip)) .{ 127, 0, 0, 1 } else d.local.ip, .port = port };
+    if (wire_seq >= icmp_send_base) panic("sim: connect of sim datagram socket {d} after {d} datagram sends: from 2^60 on, an ICMP's fault draws could meet a send's (`icmp_send_base`)", .{ fd, wire_seq });
+    takeGhosts(fd, local, to);
+    d.bound = true;
+    d.local = local;
+    d.peer = to;
+    dgram_connect_used = true;
+}
+
+fn ghostBucket(sender: Ip4, dead: Ip4) usize {
+    const key = (@as(u64, std.mem.readInt(u32, &sender.ip, .big)) << 32 | std.mem.readInt(u32, &dead.ip, .big)) ^ (@as(u64, sender.port) << 16 | dead.port) *% 0x9e3779b97f4a7c15;
+    return @intCast(mix64(key) % ghost_buckets);
+}
+
+/// Makes the ICMPs of every ghost whose four-tuple this connect makes and
+/// whose arrival is still to come, due at that arrival (row 19); refuses
+/// where their fate or time is not known, or where the four-tuple's
+/// overflow bucket is live.
+fn takeGhosts(fd: i32, local: Ip4, to: Ip4) void {
+    if (ghost_bucket_until[ghostBucket(local, to)] > clock_ns) panic("sim: connect of sim datagram socket {d} to {d}.{d}.{d}.{d}:{d}: the ghost table was full, and a datagram whose four-tuple shares this one's overflow bucket died with no ICMP made, whose ICMP could still be on its way; not simulated", .{ fd, to.ip[0], to.ip[1], to.ip[2], to.ip[3], to.port });
+    var i: usize = 0;
+    while (i < ghosts_len) {
+        const g = ghosts[i];
+        if (g.arrival <= clock_ns or !std.meta.eql(g.sender, local) or !std.meta.eql(g.dead, to)) {
+            i += 1;
+            continue;
+        }
+        if (!g.exact or udp_rule_since != no_rule) panic("sim: connect of sim datagram socket {d} to {d}.{d}.{d}.{d}:{d}, where a datagram from its address died with no ICMP made, whose ICMP could still be on its way, in a run that set a fault rule or with deaths merged: its fate or time (loss, delay, jitter, order) is not known; not simulated", .{ fd, to.ip[0], to.ip[1], to.ip[2], to.ip[3], to.port });
+        std.mem.copyForwards(Ghost, ghosts[i .. ghosts_len - 1], ghosts[i + 1 .. ghosts_len]);
+        ghosts_len -= 1;
+        wire.ensureUnusedCapacity(net_alloc, g.count) catch panic("sim: out of memory for {d} ICMP entries at a connect", .{g.count});
+        for (0..g.count) |_| sendIcmpAt(g.dead, g.sender, g.arrival);
+    }
+}
+
+/// Remembers a death at `death_at` (its `due_at`) that made no ICMP:
+/// merged into a ghost of the same four-tuple where it can be, else a new
+/// entry, else (the table full even after `compactGhosts`) its four-tuple's
+/// overflow bucket. Drops ghosts already past their arrival first.
+fn addGhost(sender: Ip4, dead: Ip4, death_at: u64) void {
+    const faulted = udp_rule_since < death_at;
+    const arrival = death_at +| wire_latency_ns +| if (faulted) max_fault_delay_ns else 0;
+    var w: usize = 0;
+    for (ghosts[0..ghosts_len]) |x| {
+        if (x.arrival <= clock_ns) continue;
+        ghosts[w] = x;
+        w += 1;
+    }
+    ghosts_len = w;
+    for (ghosts[0..ghosts_len]) |*e| {
+        if (!std.meta.eql(e.sender, sender) or !std.meta.eql(e.dead, dead)) continue;
+        if (e.exact and !faulted and e.arrival == arrival) {
+            // A count that would overflow is no longer exact: a connect refuses.
+            if (e.count == ghost_count_max) e.exact = false else e.count += 1;
+            return;
+        }
+        if (!e.exact or faulted) {
+            e.exact = false;
+            e.arrival = @max(e.arrival, arrival);
+            e.count +|= 1;
+            return;
+        }
+        // An exact ghost of the same four-tuple at another time stays apart,
+        // so each keeps its time.
+    }
+    if (ghosts_len == max_ghosts) compactGhosts();
+    if (ghosts_len == max_ghosts) {
+        const b = &ghost_bucket_until[ghostBucket(sender, dead)];
+        b.* = @max(b.*, arrival);
+        return;
+    }
+    ghosts[ghosts_len] = .{ .sender = sender, .dead = dead, .arrival = arrival, .count = 1, .exact = !faulted };
+    ghosts_len += 1;
+}
+
+/// Merges the ghosts of each four-tuple into one inexact entry (the latest
+/// arrival, the deaths summed), so the table holds one entry per four-tuple.
+fn compactGhosts() void {
+    var w: usize = 0;
+    for (ghosts[0..ghosts_len]) |x| {
+        for (ghosts[0..w]) |*e| {
+            if (std.meta.eql(e.sender, x.sender) and std.meta.eql(e.dead, x.dead)) {
+                e.exact = false;
+                e.arrival = @max(e.arrival, x.arrival);
+                e.count +|= x.count;
+                break;
+            }
+        } else {
+            ghosts[w] = x;
+            w += 1;
+        }
+    }
+    ghosts_len = w;
+}
+
+/// The connected peer (`getpeername`), or null.
+pub fn dgramPeer(fd: i32) ?Ip4 {
+    return dgramSlot("getpeername", fd).peer;
+}
+
+/// Whether `fd` is an open, connected sim datagram socket. False for a
+/// closed one, so the layer's new connected paths leave a closed fd's old
+/// answers alone.
+pub fn dgramIsConnected(fd: i32) bool {
+    if (!dgramIsOpen(fd)) return false;
+    return dgrams[dgramIndex(fd)].peer != null;
+}
+
 /// One datagram of `src` gathered, to `to`. With `from`, the datagram leaves
 /// from that address, which must be one the socket can receive on: its bound
 /// address, or for a wildcard socket any 127/8 address. Else
 /// `AddressUnavailable`, as the kernel says. Completes at once; the datagram
 /// lands `wire_latency_ns` later.
-pub fn dgramSend(fd: i32, src: anytype, to: Ip4, from: ?[4]u8) error{ AddressUnavailable, SystemResources }!usize {
+///
+/// `to_addr` null is a send with no address (`send`, `sendmsg` without
+/// one): to the peer of a connected socket. The layer passes null only for
+/// a connected socket. An address on a connected socket is row 5 of the
+/// profile (the connected-socket protocol above `dgramConnect`). A connected
+/// socket with a pending error takes it here instead of sending:
+/// `ConnectionRefused`, and the datagram is not sent, as both kernels do
+/// (row 7 of the parity table in `sim_dgram_connect_test.zig`).
+pub fn dgramSend(fd: i32, src: anytype, to_addr: ?Ip4, from: ?[4]u8) error{ AddressUnavailable, SystemResources, ConnectionRefused, Unexpected }!usize {
     refuseOtherThread("sim socket send");
     checkIovecs("a send", fd, src.len);
     const d = dgramSlot("send", fd);
+    if (dgram_connect_used and wire_seq >= icmp_send_base) panic("sim: datagram send number {d} on sim fd {d}: from 2^60 on, a send's fault draws could meet an ICMP's (`icmp_send_base`)", .{ wire_seq, fd });
+    // A pending error is taken by any send, with an address or not, before
+    // anything else: row 25, measured on both kernels.
+    if (d.refused) {
+        d.refused = false;
+        return error.ConnectionRefused;
+    }
+    const to = if (to_addr) |a| blk: {
+        if (d.peer != null) switch (needDgramProfile("a send with an address on a connected socket (row 5)", fd)) {
+            .macos => return error.Unexpected,
+            .linux => {},
+        };
+        break :blk a;
+    } else d.peer orelse panic("sim: a send with no address on unconnected sim datagram socket {d}", .{fd});
     refuseNonLoopback("send to", to.ip);
     if (to.port == 0) panic("sim: send to port 0 from sim fd {d}", .{fd});
     const total = totalLen(src);
@@ -1562,7 +2189,7 @@ pub fn dgramSend(fd: i32, src: anytype, to: Ip4, from: ?[4]u8) error{ AddressUna
         @memcpy(bytes[at..][0..sl.len], sl);
         at += sl.len;
     }
-    if (rule_history_len != 0) {
+    if (udp_rule_since != no_rule) {
         const src_addr: Ip4 = .{ .ip = src_ip, .port = d.local.port };
         // Every allocation this send could need comes before any fault
         // decision: a decision moves counts, matches, draws and a burst
@@ -1632,10 +2259,17 @@ pub const Received = struct {
 /// is lost: the datagram is consumed whole, as the kernel does. An empty
 /// queue is `WouldBlock` when `dont_wait` or the socket is non-blocking;
 /// otherwise the receive would block the sim thread for ever, so it refuses.
-pub fn dgramRecv(fd: i32, dst: anytype, dont_wait: bool) error{WouldBlock}!Received {
-    refuseOtherThread("sim socket receive");
-    checkIovecs("a receive", fd, dst.len);
+///
+/// A connected socket's pending error is taken by a receive that finds the
+/// queue empty: `ConnectionRefused`. A queued datagram comes first, as macOS
+/// orders it; Linux returns the error first (row 11 of the parity table in
+/// `sim_dgram_connect_test.zig`). The sim has no datagram profile and takes
+/// macOS's order on every host (the connected-socket protocol above
+/// `dgramConnect` says why).
+pub fn dgramRecv(fd: i32, dst: anytype, dont_wait: bool) error{ WouldBlock, ConnectionRefused }!Received {
+    dgramRecvPreflight(fd, dst.len);
     const d = dgramSlot("receive", fd);
+    if (dgramTakeRefusal(fd)) return error.ConnectionRefused;
     if (d.meta_len == 0) {
         if (dont_wait or d.nonblocking) return error.WouldBlock;
         panic("sim: a blocking receive on sim fd {d}, which is not non-blocking: nothing can land while the sim thread waits", .{fd});
@@ -1663,6 +2297,20 @@ pub fn dgramRecv(fd: i32, dst: anytype, dont_wait: bool) error{WouldBlock}!Recei
     }
     d.charged -= q.len + datagram_overhead;
     return .{ .copied = copied, .len = q.len, .from = q.from, .to = if (d.dst_addr) q.to else null };
+}
+
+/// The checks of every receive before it touches the socket.
+pub fn dgramRecvPreflight(fd: i32, n: usize) void {
+    refuseOtherThread("sim socket receive");
+    checkIovecs("a receive", fd, n);
+}
+
+/// Takes `fd`'s pending error if a receive would now: queue empty, or row 11.
+pub fn dgramTakeRefusal(fd: i32) bool {
+    const d = dgramSlot("receive", fd);
+    if (!d.refused or (d.meta_len != 0 and needDgramProfile("a receive with a datagram queued and an error pending (row 11)", fd) == .macos)) return false;
+    d.refused = false;
+    return true;
 }
 
 /// Puts `w` on the wire after every entry due no later (capacity reserved).
@@ -1712,6 +2360,13 @@ pub fn datagramStats(fd: i32) DatagramStats {
 /// Datagrams that landed where no socket was bound, in this run.
 pub fn datagramsDroppedNoSocket() u64 {
     return dropped_no_socket;
+}
+
+/// ICMP port unreachables made in this run (the connected-socket protocol
+/// above `dgramConnect`): one per datagram that died with its sender
+/// connected there. A copy made by `dup_ppm` is not counted again.
+pub fn icmpsMade() u64 {
+    return icmp_seq;
 }
 
 // The ev ops on a datagram socket (`Loop.submitSimDgram`): each gets an op id
@@ -1803,8 +2458,29 @@ pub fn dgramIsOpen(fd: i32) bool {
 /// datagram socket is always writable (send pressure is not modelled).
 /// Refuses a pipe end and a closed socket, so a poll calls it for every
 /// entry, whatever its events.
-pub fn dgramReadable(fd: i32) bool {
-    return dgramSlot("poll", fd).meta_len > 0;
+/// The layer's `poll` of one sim datagram socket: its revents for
+/// `events`. POLLIN when a datagram is queued; POLLOUT always (send
+/// pressure is not modelled). With an error pending, row 6 of the profile:
+/// `.macos` adds POLLIN, `.linux` adds POLLERR whatever was asked.
+pub fn dgramPollRevents(fd: i32, events: i16) i16 {
+    const d = dgramSlot("poll", fd);
+    var readable = d.meta_len > 0;
+    var r: i16 = 0;
+    if (d.refused) switch (needDgramProfile("a poll with an error pending (row 6)", fd)) {
+        .macos => readable = true,
+        .linux => r |= sys.POLL.ERR,
+    };
+    if (events & sys.POLL.IN != 0 and readable) r |= sys.POLL.IN;
+    if (events & sys.POLL.OUT != 0) r |= sys.POLL.OUT;
+    return r;
+}
+
+/// What a NetPoll for reading waits for: a queued datagram, or a pending
+/// error (both kernels wake it and complete it with success; the error
+/// stays for the next call: row 10 of the parity table).
+pub fn dgramPollReady(fd: i32) bool {
+    const d = dgramSlot("poll", fd);
+    return d.meta_len > 0 or d.refused;
 }
 
 // ---- Socket options (design section 8) ----
@@ -1887,14 +2563,19 @@ pub fn dgramSetOption(fd: i32, level: i32, name: u32, val: []const u8) error{Opt
 }
 
 /// `getsockopt` on a sim datagram socket: `SO_RCVBUF` (the byte limit),
-/// `SO_ERROR` (always 0: nothing is pending), and the destination-address
-/// option. Every other read refuses: the layer's `GetsockoptError` has no
-/// "unsupported" to return.
+/// `SO_ERROR` (ECONNREFUSED for a connected socket's pending error, which
+/// the read clears, as both kernels do; else 0), and the
+/// destination-address option. Every other read refuses: the layer's
+/// `GetsockoptError` has no "unsupported" to return.
 pub fn dgramGetOption(fd: i32, level: i32, name: u32, out: []u8) void {
     const d = dgramSlot("getsockopt", fd);
     const v: c_int = switch (classifyOption(level, name)) {
         .rcvbuf => @intCast(d.byte_limit),
-        .so_error => 0,
+        .so_error => blk: {
+            if (!d.refused) break :blk 0;
+            d.refused = false;
+            break :blk @intCast(@backingInt(std.posix.E.CONNREFUSED));
+        },
         .dst_addr => @intFromBool(d.dst_addr),
         .sndbuf, .unsupported, .misuse => panic("sim: getsockopt {s} (level {d}, option {d}) on sim fd {d} is not simulated", .{ optionName(level, name), level, name, fd }),
     };
@@ -1951,11 +2632,14 @@ const LandOutcome = enum(u8) {
     silenced = 6,
     partitioned_in_flight = 7,
     silenced_in_flight = 8,
+    /// Landed at a connected socket from a source that is not its peer
+    /// (the connected-socket protocol above `dgramConnect`).
+    not_peer = 9,
 };
 
 /// Records a datagram at its landing time in the trace and the wire digest.
 fn recordLanding(w: WireDatagram, outcome: LandOutcome) void {
-    const code: u8 = @backingInt(outcome) | (@as(u8, @intFromBool(w.copy)) << 7);
+    const code: u8 = @backingInt(outcome) | (@as(u8, @intFromBool(w.icmp)) << 6) | (@as(u8, @intFromBool(w.copy)) << 7);
     emit(.dgram, @as(u32, w.from.port) | (@as(u32, code) << 16), (@as(u32, w.to.port) << 16) | @as(u32, @intCast(w.bytes.len)));
     var h: [25]u8 = undefined;
     std.mem.writeInt(u64, h[0..8], w.due_at, .little);
@@ -1988,17 +2672,29 @@ pub fn wireDigest() u64 {
 }
 
 fn land(w: WireDatagram) void {
+    // The one late-harvest rule (the protocol above `dgramConnect`).
+    if (dgram_connect_used and w.due_at < clock_ns) panic("sim: {s} from port {d} to port {d} due at {d} ns " ++ overdue ++ ": at {d} ns, what a connected socket sees would depend on how late the harvest is. " ++ overdue_remedy, .{ if (w.icmp) "an ICMP" else "a datagram", w.from.port, w.to.port, w.due_at, clock_ns });
     if (rules_len != 0) {
         if (faultInFlight(w.from, w.to)) |outcome| {
             recordLanding(w, outcome);
             return;
         }
     }
+    if (w.icmp) return landIcmp(w);
     const d = receiverOf(w.to) orelse {
         dropped_no_socket += 1;
         recordLanding(w, .no_socket);
+        diedAtLanding(w);
         return;
     };
+    if (d.peer) |p| {
+        if (!std.meta.eql(p, w.from)) {
+            d.stats.dropped_not_peer += 1;
+            recordLanding(w, .not_peer);
+            diedAtLanding(w);
+            return;
+        }
+    }
     const cost = w.bytes.len + datagram_overhead;
     if (d.meta_len == d.meta.len or d.charged + cost > d.byte_limit) {
         d.stats.dropped_rcvbuf += 1;
@@ -2030,6 +2726,61 @@ fn wakeParked(d: *Dgram) void {
     pushDueAt(p.c, .dgram, p.id, clock_ns);
 }
 
+/// A datagram found no socket at its landing (none bound there, or a
+/// connected one whose peer it is not). If a socket bound at its sender's
+/// address is connected to where it died, the kernel's ICMP port
+/// unreachable goes back (`sendIcmpAt`). Otherwise nothing can take one now,
+/// and it is kept as a `Ghost` for a connect before its arrival.
+fn diedAtLanding(w: WireDatagram) void {
+    const s = receiverOf(w.from) orelse return addGhost(w.from, w.to, w.due_at);
+    const p = s.peer orelse return addGhost(w.from, w.to, w.due_at);
+    if (!std.meta.eql(p, w.to)) return addGhost(w.from, w.to, w.due_at);
+    sendIcmpAt(w.to, w.from, clock_ns + wire_latency_ns);
+}
+
+/// Puts an ICMP port unreachable from `from` (the address where a datagram
+/// died) to `to` (its sender) on the wire, due at `due_at` with no fault rule
+/// in the run, else through the rules as a datagram on that path (sent now).
+/// The caller reserved the room (`landDue`, `takeGhosts`).
+fn sendIcmpAt(from: Ip4, to: Ip4, due_at: u64) void {
+    // Below 2^60 always: each ICMP is a death, each death a send, and a run
+    // that connected refuses its 2^60th send (`dgramSend`, `dgramConnect`).
+    const send_no = icmp_send_base + icmp_seq;
+    icmp_seq += 1;
+    const base: WireDatagram = .{ .seq = send_no, .from = from, .to = to, .bytes = &.{}, .due_at = due_at, .icmp = true };
+    if (udp_rule_since == no_rule) return wireInsert(base);
+    switch (faultAtSend(send_no, from, to)) {
+        .dropped => |outcome| {
+            var x = base;
+            x.due_at = clock_ns;
+            recordLanding(x, outcome);
+        },
+        .sent => |s| {
+            var a = base;
+            a.due_at = s.due[0];
+            wireInsert(a);
+            if (s.copies == 2) {
+                var b = base;
+                b.due_at = s.due[1];
+                b.copy = true;
+                wireInsert(b);
+            }
+        },
+    }
+}
+
+/// An ICMP landed at the address of the datagram's sender: the socket bound
+/// there takes the error if it is connected to the ICMP's source.
+fn landIcmp(w: WireDatagram) void {
+    const d = receiverOf(w.to) orelse return recordLanding(w, .no_socket);
+    const p = d.peer orelse return recordLanding(w, .no_socket);
+    if (!std.meta.eql(p, w.from)) return recordLanding(w, .no_socket);
+    recordLanding(w, .landed);
+    d.refused = true;
+    d.stats.refusals += 1;
+    wakeParked(d);
+}
+
 fn sameFlow(a: WireDatagram, b: WireDatagram) bool {
     return std.meta.eql(a.from, b.from) and std.meta.eql(a.to, b.to);
 }
@@ -2041,6 +2792,10 @@ fn landDue() void {
     var n: usize = 0;
     while (n < wire.items.len and wire.items[n].due_at <= clock_ns) n += 1;
     if (n == 0) return;
+    // Each landing can make one ICMP, in two copies at most (`sendIcmp`),
+    // inserted after these n (it is due later than now). Reserved first, so
+    // `due_now` stays valid.
+    if (dgram_connect_used) wire.ensureUnusedCapacity(net_alloc, 2 * n) catch panic("sim: out of memory for the ICMP entries of {d} landings", .{n});
     const due_now = wire.items[0..n];
     var i: usize = 0;
     while (i < n) {
@@ -2083,12 +2838,2570 @@ fn isFlowHead(rest: []const WireDatagram, k: usize) bool {
     return true;
 }
 
+// ---- Stream sockets (design section 17; slices 1 and 2 of 17.16) ----
+//
+// The sim side of IPv4 TCP on 127.0.0.0/8. Slice 1 builds sockets, ports,
+// the handshake, listeners, accept and close; slice 2 builds bytes, FIN,
+// RST with data, shutdown and the profiles' send and receive rules. The
+// socket layer
+// (src/os/net.zig) and the ev loop's sim dispatch (`Loop.submitSimStream`)
+// call these; nothing else does.
+//
+// How a test uses stream sockets under sim:
+// - Through zio's public API, as a program does: `zio.net.IpAddress.listen`
+//   and `connect`, `Server.accept`, `close`; or std.Io's `listen`,
+//   `connect`, `accept` and `close` on zio's vtable. Each is the ev ops
+//   NetOpen, NetBind, NetListen, NetConnect, NetAccept and NetClose, plus
+//   `setsockopt` for TCP_NODELAY, SO_REUSEADDR and SO_REUSEPORT.
+// - Bytes go through the same API: `Stream.read`, `write`, `writeAll`,
+//   `readVec`, `writeVec`, `shutdown`, and their std.Io forms (`netRead`,
+//   `netWrite`, `netShutdown`), each the ev op NetRecv, NetSend or
+//   NetShutdown with the default flags. `os.net.getpeername` and
+//   `os.net.bytesReadable` (FIONREAD) are the layer's own, and SO_LINGER
+//   {1, 0} makes a close send an RST.
+// - A run that meets a row where the kernels differ needs a profile:
+//   `sim.setStreamProfile(.linux | .macos)`, called before the run's first
+//   stream socket opens, once per run. Without one, such a row panics and
+//   names it: a bind with SO_REUSEADDR next to a listener on another
+//   address of the port (row 12), a rebind over a TIME_WAIT reservation
+//   that did not set SO_REUSEADDR (row 31), a connect to 127/8 other than
+//   127.0.0.1 (rows 15 and 30), a send called after a reset with no FIN
+//   before it (rows 26b, 36, 39), a send parked when a reset arrives after
+//   a FIN (row 41), a read that meets a reset after a FIN (rows 8, 22),
+//   shutdown(.both) with unread bytes (row 17), and data that lands after
+//   shutdown(.both) (row 18).
+// - What a profile follows (t-4119's ruling): what a zio program sees on
+//   that kernel, which is not always what a blocking C call sees. The two
+//   differ where an op is parked: zio's readiness backends (kqueue, epoll)
+//   end a parked op on an error or hang-up event by reading SO_ERROR, which
+//   reports the reset and clears it. So a send parked when a reset arrives
+//   takes it: ECONNRESET with no FIN first, on both kernels (rows 23, 25);
+//   after a FIN, ECONNRESET on macOS and EPIPE on Linux (row 41). Reads then
+//   give 0. A send called after the reset follows the kernel's send: EPIPE
+//   on macOS, the pending error once on Linux. The parity table in
+//   `sim_stream_bytes_test.zig` runs each row through zio on the kernel and
+//   in a sim run, with one expected column per kernel.
+// - Not modelled (design 17.14): under `.linux`, shutdown(.both) with unread
+//   bytes while the sender's window still has a gap smaller than one
+//   segment. The kernel's persist timer then sends data into the gap, the
+//   shut receiver resets, and the parked send ends EPIPE (parity row 41g).
+//   The sim's window has no segment size, so it never has that gap: it is
+//   always in the state the kernel reaches once the gap is filled, where the
+//   send stays parked (row 41).
+// - Settings, each in a run, on the sim thread: `setStreamWindow(fd, n)`
+//   (the window toward `fd`, 1 byte to 16 MiB, default 256 KiB, refused
+//   while the peer's send is woken and not harvested) and
+//   `setStreamWindowDefault(n)` for later connections;
+//   `setStreamChunking(fd, mode)` (`.hashed`, the default; `.{ .fixed = n
+//   }`, n from 1 to 65536; `.off`) for `fd`'s connection, and
+//   `setStreamChunkingDefault(mode)`.
+// - Before `sim.end`: close every stream socket, then sleep in virtual time
+//   while `streamEntriesInFlight()` is not 0 (TCP entries on the wire and
+//   credits owed). `end` checks, before it frees
+//   anything, that no stream socket is open, no op on one is unresolved and
+//   every connection is retired, and panics listing what remains (design
+//   17.15 item 3). TIME_WAIT reservations are expected: `end` counts them,
+//   prints the count and frees them.
+//
+// Model:
+// - A stream socket takes a slot of the datagram table's range: one fd
+//   range, one lowest-free slot allocator, one generation per slot
+//   (`dgram_gen`), whichever kind opened it. A slot is a datagram socket
+//   (`dgrams[j].used`) or a stream socket (`streams[j].used`), never both.
+//   A stream socket is open (never connected), a listener, or an endpoint's
+//   descriptor (`SockKind`).
+// - A connection (`Conn`) is made by `NetConnect`, which gives it the next
+//   `conn_id` (from 1, never reused in a run). It has two endpoints, client
+//   and server (`StreamEnd`), whose phase is `StreamPhase`, and two
+//   directions; direction d is from side d.
+// - Each TCP entry (SYN, SYN-ACK, ACK, FIN, RST) carries its `conn_id`, its
+//   direction and a sequence number of that direction, and lands
+//   `wire_latency_ns` after it leaves. `takeDue` lands the datagrams due
+//   first (`landDue`, unchanged), then the TCP entries due, in (landing
+//   time, `conn_id`, direction, sequence) order (`landStreamDue`). No TCP
+//   landing draws from the run's RNG. A landing goes to its connection's
+//   endpoint, alive or dead, never to whatever socket holds a number or a
+//   port now; a SYN alone looks up a listener, at its landing.
+// - The handshake: the SYN lands at a listener, which makes an `S-prov`
+//   endpoint and sends a SYN-ACK; at its landing the connect completes and
+//   an ACK leaves; at the ACK's landing the endpoint is queued (`S-queued`)
+//   and an accept waiting on the listener is woken. A wake claims nothing:
+//   the accept takes the queue head at its harvest, so a cancel before then
+//   leaves the connection queued (17.6). A SYN with no listener at its
+//   address is answered with an RST: `ConnectionRefused`.
+// - A listener holds at most `backlog` (1 to 4096) live `S-prov` and
+//   `S-queued` endpoints; a SYN that lands at a full one panics (backlog
+//   overflow is not simulated). Closing a listener kills them; each sends
+//   an RST to its client. Accepted connections are not affected.
+// - Close of an established endpoint sends a FIN (none after an RST
+//   landed on it). The endpoint that sends its FIN before one has landed on
+//   it is the active closer, and its address and port are reserved for the
+//   rest of the run (TIME_WAIT), with its SO_REUSEADDR flag. A passive
+//   closer's port is free at its close.
+// - A connection retires (its table entry is freed) when both endpoints are
+//   dead (a server endpoint never made, `absent`, counts as dead) and no
+//   entry of it is on the wire.
+//
+// Ports: TCP has its own port table and its own counter from 49152 (wrapping
+// to 49152 after 65535). Port 0 takes the next port that no stream socket
+// holds and no reservation covers. A connect from an unbound socket binds
+// 127.0.0.1 and the next port. A bind to a fixed port, against each stream
+// socket holding that port on an overlapping address (equal, or either is
+// 0.0.0.0), and each reservation:
+// - the new socket did not set SO_REUSEADDR: `AddressInUse`;
+// - a listener at the equal address: `AddressInUse`;
+// - a listener at another address, both with SO_REUSEADDR: row 12, by
+//   profile: `.linux` `AddressInUse`; `.macos` refused (which listener gets
+//   a SYN was not measured);
+// - a reservation with SO_REUSEADDR: no conflict;
+// - a reservation without it: row 31, by profile: `.linux` `AddressInUse`,
+//   `.macos` no conflict;
+// - any other holder (a listener without SO_REUSEADDR, a bound socket, an
+//   endpoint) with the new socket's SO_REUSEADDR set: refused, not
+//   measured.
+//
+// Options on a stream socket: TCP_NODELAY 1 is stored, read back, inherited
+// by accepted sockets, and has no effect; TCP_NODELAY 0 is
+// `OptionNotSupported` (Nagle is not modelled). SO_REUSEADDR is stored and
+// used by bind and TIME_WAIT. SO_REUSEPORT is `OptionNotSupported`
+// (advisory: zio's std.Io listen sets it and ignores the answer); it stays
+// misuse on a datagram socket. `getsockopt(SO_ERROR)` is refused (no sim
+// path needs it, and both kernels clear it on read: design rows 33, 34).
+// Any other option panics, naming it.
+//
+// Bytes (design 17.7 and 17.8):
+// - A send admits `min(length, room)` bytes at once, where room is the
+//   window less what the peer has not credited, and returns that count; with
+//   no room it parks. A send of length 0 returns 0. The admitted bytes go out
+//   as chunks (`ChunkMode`): chunk k lands `wire_latency_ns + k µs` after the
+//   send, and no entry lands before the one sent before it in its direction.
+// - A read takes the unread bytes, up to its buffers, and owes a credit. At
+//   most one credit departs per direction per `wire_latency_ns`; one owed
+//   departs `wire_latency_ns` after the last, carrying the count at that
+//   time. A credit that lands raises what the sender may use and wakes its
+//   parked send. A receive with nothing unread parks, and gives 0 after a
+//   FIN, after its own shutdown(.both), and after a reset is reported.
+// - The decision lists of design 17.8 decide each call and each harvest;
+//   `streamRecv`, `streamSend`, `streamShutdown`, `closeEndpoint` and the
+//   `land*` functions are those lists, line by line.
+// - `testStreamDir` gives a test each direction's counters, so it can check
+//   `admitted = in flight + held + unread + read + discarded`.
+//
+// Faults (design 17.9 and 17.9a):
+// - A fault rule whose endpoints say `.protocol = .tcp` acts on TCP entries
+//   (SYN, SYN-ACK, ACK, data, FIN, RST, credit), never on datagrams; a
+//   `.udp` rule (the default) never on TCP entries. An entry goes from its
+//   sender's local address to its peer (a SYN to its destination); a path
+//   matches both, a silence either. The calls are the datagram ones:
+//   `setImpairment`, `setPartition`, `silence`, and their clears.
+// - A `.tcp` impairment takes `delay_ns` and `jitter_ns` (the last set
+//   that matches acts). Both are fixed at the entry's send, the jitter by
+//   `tcpJitterDraw`; the entry lands `wire_latency_ns` + its chunk spacing
+//   + delay + jitter after its send, never before the entry before it in
+//   its direction. `loss_ppm`, `burst`, `dup_ppm` and `reorder` refuse.
+// - A `.tcp` partition or silence holds entries, never loses them. An entry
+//   is held if one matches at its send or at its landing, or if its
+//   direction already holds one (order). When one is held at its landing,
+//   the later entries of its direction still on the wire are held behind
+//   it at once (`held_behind`). Held data stays charged to the
+//   window, so a held credit stalls the sender. Two held credits of one
+//   direction become one: the one with the larger sequence, whichever was
+//   held first (`holdTcp`). When a clear leaves a held direction
+//   with no matching partition or silence, it is released, in (`conn_id`,
+//   direction) order: each entry lands `wire_latency_ns` + its extra time
+//   after the release, in order. Held entries never stop the clock, count
+//   in `streamEntriesInFlight` and toward `max_tcp_entries`, and keep a
+//   connection from retiring. A test that drains before `sim.end` clears
+//   its rules first.
+// - An abort (close with unread bytes or SO_LINGER {1, 0}, an RST landing,
+//   a local reset) discards the endpoint's held data, FIN and credits;
+//   its RST follows. A close in `C-syn` or `C-failed` discards a held SYN.
+//   Each discard is recorded (`StreamOutcome.discarded_held`).
+// - The connect with no answer is a held SYN: the connect stays parked
+//   until its deadline (`Timeout`), a cancel, a close, or the release.
+// - `failStream(fd, .reset | .timed_out)`: its doc comment.
+// - Counts: `streamStats()` (`held_at_send`, `held_at_landing`,
+//   `held_behind`, `released`,
+//   `credits_coalesced`, `discarded_held`, `delayed`, `dropped_failed`),
+//   each rule's `matched` and `delayed`, `streamFaultDraws()`.
+//
+// Refused by name (a panic): poll and the datagram calls on a stream
+// socket; the socket layer's own recv, send and the rest (only the native
+// backends call them); a receive of 0 bytes; a second receive or send while
+// one is unresolved; a send or receive flag other than the defaults;
+// shutdown(.receive); SO_LINGER with a linger time; `failStream` misuse (its
+// doc comment); a `.tcp` impairment with loss, burst, duplication or
+// reorder; a path whose ends name two protocols; `connect` on a socket
+// the program bound, on a listener or on an endpoint; `local_address` in
+// `IpAddress.connect` (refused in src/net.zig before any side effect);
+// `listen` on an unbound socket, a listener or an endpoint; `accept` on
+// anything but a listener (a datagram socket keeps OperationNotSupported); a
+// second accept on a listener while one is unresolved; a bind of a bound or
+// connected socket; the layer's own `connect` and `accept` (only the native
+// backends call them); IPv6, non-loopback addresses, and port 0 as a
+// destination; more than `max_conns` connections at once or
+// `max_tcp_entries` on the wire; and every call from a thread that is not
+// the sim thread.
+
+pub const StreamProfile = enum(u8) { linux = 1, macos = 2 };
+
+/// Connections at one time (design 17.5). A retired connection frees its
+/// entry; its `conn_id` is never reused.
+pub const max_conns = 256;
+/// TCP entries on the wire at one time, all connections (design 17.7).
+pub const max_tcp_entries = 65536;
+/// The largest listen backlog; `listen` clamps to 1..max_backlog.
+pub const max_backlog = 4096;
+
+var stream_profile: ?StreamProfile = null;
+/// Whether this run opened a stream socket. Only then does `stateDigest`
+/// cover the stream tables and `end` run the teardown check, so a run with
+/// none keeps every digest it had before stream sockets existed (design 17.5
+/// and section 7, promise 1).
+var stream_used: bool = false;
+
+const SockKind = enum(u8) { open = 1, listener = 2, endpoint = 3 };
+const Side = enum(u1) { client = 0, server = 1 };
+
+fn otherSide(s: Side) Side {
+    return if (s == .client) .server else .client;
+}
+
+const StreamParked = struct { c: *anyopaque, id: u32 };
+
+const StreamSock = struct {
+    used: bool = false,
+    kind: SockKind = .open,
+    nonblocking: bool = false,
+    /// The program bound it (`streamBind`). A connect from it is refused.
+    bound: bool = false,
+    /// The bound address; an endpoint's local address.
+    local: Ip4 = .{ .ip = @splat(0), .port = 0 },
+    nodelay: bool = false,
+    reuseaddr: bool = false,
+    /// SO_LINGER {1, 0}: a close sends an RST (design 17.8, close 3).
+    linger0: bool = false,
+    /// A listener's capacity (`listen`'s backlog, clamped).
+    backlog: u16 = 0,
+    /// A listener's next queue position: ACK landing order.
+    next_queue_pos: u64 = 0,
+    /// An endpoint's connection (index into `conns`) and side.
+    conn: u16 = 0,
+    side: Side = .client,
+    /// The connect or accept waiting on this socket: a landing or a close
+    /// makes it due now.
+    parked: ?StreamParked = null,
+    /// That op until it has its result: parked, or woken and not yet
+    /// harvested. One at a time (a second accept refuses).
+    unresolved: ?StreamParked = null,
+    /// An endpoint's receive and send, each the same way: parked until a
+    /// landing, a setting or a call wakes it; unresolved until it has its
+    /// result. One of each at a time (design 17.8, the call lists).
+    parked_recv: ?StreamParked = null,
+    unresolved_recv: ?StreamParked = null,
+    parked_send: ?StreamParked = null,
+    unresolved_send: ?StreamParked = null,
+};
+
+var streams: [max_dgram]StreamSock = @splat(.{});
+
+/// An endpoint's phase (design 17.5). `absent`: a server endpoint no SYN
+/// has made (it counts as dead for retirement). `c_syn`: a connect's SYN
+/// left and no answer landed. `c_failed`: an RST answered the SYN.
+/// `s_prov`: a SYN landed at a listener. `s_queued`: its ACK landed, it waits
+/// for an accept. `est`: owned by a descriptor. `dead`: closed, or killed by
+/// its listener's close or an RST in `s_prov`.
+pub const StreamPhase = enum(u8) { absent = 0, c_syn = 1, c_failed = 2, s_prov = 3, s_queued = 4, est = 5, dead = 6 };
+
+const StreamEnd = struct {
+    phase: StreamPhase = .absent,
+    /// The descriptor's slot, in `c_syn`, `c_failed` and `est`.
+    slot: u8 = 0,
+    local: Ip4 = .{ .ip = @splat(0), .port = 0 },
+    peer: Ip4 = .{ .ip = @splat(0), .port = 0 },
+    fin_in: bool = false,
+    fin_out: bool = false,
+    /// It sent an RST; it sends at most one in its life.
+    rst_sent: bool = false,
+    reset_received: bool = false,
+    /// Whether a FIN had landed when the RST did. Kept profile-neutral:
+    /// slice 2's profiles decide from it what the reset reports (review 3,
+    /// finding 9).
+    fin_before_reset: bool = false,
+    /// An unaccepted server endpoint's listener: its slot and generation.
+    listener_slot: u8 = 0,
+    listener_gen: u32 = 0,
+    queue_pos: u64 = 0,
+    /// The listener's options when the SYN landed, for the accepted socket.
+    nodelay: bool = false,
+    reuseaddr: bool = false,
+    linger0: bool = false,
+    /// It did `shutdown(.both)`: its receive side is shut.
+    shut_rd: bool = false,
+    /// An op returned the reset's error (design 17.8, the two facts).
+    reset_reported: bool = false,
+    /// `failStream` hit it (design 17.9): how, and whether an op has
+    /// returned its error. Kept after it dies, to drop late entries.
+    failed: ?StreamFailure = null,
+    fail_reported: bool = false,
+    /// The op id of the send that was parked when the reset was received,
+    /// if one was. Set with `reset_received`, profile-neutral; the send
+    /// evaluation reads it at that op's harvest (design 17.8: a parked send
+    /// takes the reset, as zio's readiness backends end it with SO_ERROR).
+    reset_parked_send: ?u32 = null,
+    /// Bytes landed and not read: `unread.items[unread_head..]`. Freed when
+    /// the connection retires.
+    unread: std.ArrayList(u8) = .empty,
+    unread_head: usize = 0,
+
+    fn unreadLen(e: StreamEnd) usize {
+        return e.unread.items.len - e.unread_head;
+    }
+};
+
+/// Why bytes were discarded (design 17.7, conservation). `abort`: held
+/// data at its sender's abort; `failed_sender` and `failed_receiver`:
+/// `failStream`'s (held outbound, and unread or landing later).
+pub const Discard = enum(u8) { abort, failed_sender, failed_receiver, closed_receiver, unread_at_close, shut_receiver, both_discard, after_reset, listener_closed };
+
+/// One direction of a connection: data from side `d` to the other side,
+/// with its window and credit (design 17.7). The credit for it travels the
+/// other way.
+const StreamDir = struct {
+    /// The bytes the receiver accepts beyond `read + reclaimed`.
+    window: u32 = default_stream_window,
+    admitted: u64 = 0,
+    /// The highest `read + reclaimed` count a credit has brought back.
+    credited: u64 = 0,
+    read: u64 = 0,
+    /// Unread bytes `.both` discarded under `.macos`: room freed without a
+    /// read (the window release, design 17.7).
+    reclaimed: u64 = 0,
+    discarded: [@typeInfo(Discard).@"enum".field_names.len]u64 = @splat(0),
+    /// Sends that admitted at least one byte: the chunk draws' key.
+    data_send_index: u64 = 0,
+    /// Credit pacing: when the last credit departed (none yet: null), and
+    /// when an owed one departs.
+    last_credit_at: ?u64 = null,
+    owed_at: ?u64 = null,
+
+    fn room(d: StreamDir) u64 {
+        const used = d.admitted - d.credited;
+        return if (used >= d.window) 0 else d.window - used;
+    }
+};
+
+/// How a send's admitted bytes are cut into chunks (design 17.7).
+pub const ChunkMode = union(enum) {
+    /// Drawn from a keyed hash: mostly 512 to 4096 bytes, one in four 1 to
+    /// 16 bytes.
+    hashed,
+    /// Every chunk `n` bytes (1 to 65536), the last one the rest.
+    fixed: u32,
+    /// One chunk per send.
+    off,
+};
+
+pub const default_stream_window: u32 = 256 * 1024;
+pub const max_stream_window: u32 = 16 * 1024 * 1024;
+/// Chunk k of a send lands `k` times this after chunk 0 (design 17.7).
+pub const chunk_spacing_ns: u64 = 1000;
+
+const Conn = struct {
+    used: bool = false,
+    id: u32 = 0,
+    ends: [2]StreamEnd = .{ .{}, .{} },
+    /// The next sequence number of each direction, across entry kinds.
+    next_seq: [2]u64 = .{ 0, 0 },
+    /// Each direction's fence: no entry put on the wire lands before it
+    /// (design 17.7: not before the entry sent before it). It is the landing
+    /// time of the direction's last entry put on the wire, and it must stay
+    /// a time of an entry that is on the wire or has landed, never of one
+    /// taken off it:
+    /// - `putOnWire` (a send, a release) moves it to the entry's time;
+    /// - a landing leaves it, at a time not after now;
+    /// - a hold at landing takes every later entry of the direction off the
+    ///   wire (the pull), so nothing of the direction is on the wire after
+    ///   it, and the fence becomes now (sitting 34; it kept the pulled
+    ///   entries' future times before, and a release or an abort's RST
+    ///   right after the pull was clamped behind them: outside review of
+    ///   cb01515). Now never constrains: every new time is at least
+    ///   now + `wire_latency_ns`.
+    /// No other path takes an entry off the wire (a discard at an abort,
+    /// `failStream` or a close takes held entries only). A release of
+    /// entries held at their send, with older entries of the direction
+    /// still on the wire, lands behind those: the fence is theirs.
+    last_due: [2]u64 = .{ 0, 0 },
+    syn_landed: bool = false,
+    dirs: [2]StreamDir = .{ .{}, .{} },
+    chunking: ChunkMode = .hashed,
+    /// Entries of each direction in `tcp_held` (design 17.9).
+    held: [2]u32 = .{ 0, 0 },
+};
+
+var conns: [max_conns]Conn = @splat(.{});
+var next_conn_id: u32 = 1;
+
+/// The kinds of TCP entry slice 1 sends. Data chunks and credits come with
+/// slice 2.
+pub const TcpKind = enum(u8) { syn = 1, syn_ack = 2, ack = 3, fin = 4, rst = 5, data = 6, credit = 7 };
+
+const TcpEntry = struct {
+    due_at: u64,
+    conn_id: u32,
+    /// Index into `conns`; `conn_id` guards it at landing.
+    conn: u16,
+    dir: Side,
+    seq: u64,
+    kind: TcpKind,
+    /// A SYN's destination: it looks up the listener bound there when it
+    /// lands. Unused by other kinds.
+    to: Ip4,
+    /// A data chunk's bytes, owned by the entry until it lands (`net_alloc`).
+    bytes: []u8 = &.{},
+    /// A credit's count: the receiver's `read + reclaimed` at departure.
+    count: u64 = 0,
+    /// Its time after `wire_latency_ns`, fixed at its send: the chunk
+    /// spacing, a `.tcp` delay and its jitter. A release lands it this long
+    /// after `release + wire_latency_ns` (design 17.9a, point 6).
+    extra_ns: u64 = 0,
+};
+
+/// TCP entries a `.tcp` partition or silence holds, in (`conn_id`,
+/// direction, sequence) order (design 17.9). Not on the wire: they never
+/// make the clock stop.
+var tcp_held: std.ArrayList(TcpEntry) = .empty;
+/// Jitter draws of `.tcp` rules (`streamFaultDraws`).
+var stream_fault_draws: u64 = 0;
+
+/// TCP entries not yet landed, sorted by (due_at, conn_id, dir, seq):
+/// landing order. Apart from the datagram `wire` so that `landDue` stays
+/// as it was: TCP lands in a second pass and never draws (design 17.10).
+var tcp_wire: std.ArrayList(TcpEntry) = .empty;
+
+/// What happened to a TCP entry at its landing, in the trace and the wire
+/// digest.
+const StreamOutcome = enum(u8) {
+    landed = 0,
+    /// A SYN whose client closed before it landed (`stream_dropped_dead`).
+    dropped_dead_client = 1,
+    /// Landed at a dead endpoint.
+    dropped_dead = 2,
+    /// Landed at an endpoint that had received an RST.
+    dropped_reset = 3,
+    /// Data that landed after the endpoint's own `.both`.
+    dropped_shut = 4,
+    /// A credit for a terminal direction, or at a dead endpoint.
+    dropped_stale = 5,
+    /// A held entry discarded: by an abort or `failStream` of its sender,
+    /// or a held SYN at its client's close (design 17.9a, point 10).
+    discarded_held = 6,
+    /// Landed at an endpoint `failStream` hit (design 17.8, line 1 of each
+    /// landing list).
+    dropped_failed = 7,
+};
+
+pub const StreamStats = struct {
+    /// SYNs dropped because their client closed before they landed.
+    syn_dropped_dead: u64 = 0,
+    /// SYNs answered with an RST: no listener at their address.
+    refused: u64 = 0,
+    /// Entries that landed at a dead endpoint.
+    dropped_dead: u64 = 0,
+    /// Data chunks, FINs and RSTs that landed at an endpoint that had
+    /// received a reset (landed or local).
+    dropped_after_reset: u64 = 0,
+    /// Connections retired.
+    retired: u64 = 0,
+    /// Credits dropped: at departure or landing, for a direction that is
+    /// terminal, or at a dead endpoint (`stale_credit`); and a credit owed
+    /// by an endpoint that `failStream` hit.
+    stale_credit: u64 = 0,
+    /// Local resets: data that landed after `.both` under `.linux`.
+    local_resets: u64 = 0,
+    /// Data chunks that joined an endpoint's unread bytes.
+    chunks_landed: u64 = 0,
+    /// Credits that raised a sender's `credited`.
+    credits_landed: u64 = 0,
+    /// Entries a `.tcp` partition or silence held at their send, and at
+    /// their landing; entries released when the last rule holding their
+    /// direction was cleared (design 17.9).
+    held_at_send: u64 = 0,
+    held_at_landing: u64 = 0,
+    /// Entries taken off the wire because an earlier entry of their
+    /// direction was held at its landing (design 17.9 item 2).
+    held_behind: u64 = 0,
+    released: u64 = 0,
+    /// Held credits replaced by a newer one of their direction.
+    credits_coalesced: u64 = 0,
+    /// Held entries discarded (`StreamOutcome.discarded_held`).
+    discarded_held: u64 = 0,
+    /// Entries a `.tcp` impairment gave a delay or a jitter above 0.
+    delayed: u64 = 0,
+    /// Entries that landed at an endpoint `failStream` hit, credits apart
+    /// (those are `stale_credit`).
+    dropped_failed: u64 = 0,
+    /// Bytes discarded in this run, by cause: the sum over every direction,
+    /// kept after a connection retires.
+    discarded: [@typeInfo(Discard).@"enum".field_names.len]u64 = @splat(0),
+};
+
+/// Counts `n` bytes of direction `d` as discarded for `cause`, there and in
+/// the run's totals.
+fn discardBytes(d: *StreamDir, cause: Discard, n: usize) void {
+    d.discarded[@backingInt(cause)] += n;
+    stream_stats.discarded[@backingInt(cause)] += n;
+}
+
+var stream_stats: StreamStats = .{};
+
+/// TIME_WAIT: an active closer's address and port, reserved for the rest of
+/// the run, with its socket's SO_REUSEADDR flag (design 17.5).
+const Reservation = struct { ip: [4]u8, port: u16, reuse: bool };
+var reservations: std.ArrayList(Reservation) = .empty;
+var tcp_next_port: u16 = first_ephemeral_port;
+/// The window and chunk mode a new connection starts with
+/// (`setStreamWindowDefault`, `setStreamChunkingDefault`).
+var window_default: u32 = default_stream_window;
+var chunking_default: ChunkMode = .hashed;
+
+fn resetStreams() void {
+    for (streams) |s| {
+        if (s.used) panic("sim: a stream socket outlived the last run", .{});
+    }
+    for (conns) |k| {
+        if (k.used) panic("sim: a connection outlived the last run", .{});
+    }
+    if (tcp_wire.items.len != 0 or tcp_held.items.len != 0 or reservations.items.len != 0) panic("sim: TCP entries or reservations outlived the last run", .{});
+    stream_fault_draws = 0;
+    stream_profile = null;
+    stream_used = false;
+    next_conn_id = 1;
+    tcp_next_port = first_ephemeral_port;
+    stream_stats = .{};
+    window_default = default_stream_window;
+    chunking_default = .hashed;
+}
+
+fn freeStreams() void {
+    for (tcp_wire.items) |w| net_alloc.free(w.bytes);
+    for (tcp_held.items) |w| net_alloc.free(w.bytes);
+    tcp_held.clearAndFree(net_alloc);
+    for (&conns) |*k| {
+        for (&k.ends) |*e| e.unread.deinit(net_alloc);
+    }
+    tcp_wire.clearAndFree(net_alloc);
+    reservations.clearAndFree(net_alloc);
+    streams = @splat(.{});
+    conns = @splat(.{});
+}
+
+/// Sets the run's stream profile: which kernel the sim follows where the
+/// kernels differ (design 17.8). Before the run's first stream socket, once.
+pub fn setStreamProfile(p: StreamProfile) void {
+    if (comptime !compiled_in) unreachable;
+    refuseOtherThread("sim.setStreamProfile");
+    if (!begun) panic("sim: setStreamProfile outside a run", .{});
+    if (stream_used) panic("sim: setStreamProfile({t}) after the run's first stream socket opened: set it before", .{p});
+    if (stream_profile) |old| panic("sim: setStreamProfile({t}) after setStreamProfile({t}): a run has one profile", .{ p, old });
+    stream_profile = p;
+}
+
+pub fn streamProfile() ?StreamProfile {
+    return stream_profile;
+}
+
+/// The profile, at a point where the kernels differ. With none, panics and
+/// names the row.
+fn needProfile(comptime row: []const u8) StreamProfile {
+    return stream_profile orelse panic("sim: " ++ row ++ ": the kernels differ here, and this run set no stream profile (sim.setStreamProfile(.linux or .macos), before its first stream socket)", .{});
+}
+
+fn sockIndex(fd: i32) usize {
+    return @intCast(fd - fd_base - max_ends);
+}
+
+/// Whether `fd` is an open stream socket of this run.
+pub fn isStreamFd(fd: i32) bool {
+    if (!isDgramFd(fd)) return false;
+    return streams[sockIndex(fd)].used;
+}
+
+fn streamSlot(comptime what: []const u8, fd: i32) *StreamSock {
+    if (!isStreamFd(fd)) panic("sim: " ++ what ++ " on sim fd {d}, which is not an open stream socket", .{fd});
+    return &streams[sockIndex(fd)];
+}
+
+fn kindName(k: SockKind) []const u8 {
+    return switch (k) {
+        .open => "stream socket that is not connected",
+        .listener => "listener",
+        .endpoint => "connected stream socket",
+    };
+}
+
+/// The lowest slot free in both tables, with its generation moved on.
+fn allocSockSlot() usize {
+    var j: usize = 0;
+    while (j < max_dgram and (dgrams[j].used or streams[j].used)) j += 1;
+    if (j == max_dgram) panic("sim: the socket table is full ({d} sockets)", .{max_dgram});
+    dgram_gen[j] = std.math.add(u32, dgram_gen[j], 1) catch panic("sim: socket slot {d} was opened {d} times in this run: its generation would wrap, and an op of an old socket could act on a new one", .{ j, dgram_gen[j] });
+    return j;
+}
+
+/// `socket(AF_INET, SOCK_STREAM)` during a run.
+pub fn streamOpen(nonblocking: bool) i32 {
+    refuseOtherThread("sim socket open");
+    if (comptime builtin.os.tag == .windows) panic("sim: sim sockets are not supported on Windows", .{});
+    checkFdNamespace();
+    const j = allocSockSlot();
+    streams[j] = .{ .used = true, .nonblocking = nonblocking };
+    stream_used = true;
+    return fd_base + max_ends + @as(i32, @intCast(j));
+}
+
+fn overlaps(a: [4]u8, b: [4]u8) bool {
+    return isWildcard(a) or isWildcard(b) or std.mem.eql(u8, &a, &b);
+}
+
+fn holdsPort(s: StreamSock) bool {
+    return s.used and (s.bound or s.kind == .endpoint);
+}
+
+fn tcpPortFree(ip: [4]u8, port: u16) bool {
+    for (streams) |s| {
+        if (holdsPort(s) and s.local.port == port and overlaps(ip, s.local.ip)) return false;
+    }
+    for (reservations.items) |r| {
+        if (r.port == port and overlaps(ip, r.ip)) return false;
+    }
+    return true;
+}
+
+fn tcpEphemeral(ip: [4]u8) error{AddressInUse}!u16 {
+    var tries: u32 = 0;
+    while (tries < 65536 - @as(u32, first_ephemeral_port)) : (tries += 1) {
+        const p = tcp_next_port;
+        tcp_next_port = if (tcp_next_port == 65535) first_ephemeral_port else tcp_next_port + 1;
+        if (tcpPortFree(ip, p)) return p;
+    }
+    return error.AddressInUse;
+}
+
+/// The bind rules for a fixed port: the table in the protocol comment above.
+fn tcpBindCheck(fd: i32, addr: Ip4, reuse: bool) error{AddressInUse}!void {
+    for (streams, 0..) |s, j| {
+        if (!holdsPort(s) or s.local.port != addr.port or !overlaps(addr.ip, s.local.ip)) continue;
+        if (!reuse) return error.AddressInUse;
+        const holder = fd_base + max_ends + @as(i32, @intCast(j));
+        if (s.kind == .listener and s.reuseaddr) {
+            if (std.mem.eql(u8, &s.local.ip, &addr.ip)) return error.AddressInUse;
+            switch (needProfile("row 12, a bind with SO_REUSEADDR to a port a listener holds on another address")) {
+                .linux => return error.AddressInUse,
+                .macos => panic("sim: a bind of sim fd {d} with SO_REUSEADDR to port {d}, which listener {d} holds on another address: refused under .macos (row 12: macOS allows it, and which listener gets a SYN was not measured)", .{ fd, addr.port, holder }),
+            }
+        }
+        panic("sim: a bind of sim fd {d} with SO_REUSEADDR to port {d}, held by sim fd {d} (a {s}{s}): not measured, so not simulated", .{ fd, addr.port, holder, kindName(s.kind), if (s.kind == .listener) " without SO_REUSEADDR" else "" });
+    }
+    for (reservations.items) |r| {
+        if (r.port != addr.port or !overlaps(addr.ip, r.ip)) continue;
+        if (!reuse) return error.AddressInUse;
+        if (r.reuse) continue;
+        switch (needProfile("row 31, a bind with SO_REUSEADDR over a TIME_WAIT reservation that did not set it")) {
+            .linux => return error.AddressInUse,
+            .macos => {},
+        }
+    }
+}
+
+/// `bind` of a stream socket. Port 0 takes the next free TCP port.
+pub fn streamBind(fd: i32, addr: Ip4) error{AddressInUse}!void {
+    refuseOtherThread("sim socket bind");
+    const s = streamSlot("bind", fd);
+    if (s.kind != .open or s.bound) panic("sim: bind on sim fd {d}, which is already bound or connected (a {s}): not simulated", .{ fd, kindName(s.kind) });
+    if (!isWildcard(addr.ip)) refuseNonLoopback("bind to", addr.ip);
+    const port = if (addr.port == 0) try tcpEphemeral(addr.ip) else blk: {
+        try tcpBindCheck(fd, addr, s.reuseaddr);
+        break :blk addr.port;
+    };
+    s.bound = true;
+    s.local = .{ .ip = addr.ip, .port = port };
+}
+
+/// `getsockname` of a stream socket: 0.0.0.0:0 before a bind or a connect.
+pub fn streamLocal(fd: i32) Ip4 {
+    return streamSlot("getsockname", fd).local;
+}
+
+pub fn streamListen(fd: i32, backlog: u31) void {
+    refuseOtherThread("sim socket listen");
+    const s = streamSlot("listen", fd);
+    if (s.kind != .open) panic("sim: listen on sim fd {d}, a {s}: not simulated", .{ fd, kindName(s.kind) });
+    if (!s.bound) panic("sim: listen on sim fd {d}, which is not bound: the kernel would bind 0.0.0.0 and a port; not simulated (neither user does it)", .{fd});
+    s.kind = .listener;
+    s.backlog = @intCast(std.math.clamp(backlog, 1, max_backlog));
+}
+
+pub fn streamSetNonBlocking(fd: i32, on: bool) void {
+    refuseOtherThread("sim socket setNonBlocking");
+    streamSlot("setNonBlocking", fd).nonblocking = on;
+}
+
+pub fn streamIsNonBlocking(fd: i32) bool {
+    return streamSlot("isNonBlocking", fd).nonblocking;
+}
+
+/// `setsockopt` on a stream socket: the option list in the protocol comment
+/// above.
+pub fn streamSetOption(fd: i32, level: i32, name: u32, val: []const u8) error{OptionNotSupported}!void {
+    refuseOtherThread("sim socket setsockopt");
+    const s = streamSlot("setsockopt", fd);
+    if (level == sys.IPPROTO.TCP and name == sys.TCP.NODELAY) {
+        if (optionInt("TCP_NODELAY", fd, val) == 0) return error.OptionNotSupported;
+        s.nodelay = true;
+        return;
+    }
+    if (level == sys.SOL.SOCKET and name == sys.SO.REUSEADDR) {
+        s.reuseaddr = optionInt("SO_REUSEADDR", fd, val) != 0;
+        return;
+    }
+    if (level == sys.SOL.SOCKET and name == sys.SO.REUSEPORT) {
+        _ = optionInt("SO_REUSEPORT", fd, val);
+        return error.OptionNotSupported;
+    }
+    if (level == sys.SOL.SOCKET and name == sys.SO.LINGER) {
+        // {1, 0}: a close sends an RST; {0, any}: the default. A positive
+        // linger time is not simulated (nobody sets one).
+        if (val.len != @sizeOf(sys.linger)) panic("sim: setsockopt SO_LINGER on sim fd {d} with {d} bytes (a struct linger is {d})", .{ fd, val.len, @sizeOf(sys.linger) });
+        const l = std.mem.bytesToValue(sys.linger, val);
+        if (l.onoff != 0 and l.linger != 0) panic("sim: setsockopt SO_LINGER {{1, {d}}} on sim stream socket {d}: a linger time is not simulated; only {{1, 0}} and off", .{ l.linger, fd });
+        s.linger0 = l.onoff != 0;
+        return;
+    }
+    panic("sim: setsockopt {s} (level {d}, option {d}) on sim stream socket {d} is misuse here", .{ optionName(level, name), level, name, fd });
+}
+
+/// `getsockopt` on a stream socket: TCP_NODELAY only.
+pub fn streamGetOption(fd: i32, level: i32, name: u32, out: []u8) void {
+    const s = streamSlot("getsockopt", fd);
+    if (level == sys.SOL.SOCKET and name == sys.SO.ERROR) panic("sim: getsockopt SO_ERROR on sim stream socket {d} is refused: no sim path needs it, and both kernels clear it on read (design 17.4, rows 33 and 34)", .{fd});
+    if (level != sys.IPPROTO.TCP or name != sys.TCP.NODELAY) panic("sim: getsockopt {s} (level {d}, option {d}) on sim stream socket {d} is not simulated", .{ optionName(level, name), level, name, fd });
+    if (out.len != @sizeOf(c_int)) panic("sim: getsockopt on sim fd {d} into {d} bytes (an int is {d})", .{ fd, out.len, @sizeOf(c_int) });
+    const v: c_int = @intFromBool(s.nodelay);
+    @memcpy(out, std.mem.asBytes(&v));
+}
+
+/// `IpAddress.connect` with `local_address`, during a run: refused before
+/// any side effect (design 17.4). Neither user does it. Compiled out without
+/// sim.
+pub inline fn refuseConnectLocalAddress() void {
+    if (comptime !compiled_in) return;
+    if (isRunning()) panic("sim: IpAddress.connect with local_address during a sim run: a connect from a bound stream socket is not simulated", .{});
+}
+
+/// Refuses, by name, a call on a stream socket that no sim path reaches:
+/// the socket layer's own byte calls (only the native backends call them;
+/// zio's stream ops are the sim's own) and the datagram calls.
+pub fn refuseStream(comptime what: []const u8, fd: i32) noreturn {
+    panic("sim: " ++ what ++ " on sim stream socket {d} is not simulated (design 17.4: zio's stream ops do not call it under sim)", .{fd});
+}
+
+fn tcpBefore(a: TcpEntry, b: TcpEntry) bool {
+    if (a.due_at != b.due_at) return a.due_at < b.due_at;
+    if (a.conn_id != b.conn_id) return a.conn_id < b.conn_id;
+    if (a.dir != b.dir) return @backingInt(a.dir) < @backingInt(b.dir);
+    return a.seq < b.seq;
+}
+
+/// Puts an entry from side `from` of connection `ci` on the TCP wire, due
+/// `wire_latency_ns` from now. Capacity was reserved (`reserveTcp`).
+fn sendTcp(ci: u16, from: Side, kind: TcpKind, to: Ip4) void {
+    sendTcpAt(ci, from, kind, to, 0, &.{}, 0);
+}
+
+/// `sendTcp` for an entry due `extra_ns` after the wire latency (a chunk's
+/// spacing), with a data chunk's bytes (owned by the entry from here) or a
+/// credit's count. It lands no earlier than the entry sent before it in its
+/// direction (design 17.7, order within a direction); equal times land in
+/// sequence order.
+fn sendTcpAt(ci: u16, from: Side, kind: TcpKind, to: Ip4, extra_ns: u64, bytes: []u8, count: u64) void {
+    const k = &conns[ci];
+    const d = @backingInt(from);
+    var e: TcpEntry = .{ .due_at = 0, .conn_id = k.id, .conn = ci, .dir = from, .seq = k.next_seq[d], .kind = kind, .to = to, .bytes = bytes, .count = count, .extra_ns = extra_ns };
+    k.next_seq[d] += 1;
+    // A run that never set a `.tcp` rule takes none of this: its entries
+    // land exactly as before slice 3 (promise 1).
+    if (tcp_rule_set) {
+        const from_addr, const to_addr = tcpPath(k, from);
+        for (rules[0..rules_len]) |*r| {
+            if (r.key.protocol() == .tcp and r.key.matches(from_addr, to_addr)) countMatched(r);
+        }
+        if (dropRule(.impairment, .tcp, from_addr, to_addr)) |r| {
+            var add = r.imp.delay_ns;
+            if (r.imp.jitter_ns != 0) {
+                add += tcpJitterDraw(k.id, from, e.seq) % (r.imp.jitter_ns + 1);
+                stream_fault_draws += 1;
+            }
+            if (add > 0) {
+                e.extra_ns += add;
+                stream_stats.delayed += 1;
+                r.stats.delayed += 1;
+            }
+        }
+        if (heldAtSend(k, from)) {
+            stream_stats.held_at_send += 1;
+            holdTcp(e);
+            return;
+        }
+    }
+    putOnWire(e);
+}
+
+/// Whether an entry that side `from` of `k` sends now is held at its send
+/// (design 17.9 items 1 and 2): its direction already holds one, or a
+/// `.tcp` partition or silence matches its path. Only in a run that set a
+/// `.tcp` rule.
+fn heldAtSend(k: *const Conn, from: Side) bool {
+    if (!tcp_rule_set) return false;
+    if (k.held[@backingInt(from)] > 0) return true;
+    const from_addr, const to_addr = tcpPath(k, from);
+    return tcpBlocked(from_addr, to_addr);
+}
+
+/// Whether a held credit of direction `dir` of `ci` is there to be
+/// replaced by a credit held now (`holdTcp`).
+fn heldCredit(ci: u16, dir: Side) bool {
+    if (conns[ci].held[@backingInt(dir)] == 0) return false;
+    for (tcp_held.items) |h| {
+        if (h.conn == ci and h.dir == dir and h.kind == .credit) return true;
+    }
+    return false;
+}
+
+/// Side `side`'s held entries that an abort or `failStream` discards
+/// (`discardHeldOutbound`): its data, FIN and credits.
+fn heldOutbound(ci: u16, side: Side) usize {
+    if (conns[ci].held[@backingInt(side)] == 0) return 0;
+    var n: usize = 0;
+    for (tcp_held.items) |h| n += @intFromBool(h.conn == ci and h.dir == side and abortDiscards(h.kind));
+    return n;
+}
+
+fn abortDiscards(kind: TcpKind) bool {
+    return kind == .data or kind == .fin or kind == .credit;
+}
+
+/// Puts `e` on the wire, due `wire_latency_ns + e.extra_ns` from now and no
+/// earlier than the entry before it in its direction. Capacity was reserved.
+fn putOnWire(entry: TcpEntry) void {
+    var e = entry;
+    const k = &conns[e.conn];
+    const d = @backingInt(e.dir);
+    e.due_at = @max(tcpLandingAfter(e.extra_ns), k.last_due[d]);
+    k.last_due[d] = e.due_at;
+    var pos = tcp_wire.items.len;
+    while (pos > 0 and tcpBefore(e, tcp_wire.items[pos - 1])) pos -= 1;
+    tcp_wire.insertAssumeCapacity(pos, e);
+}
+
+/// The addresses an entry of direction `from` travels between, for the
+/// `.tcp` rules (design 17.9a, point 3): the sender's local address and its
+/// peer. A server side that no SYN made (`absent`: the RST that refuses a
+/// SYN) sends from the address the SYN went to.
+fn tcpPath(k: *const Conn, from: Side) struct { Ip4, Ip4 } {
+    const x = k.ends[@backingInt(from)];
+    const y = k.ends[@backingInt(otherSide(from))];
+    if (x.phase == .absent) return .{ y.peer, y.local };
+    return .{ x.local, x.peer };
+}
+
+/// Whether a `.tcp` partition or silence in force matches the path.
+fn tcpBlocked(from: Ip4, to: Ip4) bool {
+    return dropRule(.silence, .tcp, from, to) != null or dropRule(.partition, .tcp, from, to) != null;
+}
+
+/// The jitter draw of a `.tcp` rule: a keyed SipHash of (seed, conn_id,
+/// direction, sequence, "jitter"), with `chunkDraw`'s key: the run's seed
+/// in the key's first 8 bytes and zeros after; the message is those fields,
+/// little endian, then the 6 bytes "jitter". The jitter is this modulo
+/// `jitter_ns + 1`. It never touches the run's RNG.
+fn tcpJitterDraw(conn_id: u32, dir: Side, seq: u64) u64 {
+    var key: [16]u8 = @splat(0);
+    std.mem.writeInt(u64, key[0..8], current_seed, .little);
+    var m: [19]u8 = undefined;
+    std.mem.writeInt(u32, m[0..4], conn_id, .little);
+    m[4] = @backingInt(dir);
+    std.mem.writeInt(u64, m[5..13], seq, .little);
+    @memcpy(m[13..19], "jitter");
+    return std.hash.SipHash64(2, 4).toInt(&m, &key);
+}
+
+fn heldBefore(a: TcpEntry, b: TcpEntry) bool {
+    if (a.conn_id != b.conn_id) return a.conn_id < b.conn_id;
+    if (a.dir != b.dir) return @backingInt(a.dir) < @backingInt(b.dir);
+    return a.seq < b.seq;
+}
+
+/// Holds `e` (design 17.9 items 2 and 3). Two held credits of one
+/// direction coalesce to the one with the larger sequence, whichever came
+/// to the list first: an entry held at its landing left before one held at
+/// its send, so arriving later does not make a credit newer (outside review
+/// of slice 3, first P2). The newer one's count includes the older's,
+/// because a credit carries the receiver's cumulative `read + reclaimed`
+/// at its departure; a newer credit whose count is not larger is an
+/// invariant panic. Capacity was reserved.
+fn holdTcp(e: TcpEntry) void {
+    const k = &conns[e.conn];
+    const d = @backingInt(e.dir);
+    if (e.kind == .credit) {
+        for (tcp_held.items, 0..) |h, i| {
+            if (h.conn != e.conn or h.dir != e.dir or h.kind != .credit) continue;
+            const newer, const older = if (e.seq > h.seq) .{ e, h } else .{ h, e };
+            if (newer.count <= older.count) panic("sim: held credits of connection {d}: sequence {d} carries {d}, not more than sequence {d}'s {d} (an invariant: counts grow with the sequence)", .{ k.id, newer.seq, newer.count, older.seq, older.count });
+            stream_stats.credits_coalesced += 1;
+            // The held one is newer: the arriving one is dropped.
+            if (h.seq > e.seq) return;
+            _ = tcp_held.orderedRemove(i);
+            k.held[d] -= 1;
+            break;
+        }
+    }
+    var pos = tcp_held.items.len;
+    while (pos > 0 and heldBefore(e, tcp_held.items[pos - 1])) pos -= 1;
+    tcp_held.insertAssumeCapacity(pos, e);
+    k.held[d] += 1;
+}
+
+/// Releases every held direction that no `.tcp` partition or silence
+/// matches any more, in (`conn_id`, direction) order (design 17.9 item 4).
+/// Each entry lands `wire_latency_ns + extra_ns` after now, behind the
+/// entry before it in its direction.
+fn releaseHeld() void {
+    var order: [max_conns]u16 = undefined;
+    var n: usize = 0;
+    for (conns, 0..) |k, ci| {
+        if (!k.used or k.held[0] + k.held[1] == 0) continue;
+        var pos = n;
+        while (pos > 0 and conns[order[pos - 1]].id > k.id) : (pos -= 1) order[pos] = order[pos - 1];
+        order[pos] = @intCast(ci);
+        n += 1;
+    }
+    for (order[0..n]) |ci| {
+        const k = &conns[ci];
+        for ([_]Side{ .client, .server }) |dir| {
+            const d = @backingInt(dir);
+            if (k.held[d] == 0) continue;
+            const from_addr, const to_addr = tcpPath(k, dir);
+            if (tcpBlocked(from_addr, to_addr)) continue;
+            for (tcp_wire.items) |w| {
+                if (w.conn == ci and w.dir == dir) {
+                    for (tcp_held.items) |h| {
+                        if (h.conn == ci and h.dir == dir and h.seq < w.seq) panic("sim: connection {d} releases sequence {d} while sequence {d} of its direction is on the wire (an invariant: a held entry has nothing behind it on the wire)", .{ k.id, h.seq, w.seq });
+                    }
+                }
+            }
+            _ = tcpLandingTime();
+            tcp_wire.ensureUnusedCapacity(net_alloc, k.held[d]) catch panic("sim: out of memory for a TCP wire entry", .{});
+            var i: usize = 0;
+            while (i < tcp_held.items.len) {
+                const h = tcp_held.items[i];
+                if (h.conn != ci or h.dir != dir) {
+                    i += 1;
+                    continue;
+                }
+                _ = tcp_held.orderedRemove(i);
+                putOnWire(h);
+                stream_stats.released += 1;
+            }
+            k.held[d] = 0;
+        }
+    }
+}
+
+/// Discards side `side`'s held data, FIN and credits: an abort (`cause`
+/// `.abort`) or `failStream` (`.failed_sender`) of that side (design 17.9
+/// item 7 and 17.9a point 9). Its held handshake entries stay.
+fn discardHeldOutbound(ci: u16, side: Side, cause: Discard) void {
+    const k = &conns[ci];
+    const d = @backingInt(side);
+    var i: usize = 0;
+    while (k.held[d] > 0 and i < tcp_held.items.len) {
+        const h = tcp_held.items[i];
+        if (h.conn != ci or h.dir != side or !abortDiscards(h.kind)) {
+            i += 1;
+            continue;
+        }
+        _ = tcp_held.orderedRemove(i);
+        k.held[d] -= 1;
+        if (h.kind == .data) discardBytes(&k.dirs[d], cause, h.bytes.len);
+        discardHeld(h);
+    }
+}
+
+/// Records a held entry discarded now, and frees it.
+fn discardHeld(entry: TcpEntry) void {
+    var e = entry;
+    e.due_at = clock_ns;
+    stream_stats.discarded_held += 1;
+    recordStream(e, .discarded_held);
+    net_alloc.free(e.bytes);
+}
+
+/// `tcpLandingTime` plus `extra_ns`, under the same named limit.
+fn tcpLandingAfter(extra_ns: u64) u64 {
+    return std.math.add(u64, tcpLandingTime(), extra_ns) catch panic("sim: a TCP entry sent at {d} ns would land after maxInt(u64) ns: the sim's time limit", .{clock_ns});
+}
+
+/// When a TCP entry sent now lands. The clock can reach `maxInt(u64)`
+/// (`advanceNs` saturates), and a landing time past it would wrap to the
+/// past: that is the sim's time limit, a named panic, never a wrapped or
+/// saturated time (outside review 5, finding 4).
+fn tcpLandingTime() u64 {
+    return std.math.add(u64, clock_ns, wire_latency_ns) catch panic("sim: a TCP entry sent at {d} ns would land after maxInt(u64) ns: the sim's time limit", .{clock_ns});
+}
+
+/// Room for `n` more TCP entries, and a landing time for them: every path
+/// that sends calls this before it changes any state, so a limit panics
+/// with nothing half done. `freed` is the entries the same step removes
+/// before it adds its own (an abort's held entries, a held credit that the
+/// new one replaces): the limit is on the count after the step, so a step
+/// that does not raise the count past the limit is never refused (outside
+/// review of slice 3, second P2). Out of memory panics: a landing that
+/// must answer has no error to return.
+fn reserveTcp(n: usize, freed: usize) void {
+    _ = tcpLandingTime();
+    // Held entries count toward the limit (design 17.9 item 10). Room is
+    // made in both lists: a send goes to one or the other.
+    const now_n = tcp_wire.items.len + tcp_held.items.len;
+    if (freed > now_n) panic("sim: a step frees {d} TCP entries of the {d} there are (an invariant)", .{ freed, now_n });
+    if (now_n - freed + n > max_tcp_entries) panic("sim: {d} TCP entries on the wire and held: the limit is max_tcp_entries, {d}", .{ now_n - freed + n, max_tcp_entries });
+    tcp_wire.ensureUnusedCapacity(net_alloc, n) catch panic("sim: out of memory for a TCP wire entry", .{});
+    tcp_held.ensureUnusedCapacity(net_alloc, n) catch panic("sim: out of memory for a held TCP entry", .{});
+}
+
+fn wakeStream(slot: usize) void {
+    const p = streams[slot].parked orelse return;
+    streams[slot].parked = null;
+    pushDueAt(p.c, .stream, p.id, clock_ns);
+}
+
+fn wakeRecv(slot: usize) void {
+    const p = streams[slot].parked_recv orelse return;
+    streams[slot].parked_recv = null;
+    pushDueAt(p.c, .stream, p.id, clock_ns);
+}
+
+fn wakeSend(slot: usize) void {
+    const p = streams[slot].parked_send orelse return;
+    streams[slot].parked_send = null;
+    pushDueAt(p.c, .stream, p.id, clock_ns);
+}
+
+/// TCP entries on the wire or held, and credit departures owed. A test
+/// sleeps while it is not 0 before `sim.end`, after it cleared the rules
+/// that hold entries (design 17.15 item 3).
+pub fn streamEntriesInFlight() usize {
+    var n = tcp_wire.items.len + tcp_held.items.len;
+    for (conns) |k| {
+        if (!k.used) continue;
+        for (k.dirs) |d| n += @intFromBool(d.owed_at != null);
+    }
+    return n;
+}
+
+/// The earliest owed credit departure after now, for the poll's clock.
+fn nextOwedCredit() ?u64 {
+    var min_at: ?u64 = null;
+    for (conns) |k| {
+        if (!k.used) continue;
+        for (k.dirs) |d| {
+            const t = d.owed_at orelse continue;
+            if (t <= clock_ns) continue;
+            if (min_at == null or t < min_at.?) min_at = t;
+        }
+    }
+    return min_at;
+}
+
+pub fn streamStats() StreamStats {
+    return stream_stats;
+}
+
+/// TIME_WAIT reservations so far in this run.
+pub fn streamReservations() usize {
+    return reservations.items.len;
+}
+
+/// `NetConnect` on `fd` to `to`. Parks the op (`c`, `id`) on the socket
+/// after the SYN leaves; the SYN-ACK's or the RST's landing wakes it
+/// (`streamHarvestConnect`). The checks before the SYN are design 17.6's
+/// `NetConnect` list, line 1.
+pub fn streamConnect(fd: i32, to: Ip4, c: *anyopaque, id: u32) error{AddressInUse}!void {
+    refuseOtherThread("sim socket connect");
+    const s = streamSlot("connect", fd);
+    if (s.kind != .open) panic("sim: connect on sim fd {d}, a {s}: not simulated", .{ fd, kindName(s.kind) });
+    if (s.bound) panic("sim: connect on sim fd {d}, which the program bound: a connect from a bound stream socket is not simulated (neither user does it)", .{fd});
+    refuseNonLoopback("connect to", to.ip);
+    if (to.port == 0) panic("sim: connect to port 0 from sim fd {d}", .{fd});
+    if (!std.mem.eql(u8, &to.ip, &[4]u8{ 127, 0, 0, 1 })) {
+        switch (needProfile("rows 15 and 30, a connect to 127/8 other than 127.0.0.1")) {
+            .linux => {},
+            .macos => panic("sim: connect from sim fd {d} to {d}.{d}.{d}.{d}: refused under .macos (rows 15 and 30: macOS's answer depends on lo0's aliases)", .{ fd, to.ip[0], to.ip[1], to.ip[2], to.ip[3] }),
+        }
+    }
+    var ci: usize = 0;
+    while (ci < max_conns and conns[ci].used) ci += 1;
+    if (ci == max_conns) panic("sim: {d} connections at once: the limit is max_conns", .{max_conns});
+    // A conn_id is never reused in a run, so the run's last u32 cannot be
+    // handed out: the connect after it would need a successor that wraps
+    // (outside review 5, finding 4). Checked, with the time limit, before
+    // the port counter or any table moves.
+    const after_id = std.math.add(u32, next_conn_id, 1) catch panic("sim: conn_id {d} is the last a u32 holds: conn_ids are never reused in a run, so a run makes at most {d} connections", .{ next_conn_id, std.math.maxInt(u32) - 1 });
+    reserveTcp(1, 0);
+    const here: [4]u8 = .{ 127, 0, 0, 1 };
+    const port = try tcpEphemeral(here);
+    const local: Ip4 = .{ .ip = here, .port = port };
+    conns[ci] = .{ .used = true, .id = next_conn_id, .dirs = .{ .{ .window = window_default }, .{ .window = window_default } }, .chunking = chunking_default };
+    next_conn_id = after_id;
+    conns[ci].ends[@backingInt(Side.client)] = .{ .phase = .c_syn, .slot = @intCast(sockIndex(fd)), .local = local, .peer = to };
+    s.kind = .endpoint;
+    s.conn = @intCast(ci);
+    s.side = .client;
+    s.local = local;
+    sendTcp(@intCast(ci), .client, .syn, to);
+    s.parked = .{ .c = c, .id = id };
+    s.unresolved = s.parked;
+}
+
+/// A woken connect at its harvest, its socket checked first
+/// (`streamOpOnItsSocket`): ok if the SYN-ACK landed, `ConnectionRefused`
+/// if an RST did. A later landing in the same instant does not change
+/// that: it is the next call's to see.
+pub fn streamHarvestConnect(fd: i32) error{ ConnectionRefused, ConnectionResetByPeer, Timeout }!void {
+    const s = streamSlot("a harvested connect", fd);
+    const e = conns[s.conn].ends[@backingInt(s.side)];
+    // `failStream` in `C-syn` (17.9): `ConnectError` has no
+    // `ConnectionTimedOut`, so a timed-out death is `Timeout`.
+    if (e.failed) |how| return switch (how) {
+        .reset => error.ConnectionResetByPeer,
+        .timed_out => error.Timeout,
+    };
+    return switch (e.phase) {
+        .est => {},
+        .c_failed => error.ConnectionRefused,
+        else => panic("sim: a woken connect on sim fd {d} found its endpoint {t}: only a SYN-ACK or an RST wakes it", .{ fd, e.phase }),
+    };
+}
+
+pub const Accepted = struct { fd: i32, peer: Ip4 };
+
+fn queueHead(slot: usize) ?usize {
+    var best: ?usize = null;
+    for (conns, 0..) |k, ci| {
+        if (!k.used) continue;
+        const e = k.ends[@backingInt(Side.server)];
+        if (e.phase != .s_queued or e.listener_slot != slot or e.listener_gen != dgram_gen[slot]) continue;
+        if (best == null or e.queue_pos < conns[best.?].ends[@backingInt(Side.server)].queue_pos) best = ci;
+    }
+    return best;
+}
+
+fn listenerCount(slot: usize) usize {
+    var n: usize = 0;
+    for (conns) |k| {
+        if (!k.used) continue;
+        const e = k.ends[@backingInt(Side.server)];
+        if ((e.phase == .s_prov or e.phase == .s_queued) and e.listener_slot == slot and e.listener_gen == dgram_gen[slot]) n += 1;
+    }
+    return n;
+}
+
+/// Takes the queued connection `ci` into a new descriptor.
+fn claim(ci: usize, nonblocking: bool) Accepted {
+    const e = &conns[ci].ends[@backingInt(Side.server)];
+    const j = allocSockSlot();
+    streams[j] = .{ .used = true, .kind = .endpoint, .nonblocking = nonblocking, .local = e.local, .nodelay = e.nodelay, .reuseaddr = e.reuseaddr, .linger0 = e.linger0, .conn = @intCast(ci), .side = .server };
+    e.phase = .est;
+    e.slot = @intCast(j);
+    return .{ .fd = fd_base + max_ends + @as(i32, @intCast(j)), .peer = e.peer };
+}
+
+/// `NetAccept` on `fd`, at the call (design 17.6). null: the op (`c`, `id`)
+/// parked on the listener.
+pub fn streamAccept(fd: i32, c: *anyopaque, id: u32, nonblocking: bool) ?Accepted {
+    refuseOtherThread("sim socket accept");
+    const s = streamSlot("accept", fd);
+    if (s.kind != .listener) panic("sim: accept on sim fd {d}, a {s}: not simulated", .{ fd, kindName(s.kind) });
+    if (s.unresolved) |u| panic("sim: a second accept while one is {s}, on sim listener {d} (op {d}; the new op {d}): a listener takes one unresolved accept at a time", .{ if (s.parked != null) "parked" else "woken and not yet harvested", fd, u.id, id });
+    if (queueHead(sockIndex(fd))) |ci| return claim(ci, nonblocking);
+    s.parked = .{ .c = c, .id = id };
+    s.unresolved = s.parked;
+    return null;
+}
+
+/// A woken accept at its harvest, its listener checked first
+/// (`streamOpOnItsSocket`): claims the queue head now.
+pub fn streamHarvestAccept(fd: i32, nonblocking: bool) Accepted {
+    const ci = queueHead(sockIndex(fd)) orelse panic("sim: a woken accept on sim listener {d} found its queue empty: only an accept takes from it, and a second refuses while this one is unresolved", .{fd});
+    return claim(ci, nonblocking);
+}
+
+// ---- Slice 2: bytes (design 17.7 and 17.8) ----
+
+/// What a receive or a send evaluation gives: a count, an error, or "park".
+pub const StreamResult = union(enum) { n: usize, err: StreamError, park };
+pub const StreamError = error{ ConnectionResetByPeer, ConnectionTimedOut, BrokenPipe };
+
+fn failError(how: StreamFailure) StreamError {
+    return switch (how) {
+        .reset => error.ConnectionResetByPeer,
+        .timed_out => error.ConnectionTimedOut,
+    };
+}
+
+fn endOf(s: *const StreamSock) *StreamEnd {
+    return &conns[s.conn].ends[@backingInt(s.side)];
+}
+
+/// The socket behind `fd` for a byte call: an endpoint's descriptor whose
+/// endpoint is `est`. Anything else is design 17.8's line 1: refused.
+fn estSlot(comptime what: []const u8, fd: i32) *StreamSock {
+    const s = streamSlot(what, fd);
+    if (s.kind != .endpoint) panic("sim: " ++ what ++ " on sim fd {d}, a {s}: not simulated", .{ fd, kindName(s.kind) });
+    const e = endOf(s);
+    if (e.phase != .est) panic("sim: " ++ what ++ " on sim fd {d}, whose connection is in phase {t}, not established: not simulated", .{ fd, e.phase });
+    return s;
+}
+
+/// Whether data direction `data` (from side `data`) has ended its window
+/// accounting: its sender is dead, failed, or has received a reset (design
+/// 17.7).
+fn dirTerminal(k: *const Conn, data: Side) bool {
+    const x = k.ends[@backingInt(data)];
+    return x.phase == .dead or x.phase == .absent or x.reset_received or x.failed != null;
+}
+
+/// Moves the unread bytes of side `side` to a discard cause.
+fn discardUnread(ci: u16, side: Side, cause: Discard) usize {
+    const e = &conns[ci].ends[@backingInt(side)];
+    const n = e.unreadLen();
+    discardBytes(&conns[ci].dirs[@backingInt(otherSide(side))], cause, n);
+    e.unread.clearRetainingCapacity();
+    e.unread_head = 0;
+    return n;
+}
+
+/// Copies unread bytes of `e` into `bufs`, as many as fit.
+fn copyOutUnread(e: *StreamEnd, bufs: anytype) usize {
+    var n: usize = 0;
+    for (bufs) |b| {
+        const dst = bufBytes(b);
+        const src = e.unread.items[e.unread_head..];
+        const m = @min(dst.len, src.len);
+        @memcpy(dst[0..m], src[0..m]);
+        e.unread_head += m;
+        n += m;
+        if (e.unread_head == e.unread.items.len) break;
+    }
+    if (e.unread_head == e.unread.items.len) {
+        e.unread.clearRetainingCapacity();
+        e.unread_head = 0;
+    } else if (e.unread_head >= 4096 and e.unread_head * 2 >= e.unread.items.len) {
+        const rest = e.unread.items.len - e.unread_head;
+        std.mem.copyForwards(u8, e.unread.items[0..rest], e.unread.items[e.unread_head..]);
+        e.unread.shrinkRetainingCapacity(rest);
+        e.unread_head = 0;
+    }
+    return n;
+}
+
+/// Design 17.8, the receive evaluation.
+fn recvEval(s: *StreamSock, bufs: anytype) StreamResult {
+    const ci = s.conn;
+    const e = endOf(s);
+    // Lines 1 and 2: `failStream`. One op reports it; which one is the
+    // harvest order (17.9).
+    if (e.failed) |how| {
+        if (e.fail_reported) return .{ .n = 0 };
+        e.fail_reported = true;
+        return .{ .err = failError(how) };
+    }
+    if (e.unreadLen() > 0) {
+        const n = copyOutUnread(e, bufs);
+        conns[ci].dirs[@backingInt(otherSide(s.side))].read += n;
+        creditOwed(ci, otherSide(s.side));
+        return .{ .n = n };
+    }
+    if (e.reset_received and !e.reset_reported) {
+        if (!e.fin_before_reset) {
+            // Both kernels report it once (rows 20, 23, 26, 36, 39).
+            e.reset_reported = true;
+            return .{ .err = error.ConnectionResetByPeer };
+        }
+        switch (needProfile("rows 8 and 22, a read that meets a reset after a FIN had landed")) {
+            // The pending error is `pipe`: a read gives 0 and leaves it.
+            .linux => {},
+            .macos => {
+                e.reset_reported = true;
+                return .{ .err = error.ConnectionResetByPeer };
+            },
+        }
+    }
+    if (e.fin_in or e.shut_rd or e.reset_received) return .{ .n = 0 };
+    return .park;
+}
+
+/// Design 17.8, the send evaluation (lines 3 to 6). The reset comes before
+/// the own FIN (review 3, finding 4; row 39).
+fn sendEval(s: *StreamSock, bufs: anytype) StreamResult {
+    const ci = s.conn;
+    const e = endOf(s);
+    // Lines 1 and 2: `failStream`.
+    if (e.failed) |how| {
+        if (e.fail_reported) return .{ .err = error.BrokenPipe };
+        e.fail_reported = true;
+        return .{ .err = failError(how) };
+    }
+    if (e.reset_received) {
+        if (e.reset_reported) return .{ .err = error.BrokenPipe };
+        // Line 3a: the send that was parked when the reset arrived, at its
+        // harvest (it is the endpoint's one unresolved send then; at a
+        // call there is none). zio's readiness backends end a parked op
+        // with SO_ERROR, which reports the reset and clears it (t-4119's
+        // ruling: the sim follows zio on the kernel). With no FIN first,
+        // both kernels then give ECONNRESET (rows 23, 25). After a FIN,
+        // Linux's SO_ERROR is EPIPE and macOS's ECONNRESET (row 41).
+        const parked_at_reset = if (s.unresolved_send) |u| e.reset_parked_send == u.id else false;
+        if (parked_at_reset) {
+            e.reset_reported = true;
+            if (!e.fin_before_reset) return .{ .err = error.ConnectionResetByPeer };
+            return switch (needProfile("row 41, a send parked when a reset arrives after a FIN")) {
+                .linux => .{ .err = error.BrokenPipe },
+                .macos => .{ .err = error.ConnectionResetByPeer },
+            };
+        }
+        if (e.fin_before_reset) {
+            // Both kernels give EPIPE; Linux consumes its pending `pipe`.
+            if (stream_profile == .linux) e.reset_reported = true;
+            return .{ .err = error.BrokenPipe };
+        }
+        switch (needProfile("rows 26b, 36 and 39, a send that meets a reset with no FIN before it")) {
+            .linux => {
+                e.reset_reported = true;
+                return .{ .err = error.ConnectionResetByPeer };
+            },
+            .macos => return .{ .err = error.BrokenPipe },
+        }
+    }
+    if (e.fin_out) return .{ .err = error.BrokenPipe };
+    const room = conns[ci].dirs[@backingInt(s.side)].room();
+    if (room == 0) return .park;
+    const n: usize = @intCast(@min(room, totalLen(bufs)));
+    admit(ci, s.side, bufs, n);
+    return .{ .n = n };
+}
+
+/// The chunk-size draw: a keyed SipHash of (seed, conn_id, direction,
+/// data_send_index, chunk_index, "chunk"). The key is the run's seed in
+/// its first 8 bytes and zeros after; the message is those fields, little
+/// endian, then the 5 bytes "chunk". It never touches the run's RNG.
+fn chunkDraw(conn_id: u32, dir: Side, send_index: u64, k: u64) u64 {
+    var key: [16]u8 = @splat(0);
+    std.mem.writeInt(u64, key[0..8], current_seed, .little);
+    var m: [26]u8 = undefined;
+    std.mem.writeInt(u32, m[0..4], conn_id, .little);
+    m[4] = @backingInt(dir);
+    std.mem.writeInt(u64, m[5..13], send_index, .little);
+    std.mem.writeInt(u64, m[13..21], k, .little);
+    @memcpy(m[21..26], "chunk");
+    return std.hash.SipHash64(2, 4).toInt(&m, &key);
+}
+
+/// Chunk `k`'s size, with `rest` bytes still to cut (design 17.7).
+fn chunkSize(k: *const Conn, dir: Side, idx: u64, rest: usize) usize {
+    const want: u64 = switch (k.chunking) {
+        .off => rest,
+        .fixed => |n| n,
+        .hashed => blk: {
+            const h = chunkDraw(k.id, dir, k.dirs[@backingInt(dir)].data_send_index, idx);
+            break :blk if (h & 3 == 0) 1 + (h >> 2) % 16 else 512 + (h >> 2) % 3585;
+        },
+    };
+    return @intCast(@min(want, rest));
+}
+
+/// A position in a list of buffers, for gathering a send into chunks
+/// without walking the list from its start for each chunk.
+const BufCursor = struct {
+    i: usize = 0,
+    off: usize = 0,
+
+    fn take(c: *BufCursor, bufs: anytype, dst: []u8) void {
+        var got: usize = 0;
+        while (got < dst.len) {
+            const src = bufBytes(bufs[c.i])[c.off..];
+            const m = @min(src.len, dst.len - got);
+            @memcpy(dst[got..][0..m], src[0..m]);
+            got += m;
+            c.off += m;
+            if (c.off == bufBytes(bufs[c.i]).len) {
+                c.i += 1;
+                c.off = 0;
+            }
+        }
+    }
+};
+
+/// Admits `n` bytes of `bufs` from side `side`: the chunk plan first, its
+/// entry count and the last chunk's landing time checked before anything
+/// moves (design 17.7, admission), then one entry per chunk.
+fn admit(ci: u16, side: Side, bufs: anytype, n: usize) void {
+    const k = &conns[ci];
+    var chunks: usize = 0;
+    var rest = n;
+    while (rest > 0) : (chunks += 1) rest -= chunkSize(k, side, chunks, rest);
+    if (tcp_wire.items.len + chunks > max_tcp_entries) panic("sim: a send of {d} bytes on connection {d} needs {d} chunks: with {d} TCP entries on the wire that is past max_tcp_entries, {d} (design 17.7: a smaller window or a larger chunk mode)", .{ n, k.id, chunks, tcp_wire.items.len, max_tcp_entries });
+    _ = tcpLandingAfter((chunks - 1) * chunk_spacing_ns);
+    reserveTcp(chunks, 0);
+    const peer = k.ends[@backingInt(side)].peer;
+    var cur: BufCursor = .{};
+    rest = n;
+    var idx: usize = 0;
+    while (rest > 0) : (idx += 1) {
+        const size = chunkSize(k, side, idx, rest);
+        const bytes = net_alloc.alloc(u8, size) catch panic("sim: out of memory for a TCP data chunk of {d} bytes", .{size});
+        cur.take(bufs, bytes);
+        sendTcpAt(ci, side, .data, peer, idx * chunk_spacing_ns, bytes, 0);
+        rest -= size;
+    }
+    const d = &k.dirs[@backingInt(side)];
+    d.admitted += n;
+    d.data_send_index += 1;
+}
+
+/// A read (or a window release) of data direction `data` owes a credit:
+/// it departs now if none departed in the last L, else at `last + L`,
+/// carrying the count at that moment (design 17.7).
+fn creditOwed(ci: u16, data: Side) void {
+    const d = &conns[ci].dirs[@backingInt(data)];
+    switch (creditPlan(ci, data)) {
+        .joins_owed => {},
+        .owe => d.owed_at = d.last_credit_at.? +| wire_latency_ns,
+        .departs, .stale => departCredit(ci, data),
+    }
+}
+
+/// What a read or a release of data direction `data` does with its credit
+/// now (design 17.7). Only `.departs` puts an entry on the wire now, so a
+/// caller that reserves wire room before it changes state reserves for that
+/// alone (outside review of slice 2, P2: `.both` reserved for a credit that
+/// was already owed).
+const CreditPlan = enum {
+    /// A credit is already owed: it departs at its time with the newer count.
+    joins_owed,
+    /// One departed less than L ago: this one is owed for L after it.
+    owe,
+    /// It leaves now.
+    departs,
+    /// The direction is terminal: nothing leaves (`stale_credit`).
+    stale,
+};
+
+fn creditPlan(ci: u16, data: Side) CreditPlan {
+    const d = conns[ci].dirs[@backingInt(data)];
+    if (d.owed_at != null) return .joins_owed;
+    if (d.last_credit_at) |t| {
+        if (clock_ns < t +| wire_latency_ns) return .owe;
+    }
+    return if (dirTerminal(&conns[ci], data)) .stale else .departs;
+}
+
+/// A credit for data direction `data` leaves its receiver now, unless the
+/// direction is terminal: then nothing leaves (`stale_credit`).
+fn departCredit(ci: u16, data: Side) void {
+    const k = &conns[ci];
+    const d = &k.dirs[@backingInt(data)];
+    if (dirTerminal(k, data)) {
+        d.owed_at = null;
+        stream_stats.stale_credit += 1;
+        return;
+    }
+    const r = otherSide(data);
+    // A credit held now replaces a held one of its direction: one in, one
+    // out (`holdTcp`; it is the newest, so it is the one kept).
+    reserveTcp(1, @intFromBool(heldAtSend(k, r) and heldCredit(ci, r)));
+    d.owed_at = null;
+    d.last_credit_at = clock_ns;
+    sendTcpAt(ci, r, .credit, k.ends[@backingInt(r)].peer, 0, &.{}, d.read + d.reclaimed);
+}
+
+/// The owed credits due by now, in (`conn_id`, direction) order, after the
+/// entries that land at this instant (design 17.7).
+fn departOwedCredits() void {
+    while (true) {
+        var best: ?usize = null;
+        var best_d: u1 = 0;
+        for (conns, 0..) |k, ci| {
+            if (!k.used) continue;
+            for (k.dirs, 0..) |d, di| {
+                const t = d.owed_at orelse continue;
+                if (t > clock_ns) continue;
+                if (best == null or k.id < conns[best.?].id) {
+                    best = ci;
+                    best_d = @intCast(di);
+                }
+            }
+        }
+        const ci = best orelse return;
+        departCredit(@intCast(ci), @fromBackingInt(@intCast(best_d)));
+        maybeRetire(ci);
+    }
+}
+
+/// `NetRecv` on stream socket `fd`, at the call (design 17.8). `.park`: the
+/// op (`c`, `id`) parked on the socket.
+pub fn streamRecv(fd: i32, bufs: anytype, c: *anyopaque, id: u32) StreamResult {
+    refuseOtherThread("sim socket receive");
+    const s = estSlot("NetRecv", fd);
+    checkIovecs("a receive", fd, bufs.len);
+    if (totalLen(bufs) == 0) panic("sim: a receive of 0 bytes on sim stream socket {d} is refused (t-4096's ruling; design 17.8, NetRecv line 1)", .{fd});
+    if (s.unresolved_recv) |u| panic("sim: a second receive while one is {s}, on sim stream socket {d} (op {d}; the new op {d}): an endpoint takes one unresolved receive at a time", .{ if (s.parked_recv != null) "parked" else "woken and not yet harvested", fd, u.id, id });
+    const r = recvEval(s, bufs);
+    if (r == .park) {
+        s.parked_recv = .{ .c = c, .id = id };
+        s.unresolved_recv = s.parked_recv;
+    }
+    return r;
+}
+
+/// A woken receive at its harvest, its socket checked first
+/// (`streamOpOnItsSocket`).
+pub fn streamHarvestRecv(fd: i32, bufs: anytype) StreamResult {
+    const s = streamSlot("a harvested receive", fd);
+    const r = recvEval(s, bufs);
+    if (r == .park) panic("sim: a woken receive on sim stream socket {d} has no result: only a receive takes bytes, and a second refuses while this one is unresolved (an invariant)", .{fd});
+    return r;
+}
+
+/// `NetSend` on stream socket `fd`, at the call (design 17.8).
+pub fn streamSend(fd: i32, bufs: anytype, c: *anyopaque, id: u32) StreamResult {
+    refuseOtherThread("sim socket send");
+    const s = estSlot("NetSend", fd);
+    checkIovecs("a send", fd, bufs.len);
+    if (totalLen(bufs) == 0) return .{ .n = 0 };
+    if (s.unresolved_send) |u| panic("sim: a second send while one is {s}, on sim stream socket {d} (op {d}; the new op {d}): an endpoint takes one unresolved send at a time", .{ if (s.parked_send != null) "parked" else "woken and not yet harvested", fd, u.id, id });
+    const r = sendEval(s, bufs);
+    if (r == .park) {
+        s.parked_send = .{ .c = c, .id = id };
+        s.unresolved_send = s.parked_send;
+    }
+    return r;
+}
+
+/// A woken send at its harvest, its socket checked first.
+pub fn streamHarvestSend(fd: i32, bufs: anytype) StreamResult {
+    const s = streamSlot("a harvested send", fd);
+    const r = sendEval(s, bufs);
+    if (r == .park) panic("sim: a woken send on sim stream socket {d} has no room: only a send uses room, and a window change while it is woken refuses (an invariant)", .{fd});
+    return r;
+}
+
+/// `shutdown` of a stream socket (design 17.8). `.receive` is refused.
+pub fn streamShutdown(fd: i32, how: ShutdownHow) error{SocketUnconnected}!void {
+    refuseOtherThread("sim socket shutdown");
+    const s = estSlot("shutdown", fd);
+    if (how == .receive) panic("sim: shutdown(.receive) on sim stream socket {d} is refused: the kernels differ (rows 6 and 17) and nobody calls it (design 17.4)", .{fd});
+    const ci = s.conn;
+    const e = endOf(s);
+    // Line 2, before line 3 (rows 37, 38 and 39w). `.both` stops here too.
+    if (e.reset_received or e.failed != null) return error.SocketUnconnected;
+    const shut_rd = how == .both and !e.shut_rd;
+    const discards = shut_rd and e.unreadLen() > 0;
+    // Before anything moves: the profile, and room on the wire.
+    const p: ?StreamProfile = if (discards) needProfile("row 17, shutdown(.both) with unread bytes") else stream_profile;
+    const releases = discards and p == .macos;
+    // Only what leaves now: the FIN, and the release's credit if it
+    // departs now rather than joining one already owed or paced.
+    const credit_now = releases and creditPlan(ci, otherSide(s.side)) == .departs;
+    const leaving = @as(usize, @intFromBool(!e.fin_out)) + @intFromBool(credit_now);
+    // The FIN and the credit go the same way: the credit is held exactly
+    // when the FIN is (`heldAtSend` before either), and then it replaces a
+    // held credit of that direction, which leaves the count.
+    if (leaving > 0) reserveTcp(leaving, @intFromBool(credit_now and heldAtSend(&conns[ci], s.side) and heldCredit(ci, s.side)));
+    if (!e.fin_out) {
+        e.fin_out = true;
+        sendTcp(ci, s.side, .fin, e.peer);
+        if (!e.fin_in) reservations.append(net_alloc, .{ .ip = e.local.ip, .port = e.local.port, .reuse = s.reuseaddr }) catch panic("sim: out of memory for a TIME_WAIT reservation", .{});
+        wakeSend(sockIndex(fd));
+    }
+    if (!shut_rd) return;
+    e.shut_rd = true;
+    wakeRecv(sockIndex(fd));
+    if (releases) {
+        // The window release (design 17.7): room freed without a read.
+        const n = discardUnread(ci, s.side, .both_discard);
+        conns[ci].dirs[@backingInt(otherSide(s.side))].reclaimed += n;
+        creditOwed(ci, otherSide(s.side));
+    }
+}
+
+/// `getpeername` of a stream socket: the peer while established and not
+/// reset; null where a kernel answers ENOTCONN or EINVAL (row 9), which the
+/// layer maps to `SocketUnconnected` in every build.
+pub fn streamPeer(fd: i32) ?Ip4 {
+    const s = streamSlot("getpeername", fd);
+    if (s.kind != .endpoint) return null;
+    const e = endOf(s);
+    if (e.phase != .est or e.reset_received or e.failed != null) return null;
+    return e.peer;
+}
+
+/// `FIONREAD` of a stream socket: its unread bytes (design 17.4).
+pub fn streamBytesReadable(fd: i32) usize {
+    return endOf(estSlot("bytesReadable (FIONREAD)", fd)).unreadLen();
+}
+
+fn checkWindow(bytes: u32) void {
+    if (bytes == 0 or bytes > max_stream_window) panic("sim: a stream window of {d} bytes: the bounds are 1 to {d} (design 17.7)", .{ bytes, max_stream_window });
+}
+
+fn checkChunkMode(mode: ChunkMode) void {
+    switch (mode) {
+        .fixed => |n| if (n == 0 or n > 65536) panic("sim: chunk mode .fixed = {d}: the bounds are 1 to 65536 (design 17.7)", .{n}),
+        else => {},
+    }
+}
+
+/// The window of connections made from now on, each direction.
+pub fn setStreamWindowDefault(bytes: u32) void {
+    refuseOtherThread("sim.setStreamWindowDefault");
+    if (!begun) panic("sim: setStreamWindowDefault outside a run", .{});
+    checkWindow(bytes);
+    window_default = bytes;
+}
+
+/// The window of the direction toward `fd`, at once and with no wire
+/// entry (design 17.7). Refused while the sender's send is woken and not
+/// harvested. A grow wakes a parked send if room appears; a shrink below
+/// what is in use discards nothing.
+pub fn setStreamWindow(fd: i32, bytes: u32) void {
+    refuseOtherThread("sim.setStreamWindow");
+    const s = estSlot("setStreamWindow", fd);
+    checkWindow(bytes);
+    const k = &conns[s.conn];
+    const sender = otherSide(s.side);
+    const x = k.ends[@backingInt(sender)];
+    const live_sender = x.phase == .est;
+    if (live_sender) {
+        const ps = streams[x.slot];
+        if (ps.unresolved_send != null and ps.parked_send == null) panic("sim: setStreamWindow on sim fd {d} while its peer's send is woken and not yet harvested: refused (design 17.7)", .{fd});
+    }
+    const d = &k.dirs[@backingInt(sender)];
+    d.window = bytes;
+    if (live_sender and d.room() > 0) wakeSend(x.slot);
+}
+
+/// The chunk mode of connections made from now on.
+pub fn setStreamChunkingDefault(mode: ChunkMode) void {
+    refuseOtherThread("sim.setStreamChunkingDefault");
+    if (!begun) panic("sim: setStreamChunkingDefault outside a run", .{});
+    checkChunkMode(mode);
+    chunking_default = mode;
+}
+
+/// The chunk mode of `fd`'s connection, both directions, for sends from
+/// now on.
+pub fn setStreamChunking(fd: i32, mode: ChunkMode) void {
+    refuseOtherThread("sim.setStreamChunking");
+    const s = estSlot("setStreamChunking", fd);
+    checkChunkMode(mode);
+    conns[s.conn].chunking = mode;
+}
+
+/// Starts an ev op on stream socket `fd`; records the slot's generation.
+pub fn streamOpStart(c: *anyopaque, fd: i32) u32 {
+    const id = allocOpId(c);
+    live[live_len - 1].on_stream = true;
+    if (isStreamFd(fd)) live[live_len - 1].sock_gen = dgram_gen[sockIndex(fd)];
+    return id;
+}
+
+/// Whether the live op (`c`, `id`) still has the stream socket it was
+/// submitted on: open, and of the generation it recorded. False after a
+/// close, also when a new socket reused the number since (in the same
+/// harvest batch, as for datagram sockets: `dgramOpOnItsSocket`).
+pub fn streamOpOnItsSocket(c: *anyopaque, id: u32, fd: i32) bool {
+    for (live[0..live_len]) |l| {
+        if (l.c == c and l.id == id) {
+            return isStreamFd(fd) and l.sock_gen != 0 and dgram_gen[sockIndex(fd)] == l.sock_gen;
+        }
+    }
+    panic("sim: op {d} on sim fd {d} is not live at its harvest", .{ id, fd });
+}
+
+pub fn streamOpDone(c: *anyopaque, id: u32) void {
+    pushDueAt(c, .stream, id, clock_ns);
+}
+
+/// Whether the live op (`c`, `id`) was submitted on a stream socket.
+pub fn isStreamOp(c: *anyopaque, id: u32) bool {
+    for (live[0..live_len]) |l| {
+        if (l.c == c and l.id == id) return l.on_stream;
+    }
+    return false;
+}
+
+/// `close` of a stream socket (design 17.6 and 17.8). Wakes an op waiting
+/// on it: its harvest ends it `FileDescriptorNotASocket` (the generation).
+/// How `failStream` kills an endpoint's transport.
+pub const StreamFailure = enum(u8) { reset = 1, timed_out = 2 };
+
+/// A local transport death of the endpoint behind `fd`, at the virtual time
+/// of the call: the host on the other side vanished, or the kernel gave up
+/// (design 17.9). Nothing goes on the wire, and the peer is not told.
+/// - In `C-syn`: the parked connect (if any) fails now,
+///   `ConnectionResetByPeer` for `.reset` and `Timeout` for `.timed_out`
+///   (`ConnectError` has no `ConnectionTimedOut`); the endpoint is
+///   `C-failed`, and a SYN-ACK that lands later gets no answer.
+/// - In `est`: a parked receive and a parked send are woken now. The first
+///   one harvested (the seed's harvest order) gets `ConnectionResetByPeer`
+///   or `ConnectionTimedOut`; after that, receives give 0 and sends
+///   `BrokenPipe`. Its held data, FIN and credits are discarded
+///   (`failed_sender`), its unread bytes too (`failed_receiver`), and a
+///   credit it owed never leaves (`stale_credit`). Its entries already on
+///   the wire still land at the peer. Entries that land on it later are
+///   dropped, with no answer. `shutdown` gives `SocketUnconnected`, and a
+///   close puts nothing on the wire.
+/// Refused: an fd that is not a connection's endpoint; any other phase; an
+/// endpoint that already failed, or that received a reset (its transport is
+/// already over).
+pub fn failStream(fd: i32, how: StreamFailure) void {
+    if (comptime !compiled_in) unreachable;
+    refuseOtherThread("sim.failStream");
+    if (!begun) panic("sim: failStream outside a sim run", .{});
+    const s = streamSlot("failStream", fd);
+    if (s.kind != .endpoint) panic("sim: failStream on sim fd {d}, a {s}: only a connection's endpoint can fail", .{ fd, kindName(s.kind) });
+    const ci = s.conn;
+    const e = endOf(s);
+    if (e.failed != null) panic("sim: failStream on sim fd {d}, which already failed", .{fd});
+    if (e.reset_received) panic("sim: failStream on sim fd {d}, which has received a reset: its transport is already over", .{fd});
+    const j = sockIndex(fd);
+    switch (e.phase) {
+        .c_syn => {
+            e.phase = .c_failed;
+            e.failed = how;
+            wakeStream(j);
+        },
+        .est => {
+            e.failed = how;
+            discardHeldOutbound(ci, s.side, .failed_sender);
+            const din = &conns[ci].dirs[@backingInt(otherSide(s.side))];
+            if (din.owed_at != null) {
+                din.owed_at = null;
+                stream_stats.stale_credit += 1;
+            }
+            _ = discardUnread(ci, s.side, .failed_receiver);
+            wakeRecv(j);
+            wakeSend(j);
+        },
+        else => panic("sim: failStream on sim fd {d}, whose connection is in phase {t}: only C-syn and est are simulated", .{ fd, e.phase }),
+    }
+}
+
+/// A client's SYN that is still held, discarded at its close (design 17.9
+/// item 9): it never makes server state, and the connection can retire.
+fn discardHeldSyn(ci: u16) void {
+    const k = &conns[ci];
+    if (k.held[@backingInt(Side.client)] == 0) return;
+    for (tcp_held.items, 0..) |h, i| {
+        if (h.conn != ci or h.dir != .client or h.kind != .syn) continue;
+        _ = tcp_held.orderedRemove(i);
+        k.held[@backingInt(Side.client)] -= 1;
+        stream_stats.syn_dropped_dead += 1;
+        discardHeld(h);
+        return;
+    }
+}
+
+pub fn streamClose(fd: i32) void {
+    refuseOtherThread("sim socket close");
+    const s = streamSlot("close", fd);
+    const j = sockIndex(fd);
+    wakeStream(j);
+    wakeRecv(j);
+    wakeSend(j);
+    switch (s.kind) {
+        .open => {},
+        .listener => closeListener(j),
+        .endpoint => closeEndpoint(s.conn, s.side, s.reuseaddr, s.linger0),
+    }
+    streams[j] = .{};
+}
+
+fn closeListener(j: usize) void {
+    for (&conns, 0..) |*k, ci| {
+        if (!k.used) continue;
+        const e = &k.ends[@backingInt(Side.server)];
+        if (e.phase != .s_prov and e.phase != .s_queued) continue;
+        if (e.listener_slot != j or e.listener_gen != dgram_gen[j]) continue;
+        const answer = !e.reset_received and !e.rst_sent;
+        if (answer) reserveTcp(1, 0);
+        _ = discardUnread(@intCast(ci), .server, .listener_closed);
+        e.phase = .dead;
+        if (answer) {
+            e.rst_sent = true;
+            sendTcp(@intCast(ci), .server, .rst, e.peer);
+        }
+        maybeRetire(ci);
+    }
+}
+
+/// Close of an endpoint's descriptor (design 17.8, close; 17.6 for the
+/// client phases).
+fn closeEndpoint(ci: u16, side: Side, reuse: bool, linger0: bool) void {
+    const e = &conns[ci].ends[@backingInt(side)];
+    switch (e.phase) {
+        // The SYN is dropped at its landing if it is on the wire, and
+        // discarded now if it is held (design 17.9 item 9); if it landed,
+        // the SYN-ACK is answered with an RST at its landing.
+        .c_syn, .c_failed => discardHeldSyn(ci),
+        .est => {
+            // Line 2: after a reset or a failure nothing goes on the wire;
+            // an endpoint sends at most one RST in its life.
+            const quiet = e.reset_received or e.rst_sent or e.failed != null;
+            const rst = !quiet and (e.unreadLen() > 0 or linger0);
+            const fin = !quiet and !rst and !e.fin_out;
+            // An RST first discards the held data, FIN and credits it
+            // goes behind (line 3 below): those leave the count.
+            if (rst or fin) reserveTcp(1, if (rst) heldOutbound(ci, side) else 0);
+            // Line 1, always (review 3, finding 6).
+            _ = discardUnread(ci, side, .unread_at_close);
+            if (rst) {
+                // Line 3: its held data, FIN and credits go first, so its
+                // RST is not held behind them.
+                discardHeldOutbound(ci, side, .abort);
+                e.rst_sent = true;
+                sendTcp(ci, side, .rst, e.peer);
+            } else if (fin) {
+                e.fin_out = true;
+                sendTcp(ci, side, .fin, e.peer);
+                if (!e.fin_in) {
+                    reservations.append(net_alloc, .{ .ip = e.local.ip, .port = e.local.port, .reuse = reuse }) catch panic("sim: out of memory for a TIME_WAIT reservation", .{});
+                }
+            }
+        },
+        else => panic("sim: close of an endpoint in phase {t}", .{e.phase}),
+    }
+    e.phase = .dead;
+    maybeRetire(ci);
+}
+
+fn maybeRetire(ci: usize) void {
+    const k = &conns[ci];
+    if (!k.used) return;
+    for (k.ends) |e| {
+        if (e.phase != .dead and e.phase != .absent) return;
+    }
+    for (tcp_wire.items) |w| {
+        if (w.conn == ci) return;
+    }
+    if (k.held[0] + k.held[1] != 0) return;
+    for (k.dirs) |d| {
+        if (d.owed_at != null) return;
+    }
+    for (&k.ends) |*e| e.unread.deinit(net_alloc);
+    k.* = .{};
+    stream_stats.retired += 1;
+}
+
+/// The listener a SYN to `to` reaches: bound to `to` exactly, else to
+/// 0.0.0.0 on its port.
+fn listenerAt(to: Ip4) ?usize {
+    var wildcard: ?usize = null;
+    for (streams, 0..) |s, j| {
+        if (!s.used or s.kind != .listener or s.local.port != to.port) continue;
+        if (std.mem.eql(u8, &s.local.ip, &to.ip)) return j;
+        if (isWildcard(s.local.ip)) wildcard = j;
+    }
+    return wildcard;
+}
+
+/// Lands every TCP entry due by now, in (landing time, `conn_id`,
+/// direction, sequence) order. An answer a landing sends is due later, so it
+/// is not in this pass.
+fn landStreamDue() void {
+    while (tcp_wire.items.len > 0 and tcp_wire.items[0].due_at <= clock_ns) {
+        const e = tcp_wire.orderedRemove(0);
+        if (tcp_rule_set and holdAtLanding(e)) continue;
+        landStream(e);
+    }
+}
+
+/// Holds `e` at its landing if a `.tcp` partition or silence matches it
+/// now, or its direction already holds an entry (design 17.9 items 1, 2
+/// and 6). A drop rule that matches it now was set after its send (one in
+/// force then would have held it), so it counts as matched here.
+fn holdAtLanding(e: TcpEntry) bool {
+    const k = &conns[e.conn];
+    if (!k.used or k.id != e.conn_id) panic("sim: a TCP entry of connection {d} landed after the connection retired (the guard that cannot fire by construction)", .{e.conn_id});
+    const from_addr, const to_addr = tcpPath(k, e.dir);
+    var matched = false;
+    for (rules[0..rules_len]) |*r| {
+        if (r.key != .impairment and r.key.protocol() == .tcp and r.key.matches(from_addr, to_addr)) {
+            countMatched(r);
+            matched = true;
+        }
+    }
+    if (!matched and k.held[@backingInt(e.dir)] == 0) return false;
+    // The later entries of its direction that are still on the wire are
+    // held behind it now (design 17.9 item 2), not at their own landing: a
+    // release before they land would put them ahead of it, and an abort
+    // would discard it and leave them to be delivered after a hole (sitting
+    // 33). So a direction that holds an entry has none on the wire behind
+    // it (`releaseHeld` checks this).
+    var later: usize = 0;
+    for (tcp_wire.items) |w| later += @intFromBool(w.conn == e.conn and w.dir == e.dir);
+    tcp_held.ensureUnusedCapacity(net_alloc, 1 + later) catch panic("sim: out of memory for a held TCP entry", .{});
+    stream_stats.held_at_landing += 1;
+    holdTcp(e);
+    var i: usize = 0;
+    while (later > 0 and i < tcp_wire.items.len) {
+        const w = tcp_wire.items[i];
+        if (w.conn != e.conn or w.dir != e.dir) {
+            i += 1;
+            continue;
+        }
+        _ = tcp_wire.orderedRemove(i);
+        later -= 1;
+        stream_stats.held_behind += 1;
+        holdTcp(w);
+    }
+    // Nothing of the direction is on the wire now: its fence must not be
+    // a pulled entry's time (`Conn.last_due`).
+    for (tcp_wire.items) |w| {
+        if (w.conn == e.conn and w.dir == e.dir) panic("sim: connection {d}: sequence {d} of a direction that holds an entry is still on the wire after the pull (an invariant)", .{ k.id, w.seq });
+    }
+    k.last_due[@backingInt(e.dir)] = clock_ns;
+    return true;
+}
+
+fn landStream(e: TcpEntry) void {
+    const k = &conns[e.conn];
+    if (!k.used or k.id != e.conn_id) panic("sim: a TCP entry of connection {d} landed after the connection retired (the guard that cannot fire by construction)", .{e.conn_id});
+    const at = otherSide(e.dir);
+    const outcome: StreamOutcome = switch (e.kind) {
+        .syn => landSyn(e),
+        .syn_ack => landSynAck(e.conn),
+        .ack => landAck(e.conn),
+        .fin => landFin(e.conn, at),
+        .rst => landRst(e.conn, at),
+        .data => landData(e),
+        .credit => landCredit(e.conn, at, e.count),
+    };
+    switch (outcome) {
+        .landed, .dropped_shut, .dropped_stale => {},
+        .dropped_dead_client => stream_stats.syn_dropped_dead += 1,
+        .dropped_dead => stream_stats.dropped_dead += 1,
+        .dropped_reset => stream_stats.dropped_after_reset += 1,
+        .dropped_failed => stream_stats.dropped_failed += 1,
+        .discarded_held => unreachable,
+    }
+    recordStream(e, outcome);
+    net_alloc.free(e.bytes);
+    maybeRetire(e.conn);
+}
+
+/// Records a TCP entry at its landing in the trace and the wire digest.
+fn recordStream(e: TcpEntry, outcome: StreamOutcome) void {
+    // Slice 1's kinds keep their records exactly: length 0, nothing after.
+    const a: u32 = (e.conn_id & 0xffff) | (@as(u32, @backingInt(e.kind)) << 16) | (@as(u32, @backingInt(e.dir)) << 20) | (@as(u32, @backingInt(outcome)) << 21);
+    emit(.stream, a, (@as(u32, @truncate(e.seq & 0xffff)) << 16) | @as(u32, @intCast(@min(e.bytes.len, 0xffff))));
+    var h: [27]u8 = undefined;
+    std.mem.writeInt(u64, h[0..8], e.due_at, .little);
+    std.mem.writeInt(u32, h[8..12], e.conn_id, .little);
+    h[12] = @backingInt(e.dir);
+    h[13] = @backingInt(e.kind);
+    h[14] = @backingInt(outcome);
+    std.mem.writeInt(u64, h[15..23], e.seq, .little);
+    std.mem.writeInt(u32, h[23..27], @intCast(e.bytes.len), .little);
+    wire_hasher.update(&h);
+    switch (e.kind) {
+        .data => wire_hasher.update(e.bytes),
+        .credit => {
+            var c: [8]u8 = undefined;
+            std.mem.writeInt(u64, &c, e.count, .little);
+            wire_hasher.update(&c);
+        },
+        else => {},
+    }
+}
+
+/// A SYN lands at its address (design 17.6).
+fn landSyn(e: TcpEntry) StreamOutcome {
+    const k = &conns[e.conn];
+    const cl = &k.ends[@backingInt(Side.client)];
+    if (cl.phase != .dead) reserveTcp(1, 0);
+    k.syn_landed = true;
+    if (cl.phase == .dead) return .dropped_dead_client;
+    const j = listenerAt(e.to) orelse {
+        stream_stats.refused += 1;
+        sendTcp(e.conn, .server, .rst, cl.local);
+        return .landed;
+    };
+    const l = streams[j];
+    if (listenerCount(j) >= l.backlog) panic("sim: a SYN to port {d} landed at a full listener (backlog {d}): accept queue full: backlog overflow is not simulated", .{ e.to.port, l.backlog });
+    k.ends[@backingInt(Side.server)] = .{ .phase = .s_prov, .local = e.to, .peer = cl.local, .listener_slot = @intCast(j), .listener_gen = dgram_gen[j], .nodelay = l.nodelay, .reuseaddr = l.reuseaddr, .linger0 = l.linger0 };
+    sendTcp(e.conn, .server, .syn_ack, cl.local);
+    return .landed;
+}
+
+/// A SYN-ACK lands at the client endpoint (design 17.6).
+fn landSynAck(ci: u16) StreamOutcome {
+    const cl = &conns[ci].ends[@backingInt(Side.client)];
+    // Line 1: a failed client answers nothing, closed or not (17.6).
+    if (cl.failed != null) return .dropped_failed;
+    switch (cl.phase) {
+        .dead => {
+            if (!cl.rst_sent) {
+                reserveTcp(1, 0);
+                cl.rst_sent = true;
+                sendTcp(ci, .client, .rst, cl.peer);
+            }
+            return .dropped_dead;
+        },
+        .c_syn => {
+            reserveTcp(1, 0);
+            cl.phase = .est;
+            wakeStream(cl.slot);
+            sendTcp(ci, .client, .ack, cl.peer);
+            return .landed;
+        },
+        else => panic("sim: a SYN-ACK landed at a client endpoint in phase {t}", .{cl.phase}),
+    }
+}
+
+/// An ACK lands at the server endpoint (design 17.6).
+fn landAck(ci: u16) StreamOutcome {
+    const sv = &conns[ci].ends[@backingInt(Side.server)];
+    switch (sv.phase) {
+        // Its listener closed: its RST is already on the way.
+        .dead => return .dropped_dead,
+        .s_prov => {
+            const l = &streams[sv.listener_slot];
+            sv.phase = .s_queued;
+            sv.queue_pos = l.next_queue_pos;
+            l.next_queue_pos += 1;
+            wakeStream(sv.listener_slot);
+            return .landed;
+        },
+        else => panic("sim: an ACK landed at a server endpoint in phase {t}", .{sv.phase}),
+    }
+}
+
+/// A FIN lands at side `at` (design 17.8).
+fn landFin(ci: u16, at: Side) StreamOutcome {
+    const x = &conns[ci].ends[@backingInt(at)];
+    if (x.failed != null) return .dropped_failed;
+    switch (x.phase) {
+        .dead => return .dropped_dead,
+        .s_queued, .est => {
+            if (x.reset_received) return .dropped_reset;
+            x.fin_in = true;
+            if (x.phase == .est) wakeRecv(x.slot);
+            return .landed;
+        },
+        else => panic("sim: a FIN landed at an endpoint in phase {t}", .{x.phase}),
+    }
+}
+
+/// An RST lands at side `at` (design 17.8's RST list; line 3 is review 3's
+/// finding 2).
+fn landRst(ci: u16, at: Side) StreamOutcome {
+    const x = &conns[ci].ends[@backingInt(at)];
+    if (x.failed != null) return .dropped_failed;
+    if (x.reset_received) return .dropped_reset;
+    switch (x.phase) {
+        .dead => return .dropped_dead,
+        // Its listener's count is its live endpoints, so it leaves the
+        // count by dying: one place of capacity is free again.
+        .s_prov => x.phase = .dead,
+        .c_syn => {
+            x.phase = .c_failed;
+            x.reset_received = true;
+            wakeStream(x.slot);
+        },
+        .s_queued, .est => {
+            // Profile-neutral (review 3, finding 9): the call that meets it
+            // reads the profile. Unread bytes stay, and are read first.
+            x.reset_received = true;
+            x.fin_before_reset = x.fin_in;
+            discardHeldOutbound(ci, at, .abort);
+            if (x.phase == .est) {
+                x.reset_parked_send = if (streams[x.slot].parked_send) |p| p.id else null;
+                wakeRecv(x.slot);
+                wakeSend(x.slot);
+            }
+        },
+        else => panic("sim: an RST landed at an endpoint in phase {t}", .{x.phase}),
+    }
+    return .landed;
+}
+
+/// Answers from side `at` with its one RST, if it has not sent one.
+fn answerRst(ci: u16, at: Side) void {
+    const x = &conns[ci].ends[@backingInt(at)];
+    if (x.rst_sent) return;
+    reserveTcp(1, 0);
+    x.rst_sent = true;
+    sendTcp(ci, at, .rst, x.peer);
+}
+
+/// A data chunk lands (design 17.8, the data landing list).
+fn landData(e: TcpEntry) StreamOutcome {
+    const k = &conns[e.conn];
+    const at = otherSide(e.dir);
+    const x = &k.ends[@backingInt(at)];
+    const d = &k.dirs[@backingInt(e.dir)];
+    const n = e.bytes.len;
+    if (x.failed != null) {
+        discardBytes(d, .failed_receiver, n);
+        return .dropped_failed;
+    }
+    if (x.reset_received) {
+        discardBytes(d, .after_reset, n);
+        return .dropped_reset;
+    }
+    switch (x.phase) {
+        .dead => {
+            answerRst(e.conn, at);
+            discardBytes(d, .closed_receiver, n);
+            return .dropped_dead;
+        },
+        .s_queued, .est => {},
+        else => panic("sim: a data chunk landed at an endpoint in phase {t}", .{x.phase}),
+    }
+    if (x.shut_rd) {
+        const p = needProfile("row 18, a data chunk that lands after the endpoint's own shutdown(.both)");
+        answerRst(e.conn, at);
+        discardBytes(d, .shut_receiver, n);
+        if (p == .linux) {
+            // A local reset (review 3, finding 5): the same facts as a
+            // landed RST, set once; a later chunk takes line 2 above.
+            x.reset_received = true;
+            x.fin_before_reset = false;
+            x.reset_parked_send = if (streams[x.slot].parked_send) |ps| ps.id else null;
+            discardHeldOutbound(e.conn, at, .abort);
+            stream_stats.local_resets += 1;
+            wakeRecv(x.slot);
+            wakeSend(x.slot);
+        }
+        return .dropped_shut;
+    }
+    x.unread.appendSlice(net_alloc, e.bytes) catch panic("sim: out of memory for {d} unread bytes", .{n});
+    stream_stats.chunks_landed += 1;
+    if (x.phase == .est) wakeRecv(x.slot);
+    return .landed;
+}
+
+/// A credit lands at side `at`, the sender of the direction it credits
+/// (design 17.8, the credit landing list).
+fn landCredit(ci: u16, at: Side, count: u64) StreamOutcome {
+    const k = &conns[ci];
+    const x = k.ends[@backingInt(at)];
+    if (dirTerminal(k, at)) {
+        stream_stats.stale_credit += 1;
+        return .dropped_stale;
+    }
+    const d = &k.dirs[@backingInt(at)];
+    if (count > d.admitted) panic("sim: a credit of {d} on connection {d} is past the {d} bytes admitted (an invariant)", .{ count, k.id, d.admitted });
+    // A direction's credits land in the order they left: no entry lands
+    // before the one sent before it in its direction (design 17.7), and a
+    // release of held entries keeps that order (17.9). A credit leaves only
+    // after a read or a window release of at least one byte since the last
+    // one left, so each carries a larger count. A count that is not larger
+    // means that order broke: a panic, not a silent max.
+    if (count <= d.credited) panic("sim: a credit of {d} on connection {d} landed after one of {d}: credits land in the order they left, each with a larger count (an invariant)", .{ count, k.id, d.credited });
+    d.credited = count;
+    stream_stats.credits_landed += 1;
+    if (x.phase == .est and d.room() > 0) wakeSend(x.slot);
+    return .landed;
+}
+
+/// What a test can see of one endpoint (`testStreamEnd`, `testConnEnd`).
+pub const TestStreamEnd = struct {
+    conn_id: u32,
+    phase: StreamPhase,
+    fin_in: bool,
+    fin_out: bool,
+    rst_sent: bool,
+    reset_received: bool,
+    fin_before_reset: bool,
+    local: Ip4,
+    peer: Ip4,
+    shut_rd: bool,
+    reset_reported: bool,
+    unread: usize,
+    failed: ?StreamFailure,
+    fail_reported: bool,
+};
+
+fn endView(ci: usize, side: Side) TestStreamEnd {
+    const e = conns[ci].ends[@backingInt(side)];
+    return .{ .conn_id = conns[ci].id, .phase = e.phase, .fin_in = e.fin_in, .fin_out = e.fin_out, .rst_sent = e.rst_sent, .reset_received = e.reset_received, .fin_before_reset = e.fin_before_reset, .local = e.local, .peer = e.peer, .shut_rd = e.shut_rd, .reset_reported = e.reset_reported, .unread = e.unreadLen(), .failed = e.failed, .fail_reported = e.fail_reported };
+}
+
+/// The endpoint behind stream socket `fd`, which must be an endpoint's
+/// descriptor.
+pub fn testStreamEnd(fd: i32) TestStreamEnd {
+    if (comptime !builtin.is_test) @compileError("testStreamEnd is for tests");
+    const s = streamSlot("testStreamEnd", fd);
+    if (s.kind != .endpoint) panic("sim: testStreamEnd on sim fd {d}, a {s}", .{ fd, kindName(s.kind) });
+    return endView(s.conn, s.side);
+}
+
+/// Side `server` (true) or client of connection `conn_id`; null once it
+/// retired.
+pub fn testConnEnd(conn_id: u32, server: bool) ?TestStreamEnd {
+    if (comptime !builtin.is_test) @compileError("testConnEnd is for tests");
+    for (conns, 0..) |k, ci| {
+        if (k.used and k.id == conn_id) return endView(ci, if (server) .server else .client);
+    }
+    return null;
+}
+
+/// What a test can see of one data direction (`testStreamDir`): its
+/// counters, the bytes of its chunks on the wire, and its receiver's unread
+/// bytes, so a test can check conservation (design 17.7).
+pub const TestStreamDir = struct {
+    window: u32,
+    admitted: u64,
+    credited: u64,
+    read: u64,
+    reclaimed: u64,
+    discarded: [@typeInfo(Discard).@"enum".field_names.len]u64,
+    in_flight: u64,
+    /// Data bytes held by a `.tcp` partition or silence, and the entries of
+    /// every kind this direction holds (design 17.9).
+    held: u64,
+    held_entries: u32,
+    unread: u64,
+    data_send_index: u64,
+    owed: bool,
+
+    pub fn discardedTotal(d: TestStreamDir) u64 {
+        var n: u64 = 0;
+        for (d.discarded) |v| n += v;
+        return n;
+    }
+
+    /// `admitted = in_flight + held + unread + read + discarded` (design
+    /// 17.7).
+    pub fn conserved(d: TestStreamDir) bool {
+        return d.admitted == d.in_flight + d.held + d.unread + d.read + d.discardedTotal();
+    }
+};
+
+/// The data direction of connection `conn_id` from its client (`from_client`)
+/// or from its server; null once it retired.
+pub fn testStreamDir(conn_id: u32, from_client: bool) ?TestStreamDir {
+    if (comptime !builtin.is_test) @compileError("testStreamDir is for tests");
+    for (conns, 0..) |k, ci| {
+        if (!k.used or k.id != conn_id) continue;
+        const side: Side = if (from_client) .client else .server;
+        const d = k.dirs[@backingInt(side)];
+        var in_flight: u64 = 0;
+        for (tcp_wire.items) |w| {
+            if (w.conn == ci and w.kind == .data and w.dir == side) in_flight += w.bytes.len;
+        }
+        var held: u64 = 0;
+        for (tcp_held.items) |w| {
+            if (w.conn == ci and w.kind == .data and w.dir == side) held += w.bytes.len;
+        }
+        return .{ .window = d.window, .admitted = d.admitted, .credited = d.credited, .read = d.read, .reclaimed = d.reclaimed, .discarded = d.discarded, .in_flight = in_flight, .held = held, .held_entries = k.held[@backingInt(side)], .unread = k.ends[@backingInt(otherSide(side))].unreadLen(), .data_send_index = d.data_send_index, .owed = d.owed_at != null };
+    }
+    return null;
+}
+
+/// The landing times of the TCP entries on the wire, in landing order.
+pub fn testTcpWireDues(out: []u64) usize {
+    if (comptime !builtin.is_test) @compileError("testTcpWireDues is for tests");
+    if (tcp_wire.items.len > out.len) panic("sim: testTcpWireDues: {d} entries on the wire, room for {d}", .{ tcp_wire.items.len, out.len });
+    for (tcp_wire.items, 0..) |w, i| out[i] = w.due_at;
+    return tcp_wire.items.len;
+}
+
+/// Whether a receive and a send are parked on stream socket `fd`: waiting
+/// on it, not yet woken. A woken op is due and no longer parked, so a test
+/// can tell "woken, not harvested" from "still waiting".
+pub fn testStreamParked(fd: i32) struct { recv: bool, send: bool } {
+    if (comptime !builtin.is_test) @compileError("testStreamParked is for tests");
+    const s = streams[sockIndex(fd)];
+    return .{ .recv = s.parked_recv != null, .send = s.parked_send != null };
+}
+
+/// One TCP entry as a test sees it (`testTcpEntries`).
+pub const TestTcpEntry = struct {
+    conn_id: u32,
+    from_client: bool,
+    seq: u64,
+    kind: TcpKind,
+    /// A credit's count; 0 for other kinds.
+    count: u64,
+    /// A data chunk's length; 0 for other kinds.
+    len: usize,
+    /// Its landing time on the wire; 0 for a held entry (it has none until
+    /// it is released).
+    due_at: u64,
+};
+
+/// The TCP entries on the wire (in landing order) or held (in (`conn_id`,
+/// direction, sequence) order), for a test that keeps its own copy of
+/// them: it can name the entry that differs, not only a time or a count.
+pub fn testTcpEntries(held: bool, out: []TestTcpEntry) usize {
+    if (comptime !builtin.is_test) @compileError("testTcpEntries is for tests");
+    const list = if (held) tcp_held.items else tcp_wire.items;
+    if (list.len > out.len) panic("sim: testTcpEntries: {d} entries, room for {d}", .{ list.len, out.len });
+    for (list, 0..) |w, i| out[i] = .{ .conn_id = w.conn_id, .from_client = w.dir == .client, .seq = w.seq, .kind = w.kind, .count = w.count, .len = w.bytes.len, .due_at = if (held) 0 else w.due_at };
+    return list.len;
+}
+
+/// Moves the next `conn_id` of this run, to reach its limit in a test.
+pub fn testSetNextConnId(id: u32) void {
+    if (comptime !builtin.is_test) @compileError("testSetNextConnId is for tests");
+    if (!begun) panic("sim: testSetNextConnId outside a run", .{});
+    next_conn_id = id;
+}
+
+/// Moves the TCP port counter of this run, to reach the top of the range in
+/// a test.
+pub fn testSetNextTcpPort(port: u16) void {
+    if (comptime !builtin.is_test) @compileError("testSetNextTcpPort is for tests");
+    if (!begun) panic("sim: testSetNextTcpPort outside a run", .{});
+    if (port < first_ephemeral_port) panic("sim: testSetNextTcpPort({d}): below the ephemeral range", .{port});
+    tcp_next_port = port;
+}
+
+/// Live `S-prov` and `S-queued` endpoints of listener `fd`.
+pub fn testListenerCount(fd: i32) usize {
+    if (comptime !builtin.is_test) @compileError("testListenerCount is for tests");
+    const s = streamSlot("testListenerCount", fd);
+    if (s.kind != .listener) panic("sim: testListenerCount on sim fd {d}, a {s}", .{ fd, kindName(s.kind) });
+    return listenerCount(sockIndex(fd));
+}
+
+/// Connections in the table now (not retired).
+pub fn testConnsLive() usize {
+    if (comptime !builtin.is_test) @compileError("testConnsLive is for tests");
+    var n: usize = 0;
+    for (conns) |k| n += @intFromBool(k.used);
+    return n;
+}
+
+/// The teardown check at `sim.end`, before anything is freed (design 17.15
+/// item 3).
+fn streamTeardownCheck() void {
+    var left: usize = 0;
+    for (streams, 0..) |s, j| {
+        if (!s.used) continue;
+        left += 1;
+        std.debug.print("sim: stream teardown: sim fd {d} is open, a {s}{s}\n", .{ fd_base + max_ends + @as(i32, @intCast(j)), kindName(s.kind), if (s.unresolved != null or s.unresolved_recv != null or s.unresolved_send != null) ", with an op unresolved" else "" });
+    }
+    for (live[0..live_len]) |l| {
+        if (!l.on_stream) continue;
+        left += 1;
+        std.debug.print("sim: stream teardown: op {d} on a stream socket is unresolved\n", .{l.id});
+    }
+    for (conns) |k| {
+        if (!k.used) continue;
+        left += 1;
+        var on_wire: usize = 0;
+        for (tcp_wire.items) |w| {
+            if (w.conn_id == k.id) on_wire += 1;
+        }
+        std.debug.print("sim: stream teardown: connection {d} is not retired: client {t}, server {t}, {d} entries on the wire, {d} held, credits owed {}/{}\n", .{ k.id, k.ends[0].phase, k.ends[1].phase, on_wire, k.held[0] + k.held[1], k.dirs[0].owed_at != null, k.dirs[1].owed_at != null });
+    }
+    if (reservations.items.len != 0) {
+        std.debug.print("sim: stream teardown: {d} TIME_WAIT reservations, expected, freed\n", .{reservations.items.len});
+        reservations.clearRetainingCapacity();
+    }
+    if (reservations.items.len != 0) panic("sim: stream teardown: reservations remain after they were freed", .{});
+    if (left != 0) panic("sim: stream teardown: {d} stream objects remain at sim.end (listed above): close every stream socket, then sleep while sim.streamEntriesInFlight() is not 0", .{left});
+}
+
+fn digestChunkMode(h: *std.hash.Wyhash, m: ChunkMode) void {
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b, switch (m) {
+        .hashed => 1 << 32,
+        .off => 2 << 32,
+        .fixed => |n| (3 << 32) | @as(u64, n),
+    }, .little);
+    h.update(&b);
+}
+
+/// The stream part of `stateDigest`, for a run that opened a stream socket:
+/// every setting and state that can change the future (design 17.11, as
+/// far as slice 1 has them).
+fn digestStreams(h: *std.hash.Wyhash) void {
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b, (@as(u64, if (stream_profile) |p| @backingInt(p) else 0) << 56) | (@as(u64, tcp_next_port) << 32) | next_conn_id, .little);
+    h.update(&b);
+    std.mem.writeInt(u64, &b, window_default, .little);
+    h.update(&b);
+    digestChunkMode(h, chunking_default);
+    for (dgram_gen) |g| {
+        std.mem.writeInt(u32, b[0..4], g, .little);
+        h.update(b[0..4]);
+    }
+    for (reservations.items) |r| {
+        var e: [7]u8 = undefined;
+        @memcpy(e[0..4], &r.ip);
+        std.mem.writeInt(u16, e[4..6], r.port, .little);
+        e[6] = @intFromBool(r.reuse);
+        h.update(&e);
+    }
+    for (tcp_wire.items) |w| {
+        var e: [32]u8 = undefined;
+        std.mem.writeInt(u64, e[0..8], w.due_at, .little);
+        std.mem.writeInt(u32, e[8..12], w.conn_id, .little);
+        e[12] = @backingInt(w.dir);
+        e[13] = @backingInt(w.kind);
+        std.mem.writeInt(u64, e[14..22], w.seq, .little);
+        @memcpy(e[22..26], &w.to.ip);
+        std.mem.writeInt(u16, e[26..28], w.to.port, .little);
+        std.mem.writeInt(u32, e[28..32], @intCast(w.bytes.len), .little);
+        h.update(&e);
+        h.update(w.bytes);
+        std.mem.writeInt(u64, &b, w.count, .little);
+        h.update(&b);
+    }
+    for (streams) |s| {
+        var e: [36]u8 = undefined;
+        e[0] = @intFromBool(s.used) | (@as(u8, @intFromBool(s.bound)) << 1) | (@as(u8, @intFromBool(s.nonblocking)) << 2) | (@as(u8, @intFromBool(s.nodelay)) << 3) | (@as(u8, @intFromBool(s.reuseaddr)) << 4) | (@as(u8, @backingInt(s.side)) << 5);
+        e[1] = @backingInt(s.kind);
+        @memcpy(e[2..6], &s.local.ip);
+        std.mem.writeInt(u16, e[6..8], s.local.port, .little);
+        std.mem.writeInt(u16, e[8..10], s.backlog, .little);
+        std.mem.writeInt(u64, e[10..18], s.next_queue_pos, .little);
+        std.mem.writeInt(u16, e[18..20], s.conn, .little);
+        std.mem.writeInt(u32, e[20..24], if (s.parked) |p| p.id else 0, .little);
+        std.mem.writeInt(u32, e[24..28], if (s.unresolved) |p| p.id else 0, .little);
+        e[28] = @intFromBool(s.linger0);
+        @memset(e[29..36], 0);
+        h.update(&e);
+        var q: [16]u8 = undefined;
+        std.mem.writeInt(u32, q[0..4], if (s.parked_recv) |x| x.id else 0, .little);
+        std.mem.writeInt(u32, q[4..8], if (s.unresolved_recv) |x| x.id else 0, .little);
+        std.mem.writeInt(u32, q[8..12], if (s.parked_send) |x| x.id else 0, .little);
+        std.mem.writeInt(u32, q[12..16], if (s.unresolved_send) |x| x.id else 0, .little);
+        h.update(&q);
+    }
+    for (conns) |k| {
+        if (!k.used) continue;
+        var e: [21]u8 = undefined;
+        std.mem.writeInt(u32, e[0..4], k.id, .little);
+        std.mem.writeInt(u64, e[4..12], k.next_seq[0], .little);
+        std.mem.writeInt(u64, e[12..20], k.next_seq[1], .little);
+        e[20] = @intFromBool(k.syn_landed);
+        h.update(&e);
+        for (k.ends) |x| {
+            var f: [32]u8 = undefined;
+            f[0] = @backingInt(x.phase);
+            f[1] = x.slot;
+            f[2] = @intFromBool(x.fin_in) | (@as(u8, @intFromBool(x.fin_out)) << 1) | (@as(u8, @intFromBool(x.rst_sent)) << 2) | (@as(u8, @intFromBool(x.reset_received)) << 3) | (@as(u8, @intFromBool(x.fin_before_reset)) << 4) | (@as(u8, @intFromBool(x.nodelay)) << 5) | (@as(u8, @intFromBool(x.reuseaddr)) << 6);
+            @memcpy(f[3..7], &x.local.ip);
+            std.mem.writeInt(u16, f[7..9], x.local.port, .little);
+            @memcpy(f[9..13], &x.peer.ip);
+            std.mem.writeInt(u16, f[13..15], x.peer.port, .little);
+            f[15] = x.listener_slot;
+            std.mem.writeInt(u32, f[16..20], x.listener_gen, .little);
+            std.mem.writeInt(u64, f[20..28], x.queue_pos, .little);
+            f[28] = @intFromBool(x.linger0) | (@as(u8, @intFromBool(x.shut_rd)) << 1) | (@as(u8, @intFromBool(x.reset_reported)) << 2) | (@as(u8, @intFromBool(x.reset_parked_send != null)) << 3);
+            @memset(f[29..32], 0);
+            h.update(&f);
+            // Hashed only when set, so a run that never sets it keeps its
+            // digests.
+            if (x.reset_parked_send) |id| {
+                var g: [4]u8 = undefined;
+                std.mem.writeInt(u32, &g, id, .little);
+                h.update(&g);
+            }
+            // The same for a failure (slice 3).
+            if (x.failed) |how| h.update(&.{ @backingInt(how), @intFromBool(x.fail_reported) });
+            std.mem.writeInt(u64, &b, x.unreadLen(), .little);
+            h.update(&b);
+            h.update(x.unread.items[x.unread_head..]);
+        }
+        for (k.last_due) |t| {
+            std.mem.writeInt(u64, &b, t, .little);
+            h.update(&b);
+        }
+        digestChunkMode(h, k.chunking);
+        for (k.dirs) |d| {
+            for ([_]u64{ d.window, d.admitted, d.credited, d.read, d.reclaimed, d.data_send_index, d.last_credit_at orelse std.math.maxInt(u64), d.owed_at orelse std.math.maxInt(u64) }) |v| {
+                std.mem.writeInt(u64, &b, v, .little);
+                h.update(&b);
+            }
+            for (d.discarded) |v| {
+                std.mem.writeInt(u64, &b, v, .little);
+                h.update(&b);
+            }
+        }
+    }
+    for ([_]u64{ stream_stats.stale_credit, stream_stats.local_resets, stream_stats.chunks_landed, stream_stats.credits_landed }) |v| {
+        std.mem.writeInt(u64, &b, v, .little);
+        h.update(&b);
+    }
+    std.mem.writeInt(u64, &b, stream_stats.retired, .little);
+    h.update(&b);
+    // Slice 3, only for a run that set a `.tcp` rule (a run without one
+    // keeps its digests): every held entry, each one's extra time, the
+    // held counts per direction, the draws and the fault counts.
+    if (tcp_rule_set) {
+        for (tcp_held.items) |w| {
+            var e: [40]u8 = undefined;
+            std.mem.writeInt(u32, e[0..4], w.conn_id, .little);
+            e[4] = @backingInt(w.dir);
+            e[5] = @backingInt(w.kind);
+            std.mem.writeInt(u64, e[6..14], w.seq, .little);
+            std.mem.writeInt(u64, e[14..22], w.extra_ns, .little);
+            std.mem.writeInt(u64, e[22..30], w.count, .little);
+            std.mem.writeInt(u32, e[30..34], @intCast(w.bytes.len), .little);
+            @memcpy(e[34..38], &w.to.ip);
+            std.mem.writeInt(u16, e[38..40], w.to.port, .little);
+            h.update(&e);
+            h.update(w.bytes);
+        }
+        for (tcp_wire.items) |w| {
+            std.mem.writeInt(u64, &b, w.extra_ns, .little);
+            h.update(&b);
+        }
+        for (conns) |k| {
+            if (!k.used) continue;
+            std.mem.writeInt(u64, &b, (@as(u64, k.held[0]) << 32) | k.held[1], .little);
+            h.update(&b);
+        }
+        for ([_]u64{ stream_fault_draws, stream_stats.held_at_send, stream_stats.held_at_landing, stream_stats.held_behind, stream_stats.released, stream_stats.credits_coalesced, stream_stats.discarded_held, stream_stats.delayed, stream_stats.dropped_failed }) |v| {
+            std.mem.writeInt(u64, &b, v, .little);
+            h.update(&b);
+        }
+    }
+}
+
+/// Jitter draws of `.tcp` rules in this run (design 17.9a, point 4).
+pub fn streamFaultDraws() u64 {
+    return stream_fault_draws;
+}
+
 // ---- Datagram faults (phase 2 of the sim network) ----
 //
 // A test sets fault rules during a run, from a task, at the virtual time
 // that task runs; they act on datagrams sent (and landing) from then on.
 // `begin` starts a run with no rule. Every call is on the sim thread, during
 // a run. The sender of a faulted datagram succeeds, as a kernel's does.
+// This block is about rules whose endpoints say `.protocol = .udp` (the
+// default): only those act on datagrams, and "a run that set a rule" below
+// means a `.udp` rule. A `.tcp` rule acts on stream sockets instead (the
+// faults paragraph of the comment above `StreamProfile`).
 //
 // Rules, of three kinds:
 // - An impairment (`setImpairment`) on a `Path`: loss, burst loss, delay,
@@ -2162,6 +5475,9 @@ fn isFlowHead(rest: []const WireDatagram, k: usize) bool {
 pub const Endpoint = struct {
     ip: ?[4]u8 = null,
     port: ?u16 = null,
+    /// What the rule acts on: datagrams (`.udp`) or a stream's TCP entries
+    /// (`.tcp`). A path's two endpoints name one protocol.
+    protocol: Protocol = .udp,
 
     fn matches(e: Endpoint, a: Ip4) bool {
         if (e.ip) |ip| {
@@ -2173,6 +5489,8 @@ pub const Endpoint = struct {
         return true;
     }
 };
+
+pub const Protocol = enum(u8) { udp = 1, tcp = 2 };
 
 /// One direction: datagrams from `from` to `to`. `.{}` matches every
 /// datagram.
@@ -2261,6 +5579,13 @@ const RuleKey = union(RuleKind) {
             .silence => |e| e.matches(from) or e.matches(to),
         };
     }
+
+    fn protocol(k: RuleKey) Protocol {
+        return switch (k) {
+            .impairment, .partition => |p| p.from.protocol,
+            .silence => |e| e.protocol,
+        };
+    }
 };
 
 const Rule = struct {
@@ -2283,6 +5608,13 @@ var rules_len: usize = 0;
 const HistoryEntry = struct { key: RuleKey, matched: u64, first_set_ns: u64 };
 var rule_history: [max_rule_history]HistoryEntry = undefined;
 var rule_history_len: usize = 0;
+/// Whether this run ever set a `.udp` rule (its datagrams take the fault
+/// path from then on), or a `.tcp` one (its TCP entries do).
+/// When this run first set a `.udp` rule: `no_rule` before. A death after
+/// it was under a rule, wherever it is harvested (`addGhost`).
+var udp_rule_since: u64 = no_rule;
+const no_rule = std.math.maxInt(u64);
+var tcp_rule_set: bool = false;
 
 var fault_stats: NetFaultStats = .{};
 var fault_draws: u64 = 0;
@@ -2336,12 +5668,13 @@ fn countMatched(r: *Rule) void {
     rule_history[r.hist].matched += 1;
 }
 
-/// The most recent drop rule of `kind` in force that matches the flow.
-fn dropRule(kind: RuleKind, from: Ip4, to: Ip4) ?*Rule {
+/// The most recent rule of `kind` and `proto` in force that matches the
+/// flow.
+fn dropRule(kind: RuleKind, proto: Protocol, from: Ip4, to: Ip4) ?*Rule {
     var i = rules_len;
     while (i > 0) {
         i -= 1;
-        if (rules[i].key == kind and rules[i].key.matches(from, to)) return &rules[i];
+        if (rules[i].key == kind and rules[i].key.protocol() == proto and rules[i].key.matches(from, to)) return &rules[i];
     }
     return null;
 }
@@ -2370,7 +5703,7 @@ fn flowLatest(from: Ip4, to: Ip4) ?u64 {
 /// delayed by a rule may still be on the wire).
 fn faultAtSend(send_no: u64, from: Ip4, to: Ip4) SendFate {
     if (faultDrop(send_no, from, to)) |outcome| return .{ .dropped = outcome };
-    const r = dropRule(.impairment, from, to);
+    const r = dropRule(.impairment, .udp, from, to);
     const imp: Impairment = if (r) |x| x.imp else .{};
     const base = clock_ns + wire_latency_ns;
     var fate: SendFate = .{ .sent = .{ .copies = 1, .due = .{ base, base } } };
@@ -2405,19 +5738,19 @@ fn faultAtSend(send_no: u64, from: Ip4, to: Ip4) SendFate {
 /// The drop decisions at a datagram's send. Null: it goes on the wire.
 fn faultDrop(send_no: u64, from: Ip4, to: Ip4) ?LandOutcome {
     for (rules[0..rules_len]) |*r| {
-        if (r.key.matches(from, to)) countMatched(r);
+        if (r.key.protocol() == .udp and r.key.matches(from, to)) countMatched(r);
     }
-    if (dropRule(.silence, from, to)) |r| {
+    if (dropRule(.silence, .udp, from, to)) |r| {
         r.stats.dropped += 1;
         fault_stats.silenced_at_send += 1;
         return .silenced;
     }
-    if (dropRule(.partition, from, to)) |r| {
+    if (dropRule(.partition, .udp, from, to)) |r| {
         r.stats.dropped += 1;
         fault_stats.partitioned_at_send += 1;
         return .partitioned;
     }
-    const r = dropRule(.impairment, from, to) orelse return null;
+    const r = dropRule(.impairment, .udp, from, to) orelse return null;
     if (r.imp.burst) |b| {
         if (r.bad) {
             if (happens(b.leave_ppm, send_no, .burst)) r.bad = false;
@@ -2443,14 +5776,14 @@ fn faultDrop(send_no: u64, from: Ip4, to: Ip4) ?LandOutcome {
 /// counting it as matched here counts no datagram twice for one rule.
 fn faultInFlight(from: Ip4, to: Ip4) ?LandOutcome {
     for (rules[0..rules_len]) |*r| {
-        if (r.key != .impairment and r.key.matches(from, to)) countMatched(r);
+        if (r.key != .impairment and r.key.protocol() == .udp and r.key.matches(from, to)) countMatched(r);
     }
-    if (dropRule(.silence, from, to)) |r| {
+    if (dropRule(.silence, .udp, from, to)) |r| {
         r.stats.dropped += 1;
         fault_stats.silenced_in_flight += 1;
         return .silenced_in_flight;
     }
-    if (dropRule(.partition, from, to)) |r| {
+    if (dropRule(.partition, .udp, from, to)) |r| {
         r.stats.dropped += 1;
         fault_stats.partitioned_in_flight += 1;
         return .partitioned_in_flight;
@@ -2475,6 +5808,7 @@ fn checkEndpoint(comptime what: []const u8, e: Endpoint) void {
 fn checkPath(comptime what: []const u8, p: Path) void {
     checkEndpoint(what, p.from);
     checkEndpoint(what, p.to);
+    if (p.from.protocol != p.to.protocol) panic("sim: " ++ what ++ ": a path from a {t} endpoint to a {t} one: both ends name one protocol", .{ p.from.protocol, p.to.protocol });
 }
 
 fn checkPpm(comptime what: []const u8, comptime field: []const u8, ppm: u32) void {
@@ -2507,6 +5841,10 @@ fn addRule(comptime what: []const u8, key: RuleKey, imp: Impairment) void {
     };
     rules[rules_len] = .{ .key = key, .imp = imp, .hist = hist };
     rules_len += 1;
+    switch (key.protocol()) {
+        .udp => udp_rule_since = @min(udp_rule_since, clock_ns),
+        .tcp => tcp_rule_set = true,
+    }
 }
 
 /// Sets the impairment of `path`, replacing one already there (its burst
@@ -2526,6 +5864,14 @@ pub fn setImpairment(path: Path, imp: Impairment) void {
         panic("sim: setImpairment: delay_ns {d} plus jitter_ns {d} is over {d} ns", .{ imp.delay_ns, imp.jitter_ns, max_fault_delay_ns });
     }
     if (std.meta.eql(imp, Impairment{})) panic("sim: setImpairment with every field at its default: clearImpairment removes an impairment", .{});
+    if (path.from.protocol == .tcp) {
+        // Design 17.9: TCP does not lose, copy or reorder; a partition or
+        // silence holds entries instead.
+        if (imp.loss_ppm != 0) panic("sim: setImpairment: loss_ppm on a .tcp path is refused: a stream loses nothing (a partition or silence holds entries)", .{});
+        if (imp.burst != null) panic("sim: setImpairment: burst on a .tcp path is refused: a stream loses nothing (a partition or silence holds entries)", .{});
+        if (imp.dup_ppm != 0) panic("sim: setImpairment: dup_ppm on a .tcp path is refused: a stream delivers each byte once", .{});
+        if (imp.reorder) panic("sim: setImpairment: reorder on a .tcp path is refused: a stream delivers in order", .{});
+    }
     if (findRule(.{ .impairment = path })) |i| _ = removeRule(i);
     addRule("setImpairment", .{ .impairment = path }, imp);
 }
@@ -2548,7 +5894,9 @@ pub fn setPartition(path: Path) void {
 pub fn healPartition(path: Path) RuleStats {
     faultCall("healPartition");
     const i = findRule(.{ .partition = path }) orelse panic("sim: healPartition of a path that is not partitioned", .{});
-    return removeRule(i);
+    const st = removeRule(i);
+    if (path.from.protocol == .tcp) releaseHeld();
+    return st;
 }
 
 /// Drops every datagram from or to `ep`, at send and in flight.
@@ -2562,12 +5910,15 @@ pub fn silence(ep: Endpoint) void {
 pub fn unsilence(ep: Endpoint) RuleStats {
     faultCall("unsilence");
     const i = findRule(.{ .silence = ep }) orelse panic("sim: unsilence of an endpoint that is not silenced", .{});
-    return removeRule(i);
+    const st = removeRule(i);
+    if (ep.protocol == .tcp) releaseHeld();
+    return st;
 }
 
 fn writeEndpoint(w: *std.Io.Writer, e: Endpoint) !void {
     if (e.ip) |ip| try w.print("{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) else try w.writeByte('*');
     if (e.port) |p| try w.print(":{d}", .{p}) else try w.writeAll(":*");
+    if (e.protocol == .tcp) try w.writeAll("/tcp");
 }
 
 /// Panics, naming each one, unless every fault rule set in this run matched
@@ -2608,7 +5959,9 @@ fn describeRule(w: *std.Io.Writer, h: HistoryEntry, first: bool) !void {
 
 fn hashEndpoint(h: *std.hash.Wyhash, e: Endpoint) void {
     var b: [7]u8 = @splat(0);
-    b[0] = @as(u8, @intFromBool(e.ip != null)) | (@as(u8, @intFromBool(e.port != null)) << 1);
+    // The protocol's bit is set only for `.tcp`, so a `.udp` rule's record
+    // is what it was before slice 3 (design 17.9a, point 2).
+    b[0] = @as(u8, @intFromBool(e.ip != null)) | (@as(u8, @intFromBool(e.port != null)) << 1) | (@as(u8, @intFromBool(e.protocol == .tcp)) << 2);
     if (e.ip) |ip| @memcpy(b[1..5], &ip);
     if (e.port) |p| std.mem.writeInt(u16, b[5..7], p, .little);
     h.update(&b);
@@ -2820,7 +6173,21 @@ pub fn noCoreDump() void {
     std.posix.setrlimit(.CORE, .{ .cur = 0, .max = 0 }) catch {};
 }
 
-fn expectChildPanics(comptime test_name: []const u8, comptime want: []const u8) !void {
+pub fn expectChildPanics(comptime test_name: []const u8, comptime want: []const u8) !void {
+    _ = try runPanicChild(test_name, want);
+}
+
+/// `expectChildPanics`, and the child must end within `max_ms` of wall
+/// time. Prints how long it took.
+fn expectChildPanicsWithin(comptime test_name: []const u8, comptime want: []const u8, max_ms: u64) !void {
+    const ns = try runPanicChild(test_name, want);
+    std.debug.print("child of \"{s}\" panicked after {d} ms of wall time (at most {d})\n", .{ test_name, ns / std.time.ns_per_ms, max_ms });
+    if (ns > max_ms * std.time.ns_per_ms) return error.ChildTooSlow;
+}
+
+/// Runs the test `test_name` in a child process and checks it panics with
+/// `want`; returns the child's wall time in ns.
+fn runPanicChild(comptime test_name: []const u8, comptime want: []const u8) !u64 {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -2832,6 +6199,7 @@ fn expectChildPanics(comptime test_name: []const u8, comptime want: []const u8) 
     try env.put("TEST_FILTER", test_name);
     try env.put(death_child_env, "1");
 
+    const started = std.Io.Timestamp.now(io, .awake);
     const res = std.process.run(gpa, io, .{
         .argv = &.{exe_buf[0..exe_len]},
         .environ_map = &env,
@@ -2855,16 +6223,26 @@ fn expectChildPanics(comptime test_name: []const u8, comptime want: []const u8) 
         std.debug.print("child of \"{s}\": term {any}, wanted SIGABRT and \"{s}\"; stderr:\n{s}\n", .{ test_name, res.term, want, res.stderr });
         return error.ChildDidNotPanic;
     }
+    return @intCast(started.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds);
 }
 
 /// Whether a line of `stderr` is the panic itself saying `want`: the line
 /// `refuse` writes, or `thread <n> panic: <want>`. A plain substring match is
 /// not enough: a panic's stack trace prints source lines, and the test's own
-/// line holds `want` as a literal, so any other panic would match it.
+/// line holds `want` as a literal, so any other panic would match it. A line
+/// may start with the test runner's progress clear (`\r` and `ESC [0K`),
+/// which the child's first line of stderr carries; it is skipped.
 pub fn hasPanicLine(stderr: []const u8, want: []const u8) bool {
     var it = std.mem.splitScalar(u8, stderr, '\n');
     while (it.next()) |raw| {
         var line = raw;
+        while (true) {
+            if (std.mem.startsWith(u8, line, "\r")) {
+                line = line[1..];
+            } else if (std.mem.startsWith(u8, line, "\x1b[0K")) {
+                line = line[4..];
+            } else break;
+        }
         if (std.mem.startsWith(u8, line, "thread ")) {
             const at = std.mem.indexOf(u8, line, " panic: ") orelse continue;
             line = line[at + " panic: ".len ..];
@@ -2879,6 +6257,8 @@ test "sim: hasPanicLine matches the panic, not a source line in its trace" {
     try std.testing.expect(hasPanicLine("thread 7 panic: sim: Event.set from a thread that is not\n", want));
     try std.testing.expect(hasPanicLine("x\nsim: Event.set from a thread that is not SEED=1\n", want));
     try std.testing.expect(!hasPanicLine("thread 7 panic: sim: deadlock clock_ns=0\n    try refusal(\"t\", \"sim: Event.set from a thread\", struct {\n", want));
+    // The child's first line, after the runner's progress clear.
+    try std.testing.expect(hasPanicLine("\r\x1b[0Ksim: Event.set from a thread that is not\n", want));
 }
 
 const death = struct {
@@ -3029,6 +6409,93 @@ test "sim: every task parked with only the shrink timer pending is a deadlock, t
     if (comptime !compiled_in) return error.SkipZigTest;
     if (!isDeathChild()) return expectChildPanics("sim: every task parked with only the shrink timer pending is a deadlock, two executors", "sim: deadlock clock_ns=0");
     try deadlockChild(2);
+}
+
+// ---- A spin at one virtual instant (t-4133) ----
+
+const spin = struct {
+    const Waiter = @import("common.zig").Waiter;
+    const rt_mod = @import("runtime.zig");
+
+    /// t-4133's shape: a task arms a timer for a moment already past, is
+    /// woken at once at the same instant, and arms it again.
+    fn pastTimer() void {
+        while (true) {
+            var w: Waiter = .init();
+            defer w.deinit();
+            w.timedWait(1, .{ .deadline = .fromNanoseconds(0) }, .allow_cancel) catch {};
+        }
+    }
+
+    /// Waits for the clock to move by yielding. A main task's yield makes
+    /// no task switch and no wake, so the trace stops while the polls go on.
+    fn yieldUntilClockMoves() void {
+        const start = clock_ns;
+        while (clock_ns == start) rt_mod.yield() catch {};
+    }
+
+    fn spawnedPastTimer(executors: u8) !void {
+        noCoreDump();
+        const rt = try death.up(executors);
+        var h = try rt.spawnInto(.{ .executor = @intCast(executors - 1) }, pastTimer, .{});
+        h.join();
+    }
+};
+
+test "sim: spin: a task that keeps arming a timer for a moment already past panics at one virtual instant, naming the task and the timer, within seconds of wall time" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanicsWithin("sim: spin: a task that keeps arming a timer for a moment already past panics at one virtual instant, naming the task and the timer, within seconds of wall time", "sim: 100001 loop polls at virtual time 0 ns with the clock not moving (the limit is 100000, sim.setInstantPollLimit): a task spins without virtual time passing (t-4133); the last task run or woken has trace id 1; 100000 timers fired at this instant, the last with deadline 0 ns on clock 0", 5000);
+    try spin.spawnedPastTimer(1);
+}
+
+test "sim: spin: the same with the task on the second of two executors" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanicsWithin("sim: spin: the same with the task on the second of two executors", "sim: 100001 loop polls at virtual time 0 ns with the clock not moving (the limit is 100000, sim.setInstantPollLimit): a task spins without virtual time passing (t-4133); the last task run or woken has trace id 1; 33319 timers fired at this instant, the last with deadline 0 ns on clock 0", 5000);
+    try spin.spawnedPastTimer(2);
+}
+
+test "sim: spin: a main task that yields until the clock moves panics, with no timer to name" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanicsWithin("sim: spin: a main task that yields until the clock moves panics, with no timer to name", "sim: 100001 loop polls at virtual time 0 ns with the clock not moving (the limit is 100000, sim.setInstantPollLimit): a task spins without virtual time passing (t-4133); no task has been switched to or woken in this run (the main task?); no timer has fired in this run", 5000);
+    noCoreDump();
+    _ = try death.up(1);
+    spin.yieldUntilClockMoves();
+}
+
+test "sim: spin: a lowered limit panics at exactly one poll past it, at the virtual time of the spin" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanics("sim: spin: a lowered limit panics at exactly one poll past it, at the virtual time of the spin", "sim: 51 loop polls at virtual time 3000000 ns with the clock not moving (the limit is 50, sim.setInstantPollLimit): a task spins without virtual time passing (t-4133); the last task run or woken has trace id 1; 51 timers fired at this instant, the last with deadline 0 ns on clock 0");
+    noCoreDump();
+    const rt = try death.up(1);
+    setInstantPollLimit(50);
+    // Timers fire at 1 and 2 ms too: the line counts only this instant's.
+    for (0..3) |_| try spin.rt_mod.sleep(.fromMilliseconds(1));
+    var h = try rt.spawn(spin.pastTimer, .{});
+    h.join();
+}
+
+test "sim: spin refuses: setInstantPollLimit(0)" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildPanics("sim: spin refuses: setInstantPollLimit(0)", "sim: setInstantPollLimit(0): a run polls at least once");
+    noCoreDump();
+    _ = try death.up(1);
+    setInstantPollLimit(0);
+}
+
+test "sim: spin: the count starts again when the clock moves: 2000 sleeps of 1 ms under a limit of 10 end normally, and begin restores the default" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    const Runtime = @import("runtime.zig").Runtime;
+    begin(1);
+    defer end();
+    const rt = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1), .thread_pool = .{ .max_threads = 0 } });
+    defer rt.deinit();
+    setInstantPollLimit(10);
+    for (0..2000) |_| try spin.rt_mod.sleep(.fromMilliseconds(1));
+    try std.testing.expectEqual(@as(u64, 2_000_000_000), clock_ns);
+    try std.testing.expectEqual(@as(u64, 10), instant_poll_limit);
+    end();
+    begin(1);
+    try std.testing.expectEqual(default_instant_poll_limit, instant_poll_limit);
 }
 
 // ---- Runs that must end normally (round 3) ----
@@ -4665,11 +8132,15 @@ test "sim: dgram: port 0 gives 49152, 49153, 49154 in every run" {
     const T = struct {
         var ports: [3]u16 = undefined;
         fn body() !void {
-            for (&ports) |*p| {
-                const fd = try dg.open();
-                try dg.bindTo(fd, dg.addr(127, 0, 0, 1, 0));
-                p.* = (try dg.local(fd)).port;
+            // All three stay open to the end: a closed one would free its
+            // port for the next.
+            var fds: [3]i32 = undefined;
+            for (&ports, &fds) |*p, *fd| {
+                fd.* = try dg.open();
+                try dg.bindTo(fd.*, dg.addr(127, 0, 0, 1, 0));
+                p.* = (try dg.local(fd.*)).port;
             }
+            for (fds) |fd| dg.os_net.close(fd);
         }
     };
     var seed_value: u64 = 1;
@@ -4686,7 +8157,9 @@ test "sim: dgram: a bind conflict is AddressInUse, for an equal address and acro
         fn body() !void {
             const a = try dg.open();
             const b = try dg.open();
+            defer dg.os_net.close(b);
             const c = try dg.open();
+            defer dg.os_net.close(c);
             try dg.bindTo(a, dg.addr(127, 0, 0, 1, 5000));
             try std.testing.expectError(error.AddressInUse, dg.bindTo(b, dg.addr(127, 0, 0, 1, 5000)));
             try std.testing.expectError(error.AddressInUse, dg.bindTo(b, dg.addr(0, 0, 0, 0, 5000)));
@@ -4694,14 +8167,17 @@ test "sim: dgram: a bind conflict is AddressInUse, for an equal address and acro
             try dg.bindTo(b, dg.addr(127, 0, 0, 2, 5000));
             try dg.bindTo(c, dg.addr(0, 0, 0, 0, 6000));
             const d = try dg.open();
+            defer dg.os_net.close(d);
             try std.testing.expectError(error.AddressInUse, dg.bindTo(d, dg.addr(127, 0, 0, 9, 6000)));
             // Closing frees the port.
             dg.os_net.close(a);
             try dg.bindTo(d, dg.addr(127, 0, 0, 1, 5000));
             // Port 0 skips a port that is taken.
             const e = try dg.open();
+            defer dg.os_net.close(e);
             try dg.bindTo(e, dg.addr(127, 0, 0, 1, 49152));
             const f = try dg.open();
+            defer dg.os_net.close(f);
             try dg.bindTo(f, dg.addr(127, 0, 0, 1, 0));
             try std.testing.expectEqual(@as(u16, 49153), (try dg.local(f)).port);
         }
@@ -4713,7 +8189,9 @@ test "sim: dgram: a wildcard receiver gets the destination address, a reply from
     try dg.run(1, struct {
         fn body() !void {
             const server = try dg.open();
+            defer dg.os_net.close(server);
             const client = try dg.open();
+            defer dg.os_net.close(client);
             try dg.bindTo(server, dg.addr(0, 0, 0, 0, 7000));
             try dg.os_net.enableDestinationAddress(server);
             try dg.bindTo(client, dg.addr(127, 0, 0, 1, 0));
@@ -4751,14 +8229,17 @@ test "sim: dgram: non-blocking state is stored and read back, an empty receive w
     try dg.run(1, struct {
         fn body() !void {
             const blocking = try dg.os_net.socket(.ipv4, .dgram, .udp, .{ .nonblocking = false });
+            defer dg.os_net.close(blocking);
             try std.testing.expect(!try dg.os_net.isNonBlocking(blocking));
             try dg.os_net.setNonBlocking(blocking, true);
             try std.testing.expect(try dg.os_net.isNonBlocking(blocking));
             try dg.os_net.setNonBlocking(blocking, false);
             try std.testing.expect(!try dg.os_net.isNonBlocking(blocking));
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             try std.testing.expect(try dg.os_net.isNonBlocking(rx));
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
             var buf: [4]u8 = undefined;
             // Empty: WouldBlock, from the socket's mode alone (no dontwait).
@@ -4798,7 +8279,9 @@ test "sim: dgram: the default byte budget drops by bytes, counted, and a datagra
     try dg.run(1, struct {
         fn body() !void {
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
             // Each empty datagram costs `datagram_overhead` bytes: the budget
             // holds 832 of them, under the 1024-packet limit.
@@ -4833,8 +8316,11 @@ const dg_order = struct {
     /// logical time; the receiver logs the payloads in arrival order.
     fn body() !void {
         const rx = try dg.open();
+        defer dg.os_net.close(rx);
         const a = try dg.open();
+        defer dg.os_net.close(a);
         const b = try dg.open();
+        defer dg.os_net.close(b);
         try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
         const to = dg.addr(127, 0, 0, 1, 49152);
         for ([_][]const u8{ "a", "b", "c" }) |p| _ = try dg.sendFrom(a, to, null, p);
@@ -4902,7 +8388,9 @@ test "sim: dgram: an empty datagram queued while the ring empties does not make 
     try dg.run(1, struct {
         fn body() !void {
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
             const to = dg.addr(127, 0, 0, 1, (try dg.local(rx)).port);
             var buf: [4]u8 = undefined;
@@ -5332,9 +8820,11 @@ test "sim: dgram ev: a receive parked on a socket that is closed and whose numbe
             try dg.rt_mod.sleep(.fromNanoseconds(1));
             dg.os_net.close(rx);
             const nx = try dg.open();
+            defer dg.os_net.close(nx);
             try std.testing.expectEqual(rx, nx);
             try dg.bindTo(nx, dg.addr(127, 0, 0, 1, 0));
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, (try dg.local(nx)).port), null, "new");
             try dg.settle();
             try std.testing.expectError(error.FileDescriptorNotASocket, h.join());
@@ -5350,11 +8840,13 @@ test "sim: dgram: a closed fd number is reused by the next open, which does not 
         fn body() !void {
             const rx = try dg.open();
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
             _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 49152), null, "old");
             try dg.settle();
             dg.os_net.close(rx);
             const again = try dg.open();
+            defer dg.os_net.close(again);
             try std.testing.expectEqual(rx, again);
             try std.testing.expectEqual(Ip4{ .ip = .{ 0, 0, 0, 0 }, .port = 0 }, try dg.local(again));
             try dg.bindTo(again, dg.addr(127, 0, 0, 1, 49152));
@@ -5365,13 +8857,18 @@ test "sim: dgram: a closed fd number is reused by the next open, which does not 
     }.body);
 }
 
-test "sim: dgram: end frees every socket and every datagram on the wire, so the next run starts empty" {
+test "sim: dgram: end frees every datagram still on the wire, so the next run starts empty" {
     if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
     const T = struct {
         var first_fd: i32 = 0;
+        // The sockets close at the end of the run's body, as `end` requires
+        // (t-4142); the close drops the queued datagram, and `end` frees the
+        // one still on the wire.
         fn leave() !void {
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             first_fd = rx;
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
             _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 49152), null, "queued");
@@ -5381,6 +8878,7 @@ test "sim: dgram: end frees every socket and every datagram on the wire, so the 
         }
         fn fresh() !void {
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             try std.testing.expectEqual(first_fd, fd);
             try dg.bindTo(fd, dg.addr(127, 0, 0, 1, 0));
             try std.testing.expectEqual(@as(u16, 49152), (try dg.local(fd)).port);
@@ -5419,6 +8917,7 @@ test "sim: dgram refuses: sendto with MSG_OOB" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
             const to = dg.addr(127, 0, 0, 1, 7000);
             _ = try dg.os_net.sendto(fd, &iov, .{ .oob = true }, @ptrCast(&to), @sizeOf(dg.os_net.sockaddr.in));
@@ -5432,6 +8931,7 @@ test "sim: dgram refuses: sendto with MSG_FASTOPEN" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
             const to = dg.addr(127, 0, 0, 1, 7000);
             _ = try dg.os_net.sendto(fd, &iov, .{ .fastopen = true }, @ptrCast(&to), @sizeOf(dg.os_net.sockaddr.in));
@@ -5445,6 +8945,7 @@ test "sim: dgram refuses: sendmsg with MSG_EOR" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
             const to = dg.addr(127, 0, 0, 1, 7000);
             _ = try dg.os_net.sendmsg(fd, &iov, .{ .eor = true }, @ptrCast(&to), @sizeOf(dg.os_net.sockaddr.in), null);
@@ -5458,6 +8959,7 @@ test "sim: dgram refuses: sendDatagram with MSG_DONTROUTE" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
             const to = dg.addr(127, 0, 0, 1, 7000);
             _ = try dg.os_net.sendDatagram(fd, &iov, .{ .dont_route = true }, &to, null);
@@ -5471,6 +8973,7 @@ test "sim: dgram refuses: sendDatagram with MSG_CONFIRM" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
             const to = dg.addr(127, 0, 0, 1, 7000);
             _ = try dg.os_net.sendDatagram(fd, &iov, .{ .confirm = true }, &to, null);
@@ -5511,6 +9014,7 @@ test "sim: dgram refuses: recvmsg without a control buffer on a socket that aske
             try dg.run(1, struct {
                 fn inner() !void {
                     const rx = try dg.open();
+                    defer dg.os_net.close(rx);
                     try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 7000));
                     try dg.os_net.enableDestinationAddress(rx);
                     _ = try dg.sendFrom(rx, dg.addr(127, 0, 0, 1, 7000), null, "x");
@@ -5531,6 +9035,7 @@ test "sim: dgram refuses: recvmsg with a control buffer on a socket that asked f
         fn body() !void {
             try r3.up();
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             try dg.os_net.enableDestinationAddress(rx);
             var buf: [4]u8 = undefined;
             var ctl: [64]u8 = undefined;
@@ -5550,12 +9055,16 @@ test "sim: dgram refuses: an IPv6 socket during a run" {
     }.body);
 }
 
-test "sim: dgram refuses: a stream socket during a run" {
+// Until slice 1 of the stream track this refused `socket(ipv4, stream,
+// tcp)`; that socket is modelled now (design 17.4; `sim: stream:` tests
+// open it through std.Io with protocol `.tcp`). A stream socket of any
+// other protocol still refuses.
+test "sim: dgram refuses: a stream socket that is not TCP during a run" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    try refusal("sim: dgram refuses: a stream socket during a run", "sim: socket(ipv4, stream, tcp) during a sim run", struct {
+    try refusal("sim: dgram refuses: a stream socket that is not TCP during a run", "sim: socket(ipv4, stream, udp) during a sim run", struct {
         fn body() !void {
             try r3.up();
-            _ = try dg.os_net.socket(.ipv4, .stream, .tcp, .{ .nonblocking = true });
+            _ = try dg.os_net.socket(.ipv4, .stream, .udp, .{ .nonblocking = true });
         }
     }.body);
 }
@@ -5566,6 +9075,7 @@ test "sim: dgram refuses: a send to a non-loopback address" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             _ = try dg.sendFrom(fd, dg.addr(10, 0, 0, 1, 9), null, "x");
         }
     }.body);
@@ -5577,6 +9087,7 @@ test "sim: dgram refuses: a bind to a non-loopback address" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             try dg.bindTo(fd, dg.addr(192, 168, 1, 1, 9));
         }
     }.body);
@@ -5588,6 +9099,7 @@ test "sim: dgram refuses: a datagram over 65507 bytes" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             const big = try std.heap.page_allocator.alloc(u8, 65508);
             _ = try dg.sendFrom(fd, dg.addr(127, 0, 0, 1, 9), null, big);
         }
@@ -5600,6 +9112,7 @@ test "sim: dgram refuses: a send to port 0" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             _ = try dg.sendFrom(fd, dg.addr(127, 0, 0, 1, 0), null, "x");
         }
     }.body);
@@ -5611,6 +9124,7 @@ test "sim: dgram refuses: a bind of a bound socket" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             try dg.bindTo(fd, dg.addr(127, 0, 0, 1, 0));
             try dg.bindTo(fd, dg.addr(127, 0, 0, 1, 0));
         }
@@ -5629,13 +9143,17 @@ test "sim: dgram refuses: a send on a closed socket" {
     }.body);
 }
 
-test "sim: dgram refuses: connect on a datagram socket" {
+// Until t-4167 every connect on a datagram socket refused, and this test
+// checked that. A connect is simulated now (`sim_dgram_connect_test.zig`);
+// one to an address outside 127/8 still refuses, as a send there does.
+test "sim: dgram refuses: connect on a datagram socket to an address outside 127/8" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    try refusal("sim: dgram refuses: connect on a datagram socket", "sim: connect on sim datagram socket 100032: connected UDP is not simulated", struct {
+    try refusal("sim: dgram refuses: connect on a datagram socket to an address outside 127/8", "sim: connect to 10.0.0.1: only 127.0.0.0/8 is simulated", struct {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
-            const a = dg.addr(127, 0, 0, 1, 9);
+            defer dg.os_net.close(fd);
+            const a = dg.addr(10, 0, 0, 1, 9);
             try dg.os_net.connect(fd, @ptrCast(&a), @sizeOf(dg.os_net.sockaddr.in));
         }
     }.body);
@@ -5647,6 +9165,7 @@ test "sim: dgram refuses: an IPv6 destination" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var a6: std.c.sockaddr.in6 = .{ .port = 0, .flowinfo = 0, .addr = @splat(0), .scope_id = 0 };
             var iov = [1]dg.os_net.iovec_const{dg.os_net.iovecConstFromSlice("x")};
             _ = try dg.os_net.sendto(fd, &iov, .{}, @ptrCast(&a6), @sizeOf(std.c.sockaddr.in6));
@@ -5660,6 +9179,7 @@ test "sim: dgram refuses: MSG_PEEK" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var buf: [4]u8 = undefined;
             var iov = [1]dg.os_net.iovec{dg.os_net.iovecFromSlice(&buf)};
             _ = try dg.os_net.recvfrom(fd, &iov, .{ .peek = true }, null, null);
@@ -5776,6 +9296,7 @@ test "sim: dgram: a datagram in flight is I/O still to come: the clock reaches i
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             _ = try dg.sendFrom(fd, dg.addr(127, 0, 0, 1, 9), null, "x");
             var ev: @import("sync/Event.zig") = .init;
             try ev.wait();
@@ -5818,6 +9339,7 @@ test "sim: dgram ev: the layer sends two buffers to an ev receiver, and an ev se
             const ev_addr = try dg.evBind(ev_fd, dg.addr(127, 0, 0, 1, 0));
             try std.testing.expectEqual(Ip4{ .ip = .{ 127, 0, 0, 1 }, .port = 49152 }, ev_addr);
             const c_fd = try dg.open();
+            defer dg.os_net.close(c_fd);
             try dg.bindTo(c_fd, dg.addr(127, 0, 0, 1, 0));
             // Layer to ev.
             _ = try dg.sendTo(c_fd, dg.addr(127, 0, 0, 1, 49152), &.{ "hel", "lo" });
@@ -5845,7 +9367,9 @@ test "sim: dgram ev: poll with a zero timeout reports readable only once a datag
     try dg.run(1, struct {
         fn body() !void {
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
             const IN = dg.os_net.POLL.IN;
             const OUT = dg.os_net.POLL.OUT;
@@ -5891,7 +9415,9 @@ test "sim: dgram ev: a poll parked before the datagram is sent wakes when it lan
     try dg.run(1, struct {
         fn body() !void {
             dg_park.rx = try dg.open();
+            defer dg.os_net.close(dg_park.rx);
             dg_park.tx = try dg.open();
+            defer dg.os_net.close(dg_park.tx);
             try dg.bindTo(dg_park.rx, dg.addr(127, 0, 0, 1, 0));
             var round: usize = 0;
             while (round < 2) : (round += 1) {
@@ -5917,7 +9443,9 @@ test "sim: dgram ev: a parked receive that is canceled gives Canceled, and the n
     try dg.run(1, struct {
         fn body() !void {
             dg_park.rx = try dg.open();
+            defer dg.os_net.close(dg_park.rx);
             dg_park.tx = try dg.open();
+            defer dg.os_net.close(dg_park.tx);
             try dg.bindTo(dg_park.rx, dg.addr(127, 0, 0, 1, 0));
             var h = try dg.runtime.spawn(dg_park.recvThenRecord, .{});
             try dg.rt_mod.sleep(.fromMilliseconds(1));
@@ -6503,6 +10031,7 @@ test "sim: dgram ev: an ev receive with a datagram already queued and a poll for
     try dg.run(1, struct {
         fn body() !void {
             const rx = try dg.evOpen();
+            defer dg.os_net.close(rx);
             _ = try dg.evBind(rx, dg.addr(127, 0, 0, 1, 0));
             var buf: [4]u8 = undefined;
             var iov: [1]dg.os_net.iovec = undefined;
@@ -6510,6 +10039,7 @@ test "sim: dgram ev: an ev receive with a datagram already queued and a poll for
             try dg.io_common.waitForIo(&op.c);
             try std.testing.expectError(error.WouldBlock, op.getResult());
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 49152), null, "now");
             try dg.settle();
             const before = clockNs();
@@ -6608,6 +10138,7 @@ const second_waiter = struct {
         first = true;
         const loop = &dg.rt_mod.getCurrentExecutor().loop;
         const tx = try dg.open();
+        defer dg.os_net.close(tx);
         for (0..2) |k| {
             fds[k] = try dg.open();
             try dg.bindTo(fds[k], dg.addr(127, 0, 0, 1, 0));
@@ -6622,11 +10153,12 @@ const second_waiter = struct {
     }
 };
 
-/// A receive with no room on a full pipe takes no bytes, so it frees no room
-/// and must not wake the send parked on the other end: that send's harvest
-/// would find the pipe still full. A receive with room then wakes it.
+/// A receive with room on a full pipe frees room, so it wakes the send
+/// parked on the other end. (Until t-4096 this test also gave a receive with
+/// no room first, which took nothing and must not wake the send. Such a
+/// receive is refused now: the two tests after this one.)
 const pipe_zero_room = struct {
-    fn body() !void {
+    fn fill() !void {
         const w = second_waiter;
         w.fds = pipePair();
         const loop = &dg.rt_mod.getCurrentExecutor().loop;
@@ -6636,20 +10168,62 @@ const pipe_zero_room = struct {
         // S0 is done, S1 parked on the full pipe.
         try std.testing.expectEqual(@as(usize, pipe_buf_cap), try w.ops[0].send.getResult());
         try std.testing.expect(!w.ops[1].send.c.has_result);
-        loop.add(w.recv(2, w.fds[0], 0));
-        try dg.rt_mod.sleep(.fromMilliseconds(10));
-        try std.testing.expectEqual(@as(usize, 0), try w.ops[2].recv.getResult());
-        try std.testing.expect(!w.ops[1].send.c.has_result);
+    }
+
+    fn body() !void {
+        try fill();
+        const w = second_waiter;
+        const loop = &dg.rt_mod.getCurrentExecutor().loop;
         loop.add(w.recv(3, w.fds[0], 100));
         try dg.rt_mod.sleep(.fromMilliseconds(10));
         try std.testing.expectEqual(@as(usize, 100), try w.ops[3].recv.getResult());
         try std.testing.expectEqual(@as(usize, 10), try w.ops[1].send.getResult());
     }
+
+    /// t-4096's case: a receive of 0 bytes on an empty pipe. Before the
+    /// refusal it parked until bytes or end of stream came.
+    fn emptyPipe() !void {
+        const w = second_waiter;
+        w.fds = pipePair();
+        const loop = &dg.rt_mod.getCurrentExecutor().loop;
+        loop.add(w.recv(0, w.fds[0], 0));
+        try dg.rt_mod.sleep(.fromMilliseconds(10));
+        std.debug.print("a receive of 0 bytes on an empty pipe: has_result {}\n", .{w.ops[0].recv.c.has_result});
+    }
+
+    /// The case this test's first half had: a receive of 0 bytes on a
+    /// full pipe with a send parked on it. Before the refusal it gave 0.
+    fn fullPipe() !void {
+        try fill();
+        const w = second_waiter;
+        const loop = &dg.rt_mod.getCurrentExecutor().loop;
+        loop.add(w.recv(2, w.fds[0], 0));
+        try dg.rt_mod.sleep(.fromMilliseconds(10));
+        std.debug.print("a receive of 0 bytes on a full pipe: {any}\n", .{w.ops[2].recv.getResult()});
+    }
 };
 
-test "sim: pipe: a receive with no room on a full pipe does not wake the send parked on it, and one with room does" {
+test "sim: pipe: a receive with room on a full pipe wakes the send parked on it" {
     if (comptime !compiled_in) return error.SkipZigTest;
     for (1..9) |s| try dg.run(s, pipe_zero_room.body);
+}
+
+test "sim: pipe refuses: a receive of 0 bytes on an empty pipe (t-4096)" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: pipe refuses: a receive of 0 bytes on an empty pipe (t-4096)", "sim: a receive of 0 bytes on sim pipe fd 100000 is refused (t-4096)", struct {
+        fn body() !void {
+            try dg.run(1, pipe_zero_room.emptyPipe);
+        }
+    }.body);
+}
+
+test "sim: pipe refuses: a receive of 0 bytes on a full pipe with a send parked on it (t-4096)" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: pipe refuses: a receive of 0 bytes on a full pipe with a send parked on it (t-4096)", "sim: a receive of 0 bytes on sim pipe fd 100000 is refused (t-4096)", struct {
+        fn body() !void {
+            try dg.run(1, pipe_zero_room.fullPipe);
+        }
+    }.body);
 }
 
 /// Round 4 of the outside review, finding 1: the due list is the sim's, not a
@@ -6718,6 +10292,71 @@ test "sim: refuses a loop of a second loop group polling in one run, which would
     }.body);
 }
 
+test "sim: dgram: datagramSocketsOpen counts this run's open datagram sockets, 0 outside a run (t-4136)" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(usize, 0), datagramSocketsOpen());
+    try dg.run(1, struct {
+        fn body() !void {
+            try std.testing.expectEqual(@as(usize, 0), datagramSocketsOpen());
+            const a = try dg.open();
+            const b = try dg.open();
+            try std.testing.expectEqual(@as(usize, 2), datagramSocketsOpen());
+            dg.os_net.close(a);
+            try std.testing.expectEqual(@as(usize, 1), datagramSocketsOpen());
+            dg.os_net.close(b);
+            try std.testing.expectEqual(@as(usize, 0), datagramSocketsOpen());
+        }
+    }.body);
+    try std.testing.expectEqual(@as(usize, 0), datagramSocketsOpen());
+}
+
+test "sim: dgram: a run that closed its datagram sockets ends normally, and the next run starts with none open (t-4142)" {
+    if (comptime !compiled_in or builtin.os.tag == .windows) return error.SkipZigTest;
+    try dg.run(1, struct {
+        fn body() !void {
+            const a = try dg.open();
+            dg.os_net.close(a);
+        }
+    }.body);
+    try dg.run(1, struct {
+        fn body() !void {
+            try std.testing.expectEqual(@as(usize, 0), datagramSocketsOpen());
+        }
+    }.body);
+}
+
+test "sim: dgram refuses: sim.end with a datagram socket open (t-4142)" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: sim.end with a datagram socket open", "sim: datagram teardown: 1 datagram sockets are open at sim.end (listed above): close every datagram socket before sim.end", struct {
+        fn body() !void {
+            try dg.run(1, struct {
+                fn inner() !void {
+                    const a = try dg.open();
+                    _ = try dg.open();
+                    dg.os_net.close(a);
+                }
+            }.inner);
+        }
+    }.body);
+}
+
+// The list line, before the panic: the open socket by its own fd (the
+// second open, 100033), not the closed one (100032).
+test "sim: dgram refuses: sim.end lists each open datagram socket by its fd before it panics (t-4142)" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try refusal("sim: dgram refuses: sim.end lists each open datagram socket by its fd", "sim: datagram teardown: sim fd 100033 is an open datagram socket", struct {
+        fn body() !void {
+            try dg.run(1, struct {
+                fn inner() !void {
+                    const a = try dg.open();
+                    _ = try dg.open();
+                    dg.os_net.close(a);
+                }
+            }.inner);
+        }
+    }.body);
+}
+
 test "sim: dgram refuses: an open of a slot whose generation is at its limit" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     try refusal("sim: dgram refuses: an open of a slot whose generation is at its limit", "sim: datagram socket slot 0 was opened 4294967295 times in this run", struct {
@@ -6735,8 +10374,10 @@ test "sim: refuses two Runtimes in one sim run" {
         var got: usize = 0;
         fn exchange() !void {
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 7100));
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 7100), null, "hi");
             var buf: [8]u8 = undefined;
             got = (try dg.evRecvFrom(rx, &buf)).len;
@@ -6878,6 +10519,7 @@ test "sim: dgram ev refuses: pollInterruptible with a positive timeout on a sim 
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             _ = try dg.os_net.pollInterruptible(fd, dg.os_net.POLL.IN, 5);
         }
     }.body);
@@ -6890,6 +10532,7 @@ test "sim: dgram options: an ENet-shaped host creation: socket, non-blocking, RC
     try dg.run(1, struct {
         fn body() !void {
             const fd = try dg.os_net.socket(.ipv4, .dgram, .udp, .{ .nonblocking = false });
+            defer dg.os_net.close(fd);
             try dg.os_net.setNonBlocking(fd, true);
             try std.testing.expect(try dg.os_net.isNonBlocking(fd));
             try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF, 256 * 1024);
@@ -6907,6 +10550,7 @@ test "sim: dgram options: an ENet-shaped host creation: socket, non-blocking, RC
             try dg.setInt(fd, sys.IPPROTO.IP, dst_opt, 1);
             // It works: a datagram arrives with its destination address.
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 49152), null, "host");
             try dg.settle();
             var buf: [8]u8 = undefined;
@@ -6920,6 +10564,7 @@ test "sim: dgram options: an unsupported option returns OptionNotSupported and c
     try dg.run(1, struct {
         fn body() !void {
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             const before = try dg.getInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF);
             const unsupported = [_][2]i64{
                 .{ sys.SOL.SOCKET, sys.SO.RCVLOWAT },
@@ -6935,6 +10580,7 @@ test "sim: dgram options: an unsupported option returns OptionNotSupported and c
             try std.testing.expectEqual(before, try dg.getInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF));
             try dg.bindTo(fd, dg.addr(127, 0, 0, 1, 0));
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             _ = try dg.sendFrom(tx, dg.addr(127, 0, 0, 1, 49152), null, "still");
             try dg.settle();
             var buf: [8]u8 = undefined;
@@ -6948,7 +10594,9 @@ test "sim: dgram limits: with a large byte budget, the packet limit drops empty 
     try dg.run(1, struct {
         fn body() !void {
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             try dg.setInt(rx, sys.SOL.SOCKET, sys.SO.RCVBUF, 1 << 20);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
             try dg.sendN(tx, dg.addr(127, 0, 0, 1, 49152), rcv_packet_limit + 6, "");
@@ -6964,7 +10612,9 @@ test "sim: dgram limits: a small byte budget drops by bytes, raising SO_RCVBUF a
     try dg.run(1, struct {
         fn body() !void {
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             // 1000 bytes: two 150-byte datagrams (406 each) fit, a third does not.
             try dg.setInt(rx, sys.SOL.SOCKET, sys.SO.RCVBUF, 1000);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
@@ -7013,7 +10663,9 @@ test "sim: dgram limits: lowering SO_RCVBUF below what is queued drops nothing q
     try dg.run(1, struct {
         fn body() !void {
             const rx = try dg.open();
+            defer dg.os_net.close(rx);
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 0));
             const to = dg.addr(127, 0, 0, 1, 49152);
             var p: [100]u8 = @splat(7);
@@ -7042,8 +10694,11 @@ test "sim: dgram limits: one socket's overflow does not drop or block another so
     try dg.run(1, struct {
         fn body() !void {
             const small = try dg.open();
+            defer dg.os_net.close(small);
             const big = try dg.open();
+            defer dg.os_net.close(big);
             const tx = try dg.open();
+            defer dg.os_net.close(tx);
             try dg.setInt(small, sys.SOL.SOCKET, sys.SO.RCVBUF, 300);
             try dg.bindTo(small, dg.addr(127, 0, 0, 1, 0));
             try dg.bindTo(big, dg.addr(127, 0, 0, 1, 0));
@@ -7066,6 +10721,7 @@ test "sim: dgram limits: out of memory at open and at send is SystemResources, a
     try dg.run(1, struct {
         fn body() !void {
             const ok_fd = try dg.open();
+            defer dg.os_net.close(ok_fd);
             var failing = std.testing.FailingAllocator.init(std.heap.smp_allocator, .{ .fail_index = 0 });
             testSetNetAllocator(failing.allocator());
             defer testSetNetAllocator(std.heap.smp_allocator);
@@ -7088,6 +10744,7 @@ test "sim: dgram options refuse: SO_BROADCAST" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.BROADCAST, 1);
         }
     }.body);
@@ -7099,6 +10756,7 @@ test "sim: dgram options refuse: SO_REUSEPORT" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.REUSEPORT, 1);
         }
     }.body);
@@ -7110,6 +10768,7 @@ test "sim: dgram options refuse: a multicast membership" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var mreq: [8]u8 = @splat(0);
             try dg.os_net.setsockopt(fd, sys.IPPROTO.IP, sys.IP.ADD_MEMBERSHIP, &mreq);
         }
@@ -7122,6 +10781,7 @@ test "sim: dgram options refuse: a TCP option on a datagram socket" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             try dg.setInt(fd, sys.IPPROTO.TCP, 1, 1);
         }
     }.body);
@@ -7133,6 +10793,7 @@ test "sim: dgram options refuse: SO_RCVBUF of zero" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF, 0);
         }
     }.body);
@@ -7144,6 +10805,7 @@ test "sim: dgram options refuse: a read of an option that is not simulated" {
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             _ = try dg.getInt(fd, sys.SOL.SOCKET, sys.SO.SNDBUF);
         }
     }.body);
@@ -7167,6 +10829,7 @@ test "sim: dgram options refuse: out of memory re-provisioning the receive queue
         fn body() !void {
             try r3.up();
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             var failing = std.testing.FailingAllocator.init(std.heap.smp_allocator, .{ .fail_index = 0 });
             testSetNetAllocator(failing.allocator());
             try dg.setInt(fd, sys.SOL.SOCKET, sys.SO.RCVBUF, 300000);
@@ -7221,10 +10884,12 @@ const dg_wire = struct {
     /// length, and the bytes.
     fn body() !void {
         const rx = try dg.open();
+        defer dg.os_net.close(rx);
         try dg.bindTo(rx, dg.addr(0, 0, 0, 0, 7000));
         try dg.os_net.enableDestinationAddress(rx);
         var senders: [3]i32 = undefined;
         for (&senders) |*fd| fd.* = try dg.open();
+        defer for (senders) |fd| dg.os_net.close(fd);
         transcript_len = 0;
         var h = try dg.runtime.spawn(evFirst, .{rx});
         try dg.rt_mod.sleep(.fromMilliseconds(1));
@@ -7341,10 +11006,12 @@ const dg_drops = struct {
 
     fn body() !void {
         const rx = try dg.open();
+        defer dg.os_net.close(rx);
         try dg.bindTo(rx, dg.addr(127, 0, 0, 1, 7000));
         // Two 10-byte datagrams cost 2 * (10 + 256) = 532 bytes; a third does not fit.
         try dg.setInt(rx, sys.SOL.SOCKET, sys.SO.RCVBUF, 600);
         const tx = try dg.open();
+        defer dg.os_net.close(tx);
         try dg.bindTo(tx, dg.addr(127, 0, 0, 1, 7100));
         for (0..4) |k| {
             const p: [10]u8 = @splat(@intCast('a' + k));
@@ -7450,9 +11117,12 @@ const dg_inflight = struct {
     /// changes one thing and keeps every length, time and payload byte.
     fn body() !void {
         const rx = try dg.open();
+        defer dg.os_net.close(rx);
         try dg.bindTo(rx, dg.addr(0, 0, 0, 0, 7000));
-        _ = try dg.open(); // a second socket on 7001 would hide a bad port
+        const spare = try dg.open(); // a second socket on 7001 would hide a bad port
+        defer dg.os_net.close(spare);
         const tx = try dg.open();
+        defer dg.os_net.close(tx);
         try dg.bindTo(tx, dg.addr(0, 0, 0, 0, 7100));
         const first: []const u8 = if (variant == .queue_swapped) "b" else "a";
         const second: []const u8 = if (variant == .queue_swapped) "a" else "b";
@@ -7567,6 +11237,11 @@ test "sim: dgram trace: the state digest sees where a datagram still on the wire
 test {
     _ = @import("sim_exits_test.zig");
     _ = @import("sim_op_model_test.zig");
+    _ = @import("sim_stream_test.zig");
+    _ = @import("sim_stream_bytes_test.zig");
+    _ = @import("sim_stream_fault_test.zig");
+    _ = @import("sim_stream_op_model_test.zig");
+    _ = @import("sim_dgram_connect_test.zig");
 }
 
 // ---- Phase 1: the native-exit refusals, one test per class of exit ----
@@ -7878,8 +11553,11 @@ const nf = struct {
 const nf_silence = struct {
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const c = try nf.sock(1, 7002);
+        defer dg.os_net.close(c);
         silence(nf.ep(1, 7001));
         for (0..3) |k| try nf.send(a, 1, 7001, @intCast(k));
         for (0..2) |k| try nf.send(b, 1, 7000, @intCast(k));
@@ -7913,15 +11591,20 @@ test "sim: net faults: a silence of an exact endpoint drops what it sends and wh
 const nf_silence_forms = struct {
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const w = try dg.open();
+        defer dg.os_net.close(w);
         try dg.bindTo(w, dg.addr(0, 0, 0, 0, 7010));
         silence(.{ .port = 7010 });
         try nf.send(a, 1, 7010, 1);
         try nf.send(a, 3, 7010, 2);
         try nf.send(w, 1, 7000, 3);
         const h1 = try nf.sock(5, 7020);
+        defer dg.os_net.close(h1);
         const h2 = try nf.sock(5, 7021);
+        defer dg.os_net.close(h2);
         silence(.{ .ip = .{ 127, 0, 0, 5 } });
         try nf.send(a, 5, 7020, 4);
         try nf.send(a, 5, 7021, 5);
@@ -7947,7 +11630,9 @@ test "sim: net faults: a silence by port alone covers a socket bound to the wild
 const nf_partition = struct {
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
         setPartition(ab);
         for (0..2) |k| try nf.send(a, 1, 7001, @intCast(k));
@@ -7981,7 +11666,9 @@ test "sim: net faults: a partition drops one direction only, its reversed path t
 const nf_in_flight = struct {
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
         // On the wire when the partition starts: dropped at landing.
         try nf.send(a, 1, 7001, 1);
@@ -8046,8 +11733,11 @@ const nf_loss = struct {
 
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const c = try nf.sock(1, 7002);
+        defer dg.os_net.close(c);
         setImpairment(.{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) }, imp);
         landed = @splat(false);
         var k: u32 = 0;
@@ -8109,8 +11799,11 @@ test "sim: net faults: loss and burst loss drop exactly the datagrams the test's
 const nf_last_wins = struct {
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const c = try nf.sock(1, 7002);
+        defer dg.os_net.close(c);
         const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
         // Everything lost, then a narrower rule that loses nothing it can
         // see: a burst that alternates, bad on the first datagram, good on
@@ -8199,7 +11892,9 @@ const nf_records = struct {
         expect_hasher = std.hash.Wyhash.init(0);
         const lat = wire_latency_ns;
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
         const t0 = clockNs();
         try nf.send(a, 1, 7001, 0);
@@ -8294,7 +11989,9 @@ test "sim: net faults: each drop is in the trace and the wire digest with its ca
 const nf_matched = struct {
     fn body() !void {
         const a = try nf.sock(1, 7000);
-        _ = try nf.sock(1, 7001);
+        defer dg.os_net.close(a);
+        const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
         // Matched at send, then cleared.
         setImpairment(ab, .{ .loss_ppm = 1_000_000 });
@@ -8328,6 +12025,7 @@ test "sim: net faults refuse: requireEveryRuleMatched with a cleared rule and a 
             setPartition(.{ .to = .{ .port = 7998 } });
             silence(.{ .port = 7997 });
             const fd = try dg.open();
+            defer dg.os_net.close(fd);
             try dg.bindTo(fd, dg.addr(127, 0, 0, 1, 7997));
             _ = try dg.sendFrom(fd, dg.addr(127, 0, 0, 1, 7996), null, "x");
             requireEveryRuleMatched();
@@ -8523,7 +12221,9 @@ test "sim: net faults refuse: more distinct rules in a run than it records" {
 const nf_drop_order = struct {
     fn body() !void {
         const a = try nf.sock(1, 7000);
-        _ = try nf.sock(1, 7001);
+        defer dg.os_net.close(a);
+        const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
         // Two partitions match: the most recent drops and is counted.
         setPartition(.{});
@@ -8569,7 +12269,9 @@ const nf_delay = struct {
 
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         setImpairment(.{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) }, imp);
         for (0..n) |k| {
             sent_at[k] = clockNs();
@@ -8670,7 +12372,9 @@ test "sim: net faults: delay, jitter and duplication without reorder keep each f
 const nf_route = struct {
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
         const ms = std.time.ns_per_ms;
         var got: [8]u32 = undefined;
@@ -8754,6 +12458,8 @@ const nf_wake = struct {
 
     fn recvBody() !void {
         const s = try setup();
+        defer dg.os_net.close(s.a);
+        defer dg.os_net.close(s.b);
         var h = try dg.runtime.spawn(recvTask, .{s.b});
         try dg.rt_mod.sleep(.fromMilliseconds(1));
         const t = clockNs();
@@ -8766,6 +12472,8 @@ const nf_wake = struct {
 
     fn pollBody() !void {
         const s = try setup();
+        defer dg.os_net.close(s.a);
+        defer dg.os_net.close(s.b);
         var h = try dg.runtime.spawn(pollTask, .{s.b});
         try dg.rt_mod.sleep(.fromMilliseconds(1));
         const t = clockNs();
@@ -8782,6 +12490,7 @@ const nf_wake = struct {
     /// own receive it wakes.
     fn reuseBody() !void {
         const s = try setup();
+        defer dg.os_net.close(s.a);
         var h = try dg.runtime.spawn(recvTask, .{s.b});
         try dg.rt_mod.sleep(.fromMilliseconds(1));
         const t = clockNs();
@@ -8791,6 +12500,7 @@ const nf_wake = struct {
         try std.testing.expectEqual(@as(?anyerror, error.FileDescriptorNotASocket), err);
         try std.testing.expect(woke_at < t + delay);
         const b2 = try nf.sock(1, 7001);
+        defer dg.os_net.close(b2);
         try std.testing.expectEqual(s.b, b2);
         got_len = 0;
         var h2 = try dg.runtime.spawn(recvTask, .{b2});
@@ -8863,9 +12573,11 @@ const dg_faulted = struct {
 
     fn body() !void {
         const rx = try dg.open();
+        defer dg.os_net.close(rx);
         try dg.bindTo(rx, dg.addr(0, 0, 0, 0, 7000));
         try dg.os_net.enableDestinationAddress(rx);
         for (&senders, 0..) |*fd, i| fd.* = try nf.sock(1, @intCast(7100 + i));
+        defer for (senders) |fd| dg.os_net.close(fd);
         transcript_len = 0;
         const delay: u64 = std.time.ns_per_ms + @as(u64, @intFromBool(variant == .delay_one_ns_more));
         setImpairment(.{ .to = .{ .port = 7000 } }, .{
@@ -9108,7 +12820,9 @@ const many_iov = struct {
 
     fn dgramBody() !void {
         const rx = try nf.sock(1, 7000);
+        defer dg.os_net.close(rx);
         const tx = try nf.sock(1, 7001);
+        defer dg.os_net.close(tx);
         const to = dg.addr(127, 0, 0, 1, 7000);
         for ([_]usize{ 65, kernel_iov_max }) |n| {
             // sendDatagram, read whole by the layer.
@@ -9159,6 +12873,7 @@ test "sim: dgram refuses: a sendDatagram of IOV_MAX + 1 buffers" {
             try dg.run(1, struct {
                 fn b() !void {
                     const tx = try nf.sock(1, 7001);
+                    defer dg.os_net.close(tx);
                     const to = dg.addr(127, 0, 0, 1, 7000);
                     _ = try many_iov.os_net.sendDatagram(tx, many_iov.gather(iov_over), .{}, &to, null);
                 }
@@ -9174,6 +12889,7 @@ test "sim: dgram refuses: a sendmsg of IOV_MAX + 1 buffers" {
             try dg.run(1, struct {
                 fn b() !void {
                     const tx = try nf.sock(1, 7001);
+                    defer dg.os_net.close(tx);
                     const to = dg.addr(127, 0, 0, 1, 7000);
                     _ = try many_iov.sendmsgTo(tx, &to, iov_over);
                 }
@@ -9189,6 +12905,7 @@ test "sim: dgram refuses: an ev send of IOV_MAX + 1 buffers" {
             try dg.run(1, struct {
                 fn b() !void {
                     const tx = try nf.sock(1, 7001);
+                    defer dg.os_net.close(tx);
                     const to = dg.addr(127, 0, 0, 1, 7000);
                     _ = try many_iov.evSendTo(tx, &to, iov_over);
                 }
@@ -9204,6 +12921,7 @@ test "sim: dgram refuses: a receive of IOV_MAX + 1 buffers" {
             try dg.run(1, struct {
                 fn b() !void {
                     const rx = try nf.sock(1, 7000);
+                    defer dg.os_net.close(rx);
                     _ = many_iov.os_net.recvDatagram(rx, many_iov.scatter(iov_over), .{ .dontwait = true }, null) catch {};
                 }
             }.b);
@@ -9259,7 +12977,9 @@ const r5_alloc = struct {
 
     fn body() !void {
         const a = try nf.sock(1, 7000);
+        defer dg.os_net.close(a);
         const b = try nf.sock(1, 7001);
+        defer dg.os_net.close(b);
         const ab: Path = .{ .from = nf.ep(1, 7000), .to = nf.ep(1, 7001) };
         // The review's sequence: everything duplicated and delayed. A fresh
         // run's wire has no capacity, so a send allocates its payload copy

@@ -585,9 +585,10 @@ pub const Waiter = struct {
         return self.timedWaitClock(expected, timeout, .awake, cancel_mode);
     }
 
-    /// Like `timedWait`, but the timeout is measured against `clock`. The
-    /// no-task futex fallback only supports the monotonic (`awake`) clock, so
-    /// boot/real timeouts there degrade to awake semantics.
+    /// Like `timedWait`, but the timeout is measured against `clock`.
+    ///
+    /// On a plain thread (no task) the deadline stays absolute on `clock`; see
+    /// `timedWaitFutex` for what a kernel wait can still add past it.
     pub fn timedWaitClock(self: *Waiter, expected: u32, timeout: Timeout, clock: Clock, comptime cancel_mode: Executor.YieldCancelMode) TimedWaitError(cancel_mode)!void {
         if (timeout == .none) {
             if (cancel_mode == .allow_cancel) {
@@ -601,7 +602,11 @@ pub const Waiter = struct {
         const d = self.direct();
         const t = switch (d.tag) {
             .task => &d.payload.task,
-            .thread => return timedWaitFutex(&d.payload.thread, expected, futexTimeout(timeout, clock), cancel_mode),
+            .thread => {
+                const deadline = timeout.toDeadlineOn(clock).deadline;
+                if (comptime builtin.is_test) if (test_hold_before_futex) |hold| hold();
+                return timedWaitFutex(&d.payload.thread, expected, deadline, clock, cancel_mode);
+            },
         };
         std.debug.assert(t.kind == .ordinary);
         const task = t.task;
@@ -643,6 +648,12 @@ pub const Waiter = struct {
         }
     }
 
+    /// Test-only: runs on a no-task timed wait after the caller's timeout is
+    /// taken in and before the futex wait starts. A test sets it to hold the
+    /// thread there, which stands in for the thread being descheduled at that
+    /// point. Thread-local, so it holds only the thread that set it.
+    pub threadlocal var test_hold_before_futex: ?*const fn () void = null;
+
     /// Callback for the `timedWaitClock` timer.
     fn timeoutCallback(_: *ev.Loop, c: *ev.Completion) void {
         const self: *Waiter = @ptrCast(@alignCast(c.userdata.?));
@@ -675,54 +686,50 @@ pub const Waiter = struct {
         }
     }
 
-    /// Collapse a wall-clock (boot/real) deadline into a monotonic-relative
-    /// duration for the no-task futex fallback, which can only wait on the
-    /// monotonic clock. Without this, `timedWaitFutex` would compare an
-    /// absolute realtime timestamp (~ns since 1970) against monotonic time and
-    /// wait for decades. Best-effort: it snapshots the remaining time once and
-    /// loses suspend/step semantics.
+    /// The no-task timed wait. `deadline` is absolute on `clock`, and it is
+    /// the only time this takes in: every pass reads `clock` once and hands
+    /// the time left straight to the kernel, and it reads `clock` again after
+    /// every return, a timed-out one included. So a thread that is held up
+    /// anywhere before a pass still ends at the deadline.
     ///
-    /// TODO: support boot/real natively on this path. The Linux futex can wait
-    /// against CLOCK_REALTIME (FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME), so a
-    /// no-task wait on a real deadline could be exact rather than converted.
-    fn futexTimeout(timeout: Timeout, clock: Clock) Timeout {
-        return switch (timeout) {
-            .none, .duration => timeout,
-            .deadline => |deadline| .{ .duration = Timestamp.now(clock).durationTo(deadline) },
-        };
-    }
-
-    fn timedWaitFutex(n: *os.thread.Notify, expected: u32, timeout: Timeout, comptime cancel_mode: Executor.YieldCancelMode) TimedWaitError(cancel_mode)!void {
+    /// What a kernel wait can still add, because each one is relative:
+    /// - a thread held up between the read and the futex call waits the full
+    ///   time it read. Only an absolute kernel wait closes that (Linux
+    ///   FUTEX_WAIT_BITSET can take one on CLOCK_MONOTONIC or
+    ///   CLOCK_REALTIME; Darwin's __ulock_wait takes only an interval).
+    /// - each kernel wait times an interval on the clock that stops in a
+    ///   system sleep (Linux CLOCK_MONOTONIC; Darwin mach absolute time, which
+    ///   CLOCK_UPTIME_RAW also reads). On a boot or real deadline, a sleep
+    ///   that passes the deadline is noticed only when that kernel wait ends,
+    ///   after its awake time has run out. An awake deadline is on the
+    ///   kernel's own clock, so nothing is mixed.
+    fn timedWaitFutex(n: *os.thread.Notify, expected: u32, deadline: Timestamp, clock: Clock, comptime cancel_mode: Executor.YieldCancelMode) TimedWaitError(cancel_mode)!void {
         if (cancel_mode == .allow_cancel) {
             const sc = try syscall_cancel.Syscall.beginWait();
             defer sc.finish();
-            const deadline = timeout.toDeadline();
             while (true) {
-                const current = n.state.load(.acquire);
-                if (current >= expected) return;
-                const remaining = deadline.durationFromNow();
-                if (remaining.value <= 0) return error.Timeout;
-                n.timedWait(current, remaining) catch {
-                    const final = n.state.load(.acquire);
-                    if (final >= expected) return;
-                    return error.Timeout;
-                };
+                if (try futexPass(n, expected, deadline, clock)) return;
                 try sc.checkCancel();
             }
         } else {
-            const deadline = timeout.toDeadline();
             while (true) {
-                const current = n.state.load(.acquire);
-                if (current >= expected) return;
-                const remaining = deadline.durationFromNow();
-                if (remaining.value <= 0) return error.Timeout;
-                n.timedWait(current, remaining) catch {
-                    const final = n.state.load(.acquire);
-                    if (final >= expected) return;
-                    return error.Timeout;
-                };
+                if (try futexPass(n, expected, deadline, clock)) return;
             }
         }
+    }
+
+    /// One pass of `timedWaitFutex`: true once signaled, error.Timeout once
+    /// `deadline` has passed on `clock`, false after any other return. A
+    /// kernel timeout is not trusted on its own: the next pass reads the
+    /// deadline's clock again, which is what a real deadline needs after the
+    /// wall clock steps back.
+    fn futexPass(n: *os.thread.Notify, expected: u32, deadline: Timestamp, clock: Clock) Timeoutable!bool {
+        const current = n.state.load(.acquire);
+        if (current >= expected) return true;
+        const remaining = Timestamp.now(clock).durationTo(deadline);
+        if (remaining.value == 0) return error.Timeout;
+        n.timedWait(current, remaining) catch {};
+        return false;
     }
 
     fn waitTask(t: *const TaskWait, expected: u32, comptime cancel_mode: Executor.YieldCancelMode) if (cancel_mode == .allow_cancel) Cancelable!void else void {
