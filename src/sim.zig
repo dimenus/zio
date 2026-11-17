@@ -6710,6 +6710,91 @@ test "sim: a wake left pending on a loop already polled is handled before the cl
     childDone("sim: a wake left pending on a loop already polled is handled before the clock moves, two executors");
 }
 
+/// Upstream #928: an `ev.Async` in a loop's list is armed, and a notify on
+/// it sets the loop's `wake_async` bit, so the next sim poll takes it at
+/// the same virtual instant. Out of the list (after it completed) it is
+/// disarmed: a notify only latches `notified`, sets no wake bit (the loop
+/// stays quiescent and the clock may move), and the next `add` completes
+/// it at once. `busy` is clear whenever `notify` has returned, since a sim
+/// loop runs on the notifier's own thread and could never wait it out.
+const async_latch = struct {
+    const Loop = @import("ev/loop.zig").Loop;
+    const Completion = @import("ev/completion.zig").Completion;
+    const Async = @import("ev/completion.zig").Async;
+    const Event = @import("sync/Event.zig");
+    const rt_mod = @import("runtime.zig");
+
+    var ev: Event = .init;
+    var handle: Async = undefined;
+    var fired: u32 = 0;
+    var fired_at_ns: u64 = 0;
+
+    fn onAsync(_: *Loop, _: *Completion) void {
+        fired += 1;
+        fired_at_ns = clockNs();
+        ev.set();
+    }
+
+    fn body() !void {
+        const loop = &rt_mod.getCurrentExecutor().loop;
+        rt_mod.sleep(.fromMilliseconds(3)) catch {};
+
+        // Armed: the notify wakes the loop and is taken at its own instant.
+        handle.c.callback = onAsync;
+        loop.add(&handle.c);
+        const t1 = clockNs();
+        handle.notify();
+        if (handle.pending.load(.monotonic).busy) return error.BusyLeftByArmedNotify;
+        if (loop.simQuiescent()) return error.ArmedNotifySetNoWake;
+        try ev.wait();
+        if (fired != 1 or fired_at_ns != t1) return error.ArmedNotifyNotTakenAtItsInstant;
+
+        // Completed, so disarmed: the notify latches and wakes nothing.
+        ev.reset();
+        handle.notify();
+        if (handle.pending.load(.monotonic) != Async.Pending{ .notified = true, .disarmed = true }) return error.DisarmedNotifyNotLatched;
+        if (!loop.simQuiescent()) return error.DisarmedNotifyWokeTheLoop;
+        rt_mod.sleep(.fromMilliseconds(5)) catch {};
+        const t2 = clockNs();
+        if (t2 != t1 + 5 * std.time.ns_per_ms) return error.ClockHeldByLatchedNotify;
+        if (fired != 1) return error.LatchedNotifyFiredWithoutAdd;
+
+        // The next add takes the latch: complete at once, at this instant.
+        loop.add(&handle.c);
+        try ev.wait();
+        if (fired != 2 or fired_at_ns != t2) return error.LatchNotTakenByAdd;
+        if (handle.pending.load(.monotonic) != Async.Pending{ .disarmed = true }) return error.LatchLeftAfterAdd;
+    }
+
+    fn runSeed(seed_value: u64) !void {
+        begin(seed_value);
+        defer end();
+        ev = .init;
+        handle = Async.init();
+        fired = 0;
+        fired_at_ns = 0;
+        const rt = try rt_mod.Runtime.init(std.heap.page_allocator, .{
+            .executors = .exact(1),
+            .thread_pool = .{ .max_threads = 0 },
+        });
+        defer rt.deinit();
+        var h = try rt.spawn(body, .{});
+        h.join() catch |err| {
+            std.debug.print("seed {d}: {s}\n", .{ seed_value, @errorName(err) });
+            return err;
+        };
+    }
+};
+
+test "sim: ev.Async: an armed notify is taken at its instant, a disarmed one latches without a wake" {
+    if (comptime !compiled_in) return error.SkipZigTest;
+    if (!isDeathChild()) return expectChildSucceeds("sim: ev.Async: an armed notify is taken at its instant, a disarmed one latches without a wake");
+    noCoreDump();
+    var s: u64 = 1;
+    while (s <= 5) : (s += 1) try async_latch.runSeed(s);
+    childDone("sim: ev.Async: an armed notify is taken at its instant, a disarmed one latches without a wake");
+}
+
 // ---- Round 3 refusals: one test per new check ----
 
 const other_thread_msg = " from a thread that is not the sim thread";
